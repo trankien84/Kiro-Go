@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
 	"net/http"
@@ -21,8 +22,11 @@ import (
 //
 // Before the fix the error path (responseStarted==true) returned without
 // emitting anything, silently truncating the client's SSE stream (no
-// finish_reason, no [DONE]). After the fix it emits a finish chunk with
-// finish_reason:"error" plus a terminating data: [DONE] line.
+// finish_reason at all). After the fix it emits a finish chunk with
+// finish_reason:"error" — but NOT a terminating data: [DONE] line: upstream
+// f8f6071 ("detect empty and truncated upstream streams instead of faking
+// success") means [DONE] is reserved for a turn that actually completed, and
+// a mid-stream error must never be reported as one.
 func TestOpenAIStreamEmitsFinishChunkOnMidStreamError(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
@@ -89,13 +93,13 @@ func TestOpenAIStreamEmitsFinishChunkOnMidStreamError(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleOpenAIStream(rec, payload, "claude-sonnet-4.5", false, 1, "", nil, false)
+	h.handleOpenAIStream(context.Background(), rec, payload, "claude-sonnet-4.5", false, 1, "", nil, false)
 
 	body := rec.Body.String()
 	if !strings.Contains(body, `"finish_reason":"error"`) {
 		t.Fatalf("expected a finish chunk with finish_reason:\"error\", got body=%s", body)
 	}
-	if !strings.Contains(body, "data: [DONE]") {
-		t.Fatalf("expected a terminating data: [DONE] line, got body=%s", body)
+	if strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("a mid-stream error must not report completion via [DONE], got body=%s", body)
 	}
 }

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -117,17 +118,19 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	forwarded := r.Header.Get(forwardHeader) != ""
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		// r.Context() flows through so the stream-integrity retry can distinguish a
+		// client cancellation from a broken upstream stream.
+		h.handleResponsesStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 			apiKeyID, respID, &req, storedInputCopy, storeResponse, body, forwarded)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 		apiKeyID, respID, &req, storedInputCopy, storeResponse, body, forwarded)
 }
 
 func (h *Handler) handleResponsesNonStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 	rawBody []byte, forwarded bool,
@@ -175,6 +178,7 @@ func (h *Handler) handleResponsesNonStream(
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -190,13 +194,39 @@ func (h *Handler) handleResponsesNonStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return len(content), len(toolUses), upstreamStopReason, reasoningContent != ""
+		}
+
+		reset := func() {
+			content = ""
+			reasoningContent = ""
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+		}
+
+		// Fully buffered path: nothing reaches the client until the response is
+		// encoded, so a retry can never duplicate output.
+		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			// Integrity failures are upstream hiccups, not account faults.
+			if !isStreamIntegrityError(err) {
+				h.handleAccountFailure(account, err)
+			}
 			continue
 		}
 
@@ -217,7 +247,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 
@@ -240,9 +270,20 @@ func (h *Handler) handleResponsesNonStream(
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
+func mapResponsesCompletion(reason string) (status, incompleteReason string) {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "max_tokens", "max_output_tokens", "length", "model_context_window_exceeded", "context_window_exceeded":
+		return "incomplete", "max_output_tokens"
+	case "refusal", "content_filter", "content_filtered", "guardrail_intervened":
+		return "incomplete", "content_filter"
+	default:
+		return "completed", ""
+	}
+}
+
 func buildResponsesObject(
 	id, model, content string, toolUses []KiroToolUse,
-	inputTokens, outputTokens int, req *ResponsesRequest,
+	inputTokens, outputTokens int, req *ResponsesRequest, upstreamStopReason string,
 ) *ResponsesObject {
 	output := make([]ResponseOutputItem, 0, 1+len(toolUses))
 
@@ -284,21 +325,28 @@ func buildResponsesObject(
 		})
 	}
 
+	status, incompleteReason := mapResponsesCompletion(upstreamStopReason)
+	var incompleteDetails *ResponsesIncompleteDetails
+	if incompleteReason != "" {
+		incompleteDetails = &ResponsesIncompleteDetails{Reason: incompleteReason}
+	}
+
 	return &ResponsesObject{
 		ID:                 id,
 		Object:             "response",
 		CreatedAt:          time.Now().Unix(),
-		Status:             "completed",
+		Status:             status,
 		Model:              model,
 		Output:             output,
 		Usage:              ResponsesUsage{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: inputTokens + outputTokens},
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
+		IncompleteDetails:  incompleteDetails,
 	}
 }
 
 func (h *Handler) handleResponsesStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 	rawBody []byte, forwarded bool,
@@ -375,13 +423,14 @@ func (h *Handler) handleResponsesStream(
 		})
 
 		var (
-			fullText        strings.Builder
-			reasoningText   strings.Builder
-			toolUses        []KiroToolUse
-			inputTokens     int
-			outputTokens    int
-			credits         float64
-			realInputTokens int
+			fullText           strings.Builder
+			reasoningText      strings.Builder
+			toolUses           []KiroToolUse
+			inputTokens        int
+			outputTokens       int
+			credits            float64
+			realInputTokens    int
+			upstreamStopReason string
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -508,14 +557,43 @@ func (h *Handler) handleResponsesStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return fullText.Len(), len(toolUses), upstreamStopReason, reasoningText.Len() > 0
+		}
+
+		// Retries only run while responseStarted is false, i.e. before any
+		// content or function-call item has been sent, so the output_index /
+		// content_index cursors are still untouched. Only the accumulators need
+		// clearing.
+		reset := func() {
+			fullText.Reset()
+			reasoningText.Reset()
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+		}
+
+		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset,
+			func() bool { return !responseStarted })
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			if !responseStarted {
 				lastErr = err
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
+				// Integrity failures are upstream hiccups, not account faults.
+				if !isStreamIntegrityError(err) {
+					h.handleAccountFailure(account, err)
+				}
 				continue
 			}
 			send("response.failed", map[string]interface{}{
@@ -578,7 +656,7 @@ func (h *Handler) handleResponsesStream(
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions

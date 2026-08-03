@@ -12,13 +12,23 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
+)
+
+var (
+	ErrAccountNotFound       = errors.New("account not found")
+	ErrDuplicateAccountID    = errors.New("account ID already exists")
+	ErrDuplicateRefreshToken = errors.New("account refresh token already exists")
+	ErrDuplicateAPIKey       = errors.New("account API key already exists")
+	ErrEmptyAPIKey           = errors.New("kiroApiKey is empty")
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -50,23 +60,40 @@ type Account struct {
 	Tags    []string `json:"tags,omitempty"`    // Labels; custom_api accounts carry ["Custom API"]
 
 	// Authentication credentials
-	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
-	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
+	AccessToken  string `json:"accessToken"`  // OAuth access token for API calls
+	RefreshToken string `json:"refreshToken"` // OAuth refresh token for token renewal
+	// RefreshTokenFingerprint is a one-way identifier for the credential that
+	// originally created this account. It prevents a previously imported token
+	// from being imported again after the provider rotates it.
+	RefreshTokenFingerprint string `json:"refreshTokenFingerprint,omitempty"`
+	// KiroApiKey is a headless Kiro API key (typically ksk_...). When set,
+	// AuthMethod is "api_key" and the key is used directly as the Bearer token
+	// without OAuth refresh. AccessToken is kept in sync for the shared request path.
+	KiroApiKey   string `json:"kiroApiKey,omitempty"`
 	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
 	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	KiroApiKey   string `json:"kiroApiKey,omitempty"`   // Kiro API key credential (ksk_...); used directly as the upstream bearer token for headless "api_key" auth. Never refreshed.
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), "external_idp" (enterprise SSO, e.g. Azure AD), or "api_key" (headless Kiro API key)
+	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), "external_idp" (enterprise SSO, e.g. Azure AD), "api_key" (headless Kiro API key), "bedrock" (native Amazon Bedrock), or "custom_api" (transparent forwarder)
 	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
-	Region       string `json:"region"`                 // AWS region for OIDC endpoints
-	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
-	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
-	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
-	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
+	// Region is the AWS *authentication* region: it selects the OIDC refresh
+	// endpoint and the API-key data plane. It is deliberately NOT the Kiro
+	// generation-plane region — Kiro data-plane calls derive their region from
+	// ProfileArn (see kiro_api.go), so an account authenticated in one region can
+	// still be served by a profile in another. Bedrock accounts additionally
+	// reuse this field as their primary Bedrock invoke region (see BedrockRegions).
+	Region     string `json:"region"`
+	StartUrl   string `json:"startUrl,omitempty"`   // AWS SSO start URL
+	ExpiresAt  int64  `json:"expiresAt,omitempty"`  // Token expiration timestamp (Unix seconds); unused for API Key
+	MachineId  string `json:"machineId,omitempty"`  // UUID machine identifier for request tracking
+	ProfileArn string `json:"profileArn,omitempty"` // CodeWhisperer/Kiro profile ARN for generation requests
 
 	// External IdP (enterprise SSO, e.g. Microsoft 365 / Entra ID / Azure AD) refresh material.
 	// When AuthMethod == "external_idp" the credential is an IdP-issued OAuth token refreshed
 	// against TokenEndpoint using ClientID and Scopes (refresh_token grant), NOT the AWS SSO
-	// OIDC endpoint. IssuerURL is the OIDC issuer the endpoints were discovered from.
+	// OIDC endpoint. IssuerURL is the OIDC issuer the endpoints were discovered from and is
+	// what binds TokenEndpoint to a single tenant before the refresh token is sent.
+	// These are deliberately separate from the AWS IdC ClientSecret/Region pair: Region stays
+	// the AWS *authentication* region, while Kiro data-plane routing treats ProfileArn as
+	// authoritative whenever it is available.
 	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // External IdP OAuth2 token endpoint (refresh)
 	IssuerURL     string `json:"issuerUrl,omitempty"`     // External IdP OIDC issuer URL
 	Scopes        string `json:"scopes,omitempty"`        // Space-separated scopes granted by the external IdP
@@ -337,7 +364,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.1.2"
+const Version = "1.1.5"
 
 var (
 	cfg     *Config
@@ -553,22 +580,308 @@ func GetEnabledAccounts() []Account {
 	return accounts
 }
 
+// RefreshTokenFingerprint returns a stable, non-reversible identifier for an
+// opaque refresh token. Empty tokens do not receive a fingerprint.
+func RefreshTokenFingerprint(refreshToken string) string {
+	if refreshToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(refreshToken))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// APIKeyFingerprint returns a stable, non-reversible identifier for a Kiro API key.
+func APIKeyFingerprint(apiKey string) string {
+	if apiKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(apiKey))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// normalizedKiroRegion canonicalizes an account region for equality tests. An
+// empty region means "us-east-1" (the default NormalizeAPIKeyAccount applies), so
+// records persisted before the region field existed must compare equal to an
+// explicit us-east-1 rather than forming a second, phantom pool slot.
+func normalizedKiroRegion(region string) string {
+	region = strings.ToLower(strings.TrimSpace(region))
+	if region == "" {
+		return "us-east-1"
+	}
+	return region
+}
+
+// IsAPIKeyAccount reports whether the account authenticates against KIRO with a
+// Kiro API key. Broader than Account.IsApiKeyCredential: it also accepts the
+// "apikey" spelling and treats a bare KiroApiKey with no AuthMethod as an API-key
+// credential, which is what the import path relies on.
+//
+// custom_api and bedrock are excluded FIRST and deliberately. custom_api accounts
+// reuse KiroApiKey to hold the bearer for the upstream Kiro-Go pool they forward
+// to (see the Custom API field block on Account), so the bare-KiroApiKey test
+// above would otherwise classify them as Kiro API-key accounts. That is not
+// cosmetic: AddAccount runs NormalizeAPIKeyAccount on anything this returns true
+// for, which rewrites AuthMethod to "api_key" and would silently convert every
+// newly added custom_api account into a Kiro API-key account, routing it at the
+// Kiro CLI runtime instead of the custom_api forwarder. Bedrock keeps its bearer
+// in BedrockAPIKey and never populates KiroApiKey, but is excluded here too so the
+// invariant "non-Kiro providers are never treated as Kiro credentials" holds by
+// construction rather than by accident.
+func IsAPIKeyAccount(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	if account.IsCustomApi() || account.IsBedrock() {
+		return false
+	}
+	if strings.TrimSpace(account.KiroApiKey) != "" {
+		return true
+	}
+	method := strings.ToLower(strings.TrimSpace(account.AuthMethod))
+	return method == "api_key" || method == "apikey"
+}
+
+// SplitKiroAPIKeyAndRegion parses the convenience form "key|region".
+// The key itself is not restricted to a fixed prefix so future formats remain compatible.
+func SplitKiroAPIKeyAndRegion(raw string) (key, region string, err error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", "", ErrEmptyAPIKey
+	}
+	parts := strings.Split(trimmed, "|")
+	if len(parts) > 2 {
+		return "", "", errors.New("multiple pipe separators are not allowed")
+	}
+	key = strings.TrimSpace(parts[0])
+	if key == "" {
+		return "", "", errors.New("key before pipe is empty")
+	}
+	if len(parts) == 2 {
+		region = strings.TrimSpace(parts[1])
+		if region == "" {
+			return "", "", errors.New("region after pipe is empty")
+		}
+		if err := validateKiroRegionHostLabel(region); err != nil {
+			return "", "", err
+		}
+	}
+	return key, region, nil
+}
+
+func validateKiroRegionHostLabel(region string) error {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		return errors.New("region is empty")
+	}
+	for _, r := range region {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return errors.New("region contains host-unsafe characters")
+	}
+	if strings.Contains(region, " ") || strings.ContainsAny(region, "\n\r\t./") {
+		return errors.New("region contains host-unsafe characters")
+	}
+	return nil
+}
+
+// MachineIdFromAPIKey derives the machine id used by Kiro CLI/API-key clients:
+// sha256 hex of "KiroAPIKey/<api_key>".
+func MachineIdFromAPIKey(apiKey string) string {
+	sum := sha256.Sum256([]byte("KiroAPIKey/" + apiKey))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// NormalizeAPIKeyAccount fills API-key credential defaults in place.
+// It accepts "ksk_xxx|region", sets AuthMethod=api_key, copies the key into
+// AccessToken for the shared Bearer path, clears OAuth-only fields, and
+// derives MachineId when missing.
+func NormalizeAPIKeyAccount(account *Account) error {
+	if account == nil {
+		return errors.New("account is nil")
+	}
+	raw := strings.TrimSpace(account.KiroApiKey)
+	if raw == "" {
+		raw = strings.TrimSpace(account.AccessToken)
+	}
+	key, region, err := SplitKiroAPIKeyAndRegion(raw)
+	if err != nil {
+		return err
+	}
+	account.KiroApiKey = key
+	account.AccessToken = key
+	account.AuthMethod = "api_key"
+	account.RefreshToken = ""
+	account.RefreshTokenFingerprint = ""
+	account.ClientID = ""
+	account.ClientSecret = ""
+	account.TokenEndpoint = ""
+	account.IssuerURL = ""
+	account.Scopes = ""
+	account.ProfileArn = ""
+	account.ExpiresAt = 0
+	if region != "" {
+		if strings.TrimSpace(account.Region) == "" {
+			account.Region = region
+		}
+	}
+	if strings.TrimSpace(account.Region) == "" {
+		account.Region = "us-east-1"
+	}
+	if err := validateKiroRegionHostLabel(account.Region); err != nil {
+		return err
+	}
+	if strings.TrimSpace(account.MachineId) == "" {
+		account.MachineId = MachineIdFromAPIKey(key)
+	}
+	if strings.TrimSpace(account.Provider) == "" {
+		account.Provider = "APIKey"
+	}
+	if strings.TrimSpace(account.Email) == "" {
+		// Stable display label without leaking the full secret.
+		fp := APIKeyFingerprint(key)
+		if len(fp) > 12 {
+			fp = fp[:12]
+		}
+		account.Email = "api-key-" + fp
+	}
+	return nil
+}
+
+// AccountCredentialExists checks both the current refresh token and the
+// original credential fingerprint while holding the configuration read lock.
+func AccountCredentialExists(refreshToken string) bool {
+	if refreshToken == "" {
+		return false
+	}
+	fingerprint := RefreshTokenFingerprint(refreshToken)
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		if account.RefreshToken == refreshToken ||
+			(fingerprint != "" && account.RefreshTokenFingerprint == fingerprint) {
+			return true
+		}
+	}
+	return false
+}
+
+// AccountAPIKeyExists reports whether a Kiro API key is already persisted.
+func AccountAPIKeyExists(apiKey string) bool {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return false
+	}
+	fingerprint := APIKeyFingerprint(apiKey)
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		existing := strings.TrimSpace(account.KiroApiKey)
+		if existing == "" {
+			continue
+		}
+		if existing == apiKey || APIKeyFingerprint(existing) == fingerprint {
+			return true
+		}
+	}
+	return false
+}
+
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	// Reject a duplicate id under the write lock. The import path pre-checks with
-	// AccountIDExists (RLock) and mints a fresh id on collision, but that check and this
-	// append are not atomic; two concurrent imports of the same pasted id could both
-	// pass the pre-check. This makes "add if id absent" the atomic invariant.
-	if account.ID != "" {
-		for _, a := range cfg.Accounts {
-			if a.ID == account.ID {
-				return fmt.Errorf("account with id %s already exists", account.ID)
+	// API-key accounts carry no refresh token, so they are canonicalized (key
+	// trimmed, AuthMethod/AccessToken synced) instead of fingerprinted. Every other
+	// credential gets a refresh-token fingerprint so a re-import of the same
+	// credential is rejected even after the provider rotated the raw token.
+	if IsAPIKeyAccount(&account) {
+		if err := NormalizeAPIKeyAccount(&account); err != nil {
+			return err
+		}
+	} else if account.RefreshTokenFingerprint == "" {
+		account.RefreshTokenFingerprint = RefreshTokenFingerprint(account.RefreshToken)
+	}
+	// All duplicate checks run under the write lock held above. The import path
+	// pre-checks with AccountIDExists (RLock) and mints a fresh id on collision,
+	// but that check and this append are not atomic; two concurrent imports of the
+	// same pasted id could both pass the pre-check. Re-checking here makes
+	// "add only if absent" the atomic invariant. Credential-less accounts
+	// (bedrock / custom_api) have empty RefreshToken and empty fingerprint, so
+	// they never collide with each other here.
+	for _, existing := range cfg.Accounts {
+		if account.ID != "" && existing.ID == account.ID {
+			return ErrDuplicateAccountID
+		}
+		if account.RefreshToken != "" && existing.RefreshToken == account.RefreshToken {
+			return ErrDuplicateRefreshToken
+		}
+		existingFingerprint := existing.RefreshTokenFingerprint
+		if existingFingerprint == "" {
+			existingFingerprint = RefreshTokenFingerprint(existing.RefreshToken)
+		}
+		if account.RefreshTokenFingerprint != "" &&
+			existingFingerprint == account.RefreshTokenFingerprint {
+			return ErrDuplicateRefreshToken
+		}
+		// Scoped to genuine Kiro API-key accounts on BOTH sides. custom_api accounts
+		// also store a bearer in KiroApiKey (for the upstream pool they forward to),
+		// and the same operator key can legitimately be reused across two different
+		// BaseURLs — an unscoped comparison would reject that as a duplicate. The
+		// custom_api add path does its own (BaseURL, key) pair check instead.
+		//
+		// Scoped to the region as well: one Kiro API key is valid in several regions
+		// and each region is a SEPARATE pool slot with its own quota, so "same key,
+		// new region" is a legitimate add. Only re-importing the same key into the
+		// same region is a duplicate.
+		if IsAPIKeyAccount(&account) && IsAPIKeyAccount(&existing) &&
+			normalizedKiroRegion(existing.Region) == normalizedKiroRegion(account.Region) {
+			existingKey := strings.TrimSpace(existing.KiroApiKey)
+			if existingKey != "" && (existingKey == account.KiroApiKey ||
+				APIKeyFingerprint(existingKey) == APIKeyFingerprint(account.KiroApiKey)) {
+				return ErrDuplicateAPIKey
 			}
 		}
 	}
 	cfg.Accounts = append(cfg.Accounts, account)
-	return Save()
+	if err := Save(); err != nil {
+		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-1]
+		return err
+	}
+	return nil
+}
+
+// UpdateAccountCredentials replaces an account record INCLUDING its credential
+// material, and is the deliberate counterpart to UpdateAccount (which preserves
+// it). Use it only where the caller has just proven the incoming credential is
+// live and newer than what the slot holds — the admin "re-upload a re-login"
+// adopt/repair path is the motivating case: an OAuth refresh token expires
+// (~90d for Entra), the slot goes dead but stays in the pool, and re-running the
+// login and re-uploading is the operator's repair. Routing that through
+// UpdateAccount would silently discard the fresh tokens and report success while
+// the slot stayed dead.
+//
+// The refresh-token fingerprint is recomputed from the INCOMING token, not
+// carried over: it identifies the credential now in the slot, and a stale
+// fingerprint would make a later re-import of this same credential compare
+// against a token the account no longer holds.
+func UpdateAccountCredentials(id string, account Account) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID != id {
+			continue
+		}
+		account.ID = a.ID
+		account.RefreshTokenFingerprint = RefreshTokenFingerprint(account.RefreshToken)
+		previous := cfg.Accounts[i]
+		cfg.Accounts[i] = account
+		if err := Save(); err != nil {
+			cfg.Accounts[i] = previous
+			return err
+		}
+		return nil
+	}
+	return ErrAccountNotFound
 }
 
 func UpdateAccount(id string, account Account) error {
@@ -576,8 +889,50 @@ func UpdateAccount(id string, account Account) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			// Callers of UpdateAccount use it for administrative/status fields only.
+			// Preserve the authoritative credential state so a stale account
+			// snapshot cannot overwrite a refresh-token rotation that completed
+			// while an upstream status request was in flight. A caller that
+			// intends to replace the credential must say so explicitly via
+			// UpdateAccountCredentials.
+			account.AccessToken = a.AccessToken
+			account.RefreshToken = a.RefreshToken
+			account.RefreshTokenFingerprint = a.RefreshTokenFingerprint
+			account.KiroApiKey = a.KiroApiKey
+			account.ClientID = a.ClientID
+			account.ClientSecret = a.ClientSecret
+			account.AuthMethod = a.AuthMethod
+			account.Provider = a.Provider
+			// Region is force-restored from storage for every OTHER field on this
+			// preserve-list (credentials/endpoints), but Region itself is legitimately
+			// editable — proxy/handler.go's apiUpdateAccount lets a Bedrock account's
+			// region change (fork commits 32db685/dae4aa8). Reverting a caller-supplied
+			// non-empty Region here made that save silently no-op: the handler set
+			// existing.Region to the new value, then this line reverted it to the old
+			// one on the very next line, and clearBedrockModelCache/RegionRoutes had
+			// already flushed — so the account re-probed and re-learned the OLD region
+			// while the API returned 200 and the UI toasted success. Only fall back to
+			// the stored value when the caller left Region blank (an update that never
+			// touched it), so an explicit new region is honored.
+			if account.Region == "" {
+				account.Region = a.Region
+			}
+			account.StartUrl = a.StartUrl
+			account.ExpiresAt = a.ExpiresAt
+			account.ProfileArn = a.ProfileArn
+			account.TokenEndpoint = a.TokenEndpoint
+			account.IssuerURL = a.IssuerURL
+			account.Scopes = a.Scopes
+			if account.RefreshTokenFingerprint == "" {
+				account.RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
+			}
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i] = account
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -616,12 +971,17 @@ func SetAccountEnabled(id string, enabled bool) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i].Enabled = enabled
 			if !enabled {
 				cfg.Accounts[i].BanStatus = "DISABLED"
 				cfg.Accounts[i].BanTime = time.Now().Unix()
 			}
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -634,13 +994,39 @@ func SetAccountBanStatus(id, status, reason string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i].BanStatus = status
 			cfg.Accounts[i].BanReason = reason
 			cfg.Accounts[i].BanTime = time.Now().Unix()
 			if status == "BANNED" || status == "DISABLED" {
 				cfg.Accounts[i].Enabled = false
 			}
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+// ClearAccountBanStatus marks an account active without replacing any
+// credential fields from a potentially stale caller snapshot.
+func ClearAccountBanStatus(id string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, account := range cfg.Accounts {
+		if account.ID == id {
+			previous := cfg.Accounts[i]
+			cfg.Accounts[i].BanStatus = "ACTIVE"
+			cfg.Accounts[i].BanReason = ""
+			cfg.Accounts[i].BanTime = 0
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -654,8 +1040,13 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i].ProfileArn
 			cfg.Accounts[i].ProfileArn = profileArn
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i].ProfileArn = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return fmt.Errorf("account not found: %s", id)
@@ -674,19 +1065,44 @@ func DeleteAccount(id string) error {
 }
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
+	return UpdateAccountCredentialState(id, accessToken, refreshToken, expiresAt, "")
+}
+
+// UpdateAccountCredentialState atomically updates all fields produced by one
+// refresh-token exchange. If persistence fails, the in-memory configuration is
+// restored so a rotated token is never published from a state that cannot
+// survive restart.
+func UpdateAccountCredentialState(
+	id string,
+	accessToken string,
+	refreshToken string,
+	expiresAt int64,
+	profileArn string,
+) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
+			if cfg.Accounts[i].RefreshTokenFingerprint == "" {
+				cfg.Accounts[i].RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
+			}
 			cfg.Accounts[i].AccessToken = accessToken
 			if refreshToken != "" {
 				cfg.Accounts[i].RefreshToken = refreshToken
 			}
 			cfg.Accounts[i].ExpiresAt = expiresAt
-			return Save()
+			if profileArn != "" {
+				cfg.Accounts[i].ProfileArn = profileArn
+			}
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
-	return nil
+	return ErrAccountNotFound
 }
 
 func GetApiKey() string {

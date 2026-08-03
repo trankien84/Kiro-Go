@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"kiro-go/config"
 	"net/http"
+	"strings"
 )
 
 const (
@@ -56,29 +57,50 @@ func buildKiroHeaderValues(account *config.Account, host, apiName, sdkVersion, m
 }
 
 func applyKiroBaseHeaders(req *http.Request, account *config.Account, values kiroHeaderValues) {
-	if account != nil {
-		if account.IsApiKeyCredential() {
-			// Kiro API-key credential: the key itself is the bearer token, and the
-			// upstream requires a "tokentype: API_KEY" header to recognize it.
-			if account.KiroApiKey != "" {
-				req.Header.Set("Authorization", "Bearer "+account.KiroApiKey)
-				req.Header.Set("tokentype", "API_KEY")
-			}
-		} else if account.AccessToken != "" {
-			req.Header.Set("Authorization", "Bearer "+account.AccessToken)
+	token := accountBearerToken(account)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	// Kiro requires external identity-provider access tokens and API keys to be
+	// identified explicitly. Keep this in the shared header path so streaming
+	// and REST requests cannot drift apart.
+	req.Header.Del("TokenType")
+	req.Header.Del("tokentype")
+	// Gated on a resolved bearer: a token-type header describes the Authorization
+	// header, so announcing API_KEY / EXTERNAL_IDP on a request that carries no
+	// credential at all would be a lie to upstream (and we deliberately never send
+	// a bare "Bearer ").
+	if account != nil && token != "" {
+		if config.IsAPIKeyAccount(account) {
+			// Upstream accepts either casing; CLI captures use lowercase "tokentype".
+			req.Header.Set("tokentype", "API_KEY")
+		} else if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
+			// External IdP (enterprise SSO, e.g. Azure AD) tokens MUST carry this
+			// header or CodeWhisperer does not recognize the token type and silently
+			// returns an empty profile list (and rejects data-plane calls). With it, a
+			// provisioned account resolves its profile; an unprovisioned one gets a
+			// clear 403.
+			req.Header.Set("TokenType", "EXTERNAL_IDP")
 		}
 	}
 	req.Header.Set("User-Agent", values.UserAgent)
 	req.Header.Set("x-amz-user-agent", values.AmzUserAgent)
 	req.Header.Set("x-amzn-codewhisperer-optout", "true")
-	// External IdP (enterprise SSO, e.g. Azure AD) tokens MUST carry this header or
-	// CodeWhisperer does not recognize the token type and silently returns an empty
-	// profile list (and rejects data-plane calls). With it, a provisioned account
-	// resolves its profile; an unprovisioned one gets a clear 403.
-	if account != nil && account.AuthMethod == "external_idp" {
-		req.Header.Set("TokenType", "EXTERNAL_IDP")
-	}
 	if values.Host != "" {
 		req.Host = values.Host
 	}
+}
+
+// accountBearerToken returns the token used for Authorization: Bearer.
+// API Key accounts prefer KiroApiKey; OAuth accounts use AccessToken.
+func accountBearerToken(account *config.Account) string {
+	if account == nil {
+		return ""
+	}
+	if config.IsAPIKeyAccount(account) {
+		if key := strings.TrimSpace(account.KiroApiKey); key != "" {
+			return key
+		}
+	}
+	return strings.TrimSpace(account.AccessToken)
 }

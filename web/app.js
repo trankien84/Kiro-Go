@@ -11,8 +11,10 @@
     localStorage.removeItem('admin_login_time');
   }
   let password = sessionStorage.getItem('admin_password') || localStorage.getItem('admin_password') || '';
+  const supportedLangs = ['zh', 'en', 'vi'];
   let currentLang = localStorage.getItem('kiro_lang') || 'zh';
-  const dict = { en: null, zh: null };
+  if (!supportedLangs.includes(currentLang)) currentLang = 'zh';
+  const dict = { en: null, zh: null, vi: null };
   let accountsData = [];
   const selectedAccounts = new Set();
   let filterKeyword = '';
@@ -28,6 +30,14 @@
   // that window would fire a second POST /start and orphan the first session.
   let kiroSsoStarting = false;
   let iamSession = '';
+  let microsoftSession = '';
+  let microsoftSelectionId = '';
+  let microsoftStage = 'kiro';
+  let microsoftAuthorizeUrl = '';
+  let microsoftProfiles = [];
+  let microsoftSelectedProfileArn = '';
+  let microsoftBusy = false;
+  let microsoftGeneration = 0;
   let exportSelectedIds = new Set();
   let currentVersion = '';
   let testLogs = [];
@@ -128,6 +138,7 @@
     refreshCustomSelects();
   }
   async function setLang(lang) {
+    if (!supportedLangs.includes(lang)) lang = 'zh';
     currentLang = lang;
     localStorage.setItem('kiro_lang', lang);
     await loadLocale(lang);
@@ -141,11 +152,12 @@
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
     qsa('.lang-toggle').forEach(btn => {
       const label = btn.querySelector('.lang-toggle-label');
-      if (label) label.textContent = currentLang === 'zh' ? t('lang.zh') : t('lang.en');
+      if (label) label.textContent = t('lang.' + currentLang);
     });
   }
   function toggleLang() {
-    setLang(currentLang === 'zh' ? 'en' : 'zh');
+    const next = supportedLangs[(supportedLangs.indexOf(currentLang) + 1) % supportedLangs.length];
+    setLang(next);
   }
 
   // Custom select
@@ -893,8 +905,10 @@
   function formatAuthMethod(method) {
     if (!method) return '-';
     const normalized = String(method).toLowerCase();
+    if (normalized === 'external_idp' || normalized === 'azuread') return t('auth.microsoft');
     if (normalized === 'idc') return t('auth.enterprise');
     if (normalized === 'social') return t('auth.social');
+    if (normalized === 'api_key' || normalized === 'apikey') return t('auth.apiKey');
     if (normalized === 'builderid') return 'BuilderID';
     if (normalized === 'api_key') return t('auth.apiKey');
     if (normalized === 'custom_api') return t('auth.customApi');
@@ -1105,13 +1119,46 @@
       toast((e && e.message) || t('common.failed'), 'error');
     }
   }
+  function credentialImportPayloadFromFullAccount(a) {
+    const payload = {
+      clientId: a.clientId || '',
+      clientSecret: a.clientSecret || '',
+      accessToken: a.accessToken || '',
+      refreshToken: a.refreshToken || ''
+    };
+    if (a.authMethod) payload.authMethod = a.authMethod;
+    if (a.provider) payload.provider = a.provider;
+    if (a.tokenEndpoint) payload.tokenEndpoint = a.tokenEndpoint;
+    if (a.issuerUrl) payload.issuerUrl = a.issuerUrl;
+    if (a.scopes) payload.scopes = a.scopes;
+    if (a.userId) payload.userId = a.userId;
+    if (a.profileArn) payload.profileArn = a.profileArn;
+    if (a.region) payload.region = a.region;
+    return payload;
+  }
+  function credentialImportPayloadFromExportAccount(a) {
+    const credentials = a.credentials || {};
+    return credentialImportPayloadFromFullAccount({
+      clientId: credentials.clientId,
+      clientSecret: credentials.clientSecret,
+      accessToken: credentials.accessToken,
+      refreshToken: credentials.refreshToken,
+      authMethod: credentials.authMethod || a.authMethod,
+      provider: credentials.provider || a.provider || a.idp,
+      tokenEndpoint: credentials.tokenEndpoint,
+      issuerUrl: credentials.issuerUrl,
+      scopes: credentials.scopes,
+      userId: a.userId,
+      profileArn: a.profileArn,
+      region: credentials.region || a.region
+    });
+  }
   async function copyAccountJSON(id, btn) {
     try {
       const jsonPromise = api('/accounts/' + id + '/full').then(async res => {
         if (!res.ok) throw new Error('Failed');
         const a = await res.json();
-        const { clientId, clientSecret, accessToken, refreshToken } = a;
-        return JSON.stringify({ clientId, clientSecret, accessToken, refreshToken }, null, 2);
+        return JSON.stringify(credentialImportPayloadFromFullAccount(a), null, 2);
       });
       await copyText(jsonPromise);
       flashCopySuccess(btn);
@@ -2161,11 +2208,12 @@
     builderid: 'fa-solid fa-id-card',
     iam: 'fa-solid fa-key',
     enterprisesso: 'fa-brands fa-microsoft',
+    microsoft: 'fa-brands fa-microsoft',
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
     cookie: 'fa-solid fa-cookie-bite',
-    apikey: 'fa-solid fa-lock',
+    apikey: 'fa-solid fa-key',
     bedrock: 'fa-brands fa-aws'
   };
   function methodCard(type, title, desc) {
@@ -2187,6 +2235,7 @@
     else if (type === 'builderid') modalBuilderId(title, body);
     else if (type === 'iam') modalIam(title, body);
     else if (type === 'enterprisesso') modalEnterpriseSso(title, body);
+    else if (type === 'microsoft') openMicrosoftModal(title, body);
     else if (type === 'sso') modalSso(title, body);
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
@@ -2199,6 +2248,7 @@
   }
   function closeModal() {
     closeDialog('addModal');
+    resetMicrosoftFlow(true);
     iamSession = '';
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
     builderIdSession = '';
@@ -2218,6 +2268,7 @@
       methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
       methodCard('enterprisesso', t('modal.enterpriseSsoTitle'), t('modal.enterpriseSsoDesc')) +
+      methodCard('microsoft', t('modal.microsoftTitle'), t('modal.microsoftDesc')) +
       methodCard('sso', t('modal.ssoTitle'), t('modal.ssoDesc')) +
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
@@ -2276,6 +2327,82 @@
       '</div>';
     $('iamBtn').addEventListener('click', startIamSso);
   }
+  function openMicrosoftModal(title, body) {
+    resetMicrosoftFlow(true);
+    renderMicrosoftModal(title, body);
+  }
+  function renderMicrosoftModal(title, body) {
+    title = title || $('modalTitle');
+    body = body || $('modalBody');
+    title.textContent = t('modal.microsoftTitle');
+
+    if (microsoftSelectionId && microsoftProfiles.length) {
+      body.innerHTML =
+        '<p class="help-block">' + escapeHtml(t('microsoft.selectProfileDesc')) + '</p>' +
+        '<fieldset class="microsoft-profile-list"><legend class="sr-only">' + escapeHtml(t('microsoft.selectProfileTitle')) + '</legend>' +
+        microsoftProfiles.map((profile, index) => {
+          const arn = String(profile.arn || '');
+          const checked = arn === microsoftSelectedProfileArn || (!microsoftSelectedProfileArn && index === 0);
+          return '<label class="microsoft-profile-card' + (checked ? ' selected' : '') + '">' +
+            '<input type="radio" name="microsoftProfile" value="' + escapeAttr(arn) + '"' + (checked ? ' checked' : '') + ' />' +
+            '<span class="microsoft-profile-body">' +
+            '<span class="microsoft-profile-name">' + escapeHtml(profile.name || arn) + '</span>' +
+            '<span class="microsoft-profile-arn font-mono">' + escapeHtml(arn) + '</span>' +
+            (profile.region ? '<span class="microsoft-profile-region">' + escapeHtml(t('microsoft.profileRegion', profile.region)) + '</span>' : '') +
+            '</span></label>';
+        }).join('') +
+        '</fieldset>' +
+        '<div class="modal-footer">' +
+        '<button class="btn btn-secondary" data-microsoft-back="1" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+        '<button class="btn btn-primary" id="microsoftSelectProfileBtn" type="button">' + escapeHtml(t('microsoft.selectProfile')) + '</button>' +
+        '</div>';
+      qsa('input[name="microsoftProfile"]', body).forEach(radio => radio.addEventListener('change', e => {
+        microsoftSelectedProfileArn = e.target.value;
+        qsa('.microsoft-profile-card', body).forEach(card => {
+          const input = card.querySelector('input');
+          card.classList.toggle('selected', Boolean(input && input.checked));
+        });
+      }));
+      $('microsoftSelectProfileBtn').addEventListener('click', selectMicrosoftProfile);
+      syncMicrosoftBusyUI();
+      return;
+    }
+
+    const hasAuthorizeUrl = Boolean(microsoftAuthorizeUrl);
+    const loginLabel = microsoftStage === 'microsoft' ? t('microsoft.providerStep') : t('microsoft.portalStep');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.microsoftDesc')) + '</p>' +
+      (hasAuthorizeUrl ?
+        '<div class="form-group"><label>' + escapeHtml(loginLabel) + '</label>' +
+        '<div class="endpoint"><span id="microsoftAuthUrl" class="font-mono text-xs"></span></div>' +
+        '<div class="flex gap-2 mt-2">' +
+        '<button class="btn btn-sm btn-outline flex-1" id="microsoftOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
+        '<button class="btn btn-sm btn-outline flex-1" id="microsoftCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+        '</div></div>' +
+        '<div class="message message-info microsoft-callback-note"><p>' + escapeHtml(t('microsoft.callbackInstructions')) + '</p></div>' +
+        '<div class="form-group mt-4"><label>' + escapeHtml(t('microsoft.callbackUrl')) + '</label>' +
+        '<textarea id="microsoftCallback" class="font-mono microsoft-callback-input" placeholder="' + escapeAttr(t('microsoft.callbackPlaceholder')) + '"></textarea></div>'
+        : '') +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-microsoft-back="1" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="microsoftBtn" type="button">' +
+      escapeHtml(hasAuthorizeUrl ? t('microsoft.complete') : t('microsoft.start')) +
+      '</button></div>';
+
+    if (hasAuthorizeUrl) {
+      $('microsoftAuthUrl').textContent = microsoftAuthorizeUrl;
+      $('microsoftOpenBtn').addEventListener('click', () => {
+        const opened = window.open(microsoftAuthorizeUrl, '_blank', 'noopener');
+        if (opened) opened.opener = null;
+      });
+      $('microsoftCopyBtn').addEventListener('click', async () => {
+        await copyText(microsoftAuthorizeUrl);
+        toast(t('common.copied'), 'primary');
+      });
+    }
+    $('microsoftBtn').addEventListener('click', hasAuthorizeUrl ? completeMicrosoftLogin : startMicrosoftLogin);
+    syncMicrosoftBusyUI();
+  }
   function modalSso(title, body) {
     title.textContent = t('modal.ssoTitle');
     body.innerHTML =
@@ -2295,6 +2422,33 @@
       '<button class="btn btn-primary" id="importSsoBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
       '</div>';
     $('importSsoBtn').addEventListener('click', importSsoToken);
+  }
+  function modalApiKey(title, body) {
+    title.textContent = t('modal.apiKeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apiKeyDesc')) + '</p>' +
+      '<div class="help-block">' +
+      '<p>' + escapeHtml(t('apikey.hint')) + '</p>' +
+      '<p class="font-mono text-xs">ksk_xxxxxxxx</p>' +
+      '<p class="font-mono text-xs">ksk_xxxxxxxx|eu-central-1</p>' +
+      '</div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.label')) + '</label>' +
+      '<textarea id="kiroApiKeyInput" class="font-mono" placeholder="' + escapeAttr(t('apikey.placeholder')) + '"></textarea></div>' +
+      // H1: no default value here. A non-empty default silently collapses
+      // resolveApiKeyRegion's probe (backend) to that ONE region — an
+      // EU-provisioned key pasted with this box left untouched would 403
+      // forever against us-east-1 instead of being probed across every
+      // candidate region. Leave blank so importApiKey below can omit region
+      // entirely and let the backend's full multi-region probe run.
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + ' <small>' + escapeHtml(t('apikey.regionHint')) + '</small></label>' +
+      '<input type="text" id="kiroApiKeyRegion" placeholder="us-east-1 / eu-west-1 (leave blank to auto-detect)" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + '</label>' +
+      '<input type="text" id="kiroApiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApiKeyBtn').addEventListener('click', importApiKey);
   }
 
   function modalLocal(title, body) {
@@ -2380,47 +2534,6 @@
       '<button class="btn btn-primary" id="importCookieBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
       '</div>';
     $('importCookieBtn').addEventListener('click', importFromCookie);
-  }
-  function modalApiKey(title, body) {
-    title.textContent = t('modal.apiKeyTitle');
-    body.innerHTML =
-      '<p class="help-block">' + escapeHtml(t('modal.apiKeyDesc')) + '</p>' +
-      '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + ' <small>' + escapeHtml(t('apikey.optional')) + '</small></label>' +
-      '<input type="text" id="apiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('apikey.keyLabel')) + '</label>' +
-      '<input type="text" id="apiKeyValue" class="font-mono" placeholder="ksk_..." /></div>' +
-      '<div class="modal-footer">' +
-      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
-      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
-      '</div>';
-    $('importApiKeyBtn').addEventListener('click', importApiKey);
-  }
-  async function importApiKey() {
-    const key = $('apiKeyValue').value.trim();
-    if (!key) return toastWarning(t('apikey.keyMissing'));
-    // region intentionally omitted — the server probes the candidate regions and
-    // pins the one the key actually serves. The profile is bound to the key
-    // server-side, but the data-plane endpoint is still regional, so the region
-    // must be discovered rather than assumed (an EU key 403s against us-east-1).
-    const payload = {
-      authMethod: 'api_key',
-      kiroApiKey: key,
-      nickname: $('apiKeyNickname').value.trim(),
-      enabled: true
-    };
-    try {
-      const res = await api('/accounts', { method: 'POST', body: JSON.stringify(payload) });
-      const d = await res.json();
-      if (d.success) {
-        closeModal(); loadAccounts(); loadStats();
-        toastPrimary(t('apikey.success'));
-        autoRefreshNewAccount(d.id);
-      } else {
-        toastError(t('common.failed') + ': ' + (d.error || ''));
-      }
-    } catch {
-      toastError(t('common.failed'));
-    }
   }
   // modalCustomApi renders the "Custom API" (pool-linking) add form. A Custom API
   // account is a transparent proxy to ANOTHER Kiro-Go pool: base URL + a key that
@@ -2556,6 +2669,42 @@
   }
 
   // Import handlers
+  async function importApiKey() {
+    const raw = ($('kiroApiKeyInput') && $('kiroApiKeyInput').value || '').trim();
+    if (!raw) return toastWarning(t('apikey.missing'));
+    let key = raw;
+    let regionFromKey = '';
+    if (raw.includes('|')) {
+      const parts = raw.split('|');
+      key = (parts[0] || '').trim();
+      regionFromKey = (parts[1] || '').trim();
+    }
+    if (!key) return toastWarning(t('apikey.missing'));
+    // H1: no 'us-east-1' fallback. An empty region here must reach the
+    // backend as "" so resolveApiKeyRegion runs its full multi-region probe
+    // instead of being pinned to a single (possibly wrong) region.
+    const region = regionFromKey || ($('kiroApiKeyRegion') && $('kiroApiKeyRegion').value.trim()) || '';
+    const nickname = ($('kiroApiKeyNickname') && $('kiroApiKeyNickname').value.trim()) || '';
+    const payload = {
+      kiroApiKey: key,
+      authMethod: 'api_key',
+      region,
+      nickname
+    };
+    try {
+      const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+      const d = await res.json();
+      if (d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('apikey.importSuccess') + ': ' + (d.account?.email || d.account?.id));
+        autoRefreshNewAccount(d.account?.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch (e) {
+      toastError(t('common.failed') + ': ' + (e.message || e));
+    }
+  }
   async function importLocalKiro() {
     const provider = $('localProvider').value;
     const tokenJson = $('localTokenJson').value.trim();
@@ -2594,30 +2743,10 @@
     let skipped = 0;
     try {
       const json = JSON.parse(raw);
-      if (json.accounts && Array.isArray(json.accounts)) {
-        items = json.accounts.map(a => {
-          const c = a.credentials || {};
-          return {
-            refreshToken: c.refreshToken || a.refreshToken,
-            accessToken: c.accessToken || a.accessToken,
-            clientId: c.clientId || a.clientId,
-            clientSecret: c.clientSecret || a.clientSecret,
-            kiroApiKey: c.kiroApiKey || a.kiroApiKey,
-            region: c.region || a.region,
-            authMethod: c.authMethod || a.authMethod,
-            provider: c.provider || a.provider || a.idp,
-            tokenEndpoint: c.tokenEndpoint || a.tokenEndpoint,
-            issuerUrl: c.issuerUrl || a.issuerUrl,
-            scopes: c.scopes || a.scopes,
-            id: a.id,
-            email: c.email || a.email,
-            profileArn: c.profileArn || a.profileArn,
-            userId: a.userId
-          };
-        });
-      } else {
-        items = Array.isArray(json) ? json : [json];
-      }
+      const source = json.accounts && Array.isArray(json.accounts)
+        ? json.accounts
+        : (Array.isArray(json) ? json : [json]);
+      items = source.map(normalizeCredentialRecord);
     } catch {
       const parsed = parseLineCredentials(raw);
       items = parsed.items;
@@ -2633,55 +2762,64 @@
     }
     let ok = 0, fail = 0, newIds = [];
     for (const item of items) {
-      // api_key accounts carry a kiroApiKey instead of a refreshToken; route them
-      // straight to the import endpoint's api_key branch.
-      const itemAuth = (item.authMethod || '').toLowerCase();
-      if (itemAuth === 'api_key' || item.kiroApiKey) {
-        if (!item.kiroApiKey) { fail++; continue; }
+      const rawMethod = String(item.authMethod || '').trim();
+      const rawProvider = String(item.provider || '').trim();
+      const methodKey = rawMethod.toLowerCase();
+      const providerKey = rawProvider.toLowerCase();
+      const kiroApiKey = String(item.kiroApiKey || '').trim();
+      const isApiKey = Boolean(kiroApiKey) || methodKey === 'api_key' || methodKey === 'apikey' ||
+        (!item.refreshToken && String(item.accessToken || '').trim().startsWith('ksk_'));
+      if (!isApiKey && !item.refreshToken) { fail++; continue; }
+      if (isApiKey) {
+        const payload = {
+          id: item.id || '',
+          email: item.email || '',
+          userId: item.userId || '',
+          nickname: item.nickname || '',
+          kiroApiKey: kiroApiKey || item.accessToken || '',
+          authMethod: 'api_key',
+          provider: rawProvider || 'APIKey',
+          region: item.region || 'us-east-1'
+        };
         try {
-          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify({
-            authMethod: 'api_key',
-            kiroApiKey: item.kiroApiKey,
-            region: item.region || 'us-east-1',
-            ...(item.id ? { id: item.id } : {}),
-            ...(item.email ? { email: item.email } : {}),
-            ...(item.provider ? { provider: item.provider } : {})
-          }) });
+          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
           const d = await res.json();
           if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
           else fail++;
         } catch { fail++; }
         continue;
       }
-      if (!item.refreshToken) { fail++; continue; }
-      const EXTERNAL_IDP = ['external_idp','azuread','azure','entra','entra-id','microsoft','m365','office365','external'];
-      let authMethod = (item.authMethod || '').toLowerCase();
-      if (EXTERNAL_IDP.includes(authMethod) || item.tokenEndpoint) {
-        authMethod = 'external_idp';
-      } else if (item.clientId && item.clientSecret) {
-        authMethod = 'idc';
-      } else if (!authMethod || authMethod === 'social') {
-        authMethod = 'social';
-      } else {
-        authMethod = authMethod === 'idc' ? 'idc' : 'social';
-      }
-      let provider = item.provider || '';
-      if (!provider && authMethod === 'external_idp') provider = 'AzureAD';
+      const externalAliases = [
+        'external_idp', 'external-idp', 'external', 'microsoft', 'm365', 'office365',
+        'azure', 'azuread', 'azure-ad', 'azure_ad', 'entra', 'entra-id'
+      ];
+      const isExternalIdp = externalAliases.includes(methodKey) ||
+        externalAliases.includes(providerKey) ||
+        Boolean(item.tokenEndpoint || item.issuerUrl);
+      let authMethod;
+      if (isExternalIdp) authMethod = 'external_idp';
+      else if (item.clientId && item.clientSecret) authMethod = 'idc';
+      else if (methodKey === 'idc') authMethod = 'idc';
+      else if (methodKey === 'social' || methodKey === 'google' || methodKey === 'github') authMethod = 'social';
+      else authMethod = methodKey ? 'social' : '';
+      let provider = isExternalIdp ? 'AzureAD' : rawProvider;
       if (!provider && authMethod === 'social') provider = 'Google';
       if (!provider && authMethod === 'idc') provider = 'BuilderId';
       const payload = {
+        id: item.id || '',
+        email: item.email || '',
+        userId: item.userId || '',
+        nickname: item.nickname || '',
+        profileArn: item.profileArn || '',
         refreshToken: item.refreshToken,
         accessToken: item.accessToken || '',
         clientId: item.clientId || '',
         clientSecret: item.clientSecret || '',
         authMethod, provider,
-        region: item.region || 'us-east-1',
+        region: item.region || (isExternalIdp ? '' : 'us-east-1'),
         tokenEndpoint: item.tokenEndpoint || '',
         issuerUrl: item.issuerUrl || '',
-        scopes: item.scopes || '',
-        ...(item.id ? { id: item.id } : {}),
-        ...(item.email ? { email: item.email } : {}),
-        ...(item.profileArn ? { profileArn: item.profileArn } : {})
+        scopes: item.scopes || ''
       };
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
@@ -2696,6 +2834,33 @@
     if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
     toastPrimary(msg, { duration: 5200 });
     newIds.forEach(autoRefreshNewAccount);
+  }
+  function normalizeCredentialRecord(record) {
+    const source = record && typeof record === 'object' ? record : {};
+    const credentials = source.credentials && typeof source.credentials === 'object'
+      ? source.credentials
+      : {};
+    const value = key => Object.prototype.hasOwnProperty.call(credentials, key)
+      ? credentials[key]
+      : source[key];
+    return {
+      id: value('id'),
+      email: value('email'),
+      userId: value('userId'),
+      nickname: value('nickname'),
+      profileArn: value('profileArn'),
+      accessToken: value('accessToken'),
+      refreshToken: value('refreshToken'),
+      kiroApiKey: value('kiroApiKey'),
+      clientId: value('clientId'),
+      clientSecret: value('clientSecret'),
+      authMethod: value('authMethod'),
+      provider: value('provider') || source.idp,
+      region: value('region'),
+      tokenEndpoint: value('tokenEndpoint'),
+      issuerUrl: value('issuerUrl'),
+      scopes: value('scopes')
+    };
   }
   function parseLineCredentials(text) {
     const items = [];
@@ -2994,6 +3159,187 @@
       } else toastError(t('common.failed') + ': ' + (d.error || ''));
     }
   }
+  function cancelMicrosoftServerSession(sessionId, selectionId) {
+    if (!sessionId && !selectionId) return;
+    api('/auth/microsoft-sso/cancel', {
+      method: 'POST',
+      body: JSON.stringify({
+        sessionId: sessionId || '',
+        selectionId: selectionId || ''
+      })
+    }).catch(() => {});
+  }
+  function resetMicrosoftFlow(notifyServer) {
+    const sessionId = microsoftSession;
+    const selectionId = microsoftSelectionId;
+    microsoftGeneration++;
+    microsoftSession = '';
+    microsoftSelectionId = '';
+    microsoftStage = 'kiro';
+    microsoftAuthorizeUrl = '';
+    microsoftProfiles = [];
+    microsoftSelectedProfileArn = '';
+    microsoftBusy = false;
+    if (notifyServer) cancelMicrosoftServerSession(sessionId, selectionId);
+  }
+  function syncMicrosoftBusyUI() {
+    const loginAction = $('microsoftBtn');
+    if (loginAction) {
+      loginAction.disabled = microsoftBusy;
+      loginAction.textContent = microsoftBusy
+        ? t('microsoft.processing')
+        : (microsoftAuthorizeUrl ? t('microsoft.complete') : t('microsoft.start'));
+    }
+    const profileAction = $('microsoftSelectProfileBtn');
+    if (profileAction) {
+      profileAction.disabled = microsoftBusy;
+      profileAction.textContent = microsoftBusy ? t('microsoft.processing') : t('microsoft.selectProfile');
+    }
+    qsa('[data-microsoft-back]', $('modalBody')).forEach(button => {
+      button.disabled = microsoftBusy;
+    });
+  }
+  async function startMicrosoftLogin() {
+    if (microsoftBusy) return;
+    microsoftBusy = true;
+    syncMicrosoftBusyUI();
+    const generation = microsoftGeneration;
+    try {
+      const res = await api('/auth/microsoft-sso/start', {
+        method: 'POST',
+        body: JSON.stringify({})
+      });
+      const d = await res.json().catch(() => ({}));
+      if (generation !== microsoftGeneration) {
+        cancelMicrosoftServerSession(d.sessionId || '', d.selectionId || '');
+        return;
+      }
+      if (!res.ok || !d.sessionId || !d.authorizeUrl) {
+        toastError(t('common.failed') + ': ' + (d.error || res.statusText || ''));
+        return;
+      }
+      microsoftSession = d.sessionId;
+      microsoftAuthorizeUrl = d.authorizeUrl;
+      microsoftStage = 'kiro';
+      microsoftBusy = false;
+      renderMicrosoftModal();
+    } catch (e) {
+      if (generation === microsoftGeneration) {
+        toastError(t('common.failed') + ': ' + (e.message || ''));
+      }
+    } finally {
+      if (generation === microsoftGeneration && microsoftBusy) {
+        microsoftBusy = false;
+        syncMicrosoftBusyUI();
+      }
+    }
+  }
+  async function completeMicrosoftLogin() {
+    if (microsoftBusy) return;
+    const callback = ($('microsoftCallback')?.value || '').trim();
+    if (!callback) {
+      toastWarning(t('microsoft.callbackRequired'));
+      $('microsoftCallback')?.focus();
+      return;
+    }
+    microsoftBusy = true;
+    syncMicrosoftBusyUI();
+    const generation = microsoftGeneration;
+    const sessionId = microsoftSession;
+    try {
+      const res = await api('/auth/microsoft-sso/complete', {
+        method: 'POST',
+        body: JSON.stringify({
+          sessionId: microsoftSession,
+          callbackUrl: callback
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (generation !== microsoftGeneration) {
+        cancelMicrosoftServerSession(sessionId, d.selectionId || '');
+        return;
+      }
+      if (!res.ok || d.error) {
+        toastError(t('common.failed') + ': ' + (d.error || res.statusText || ''));
+        return;
+      }
+      if (d.requiresProfileSelection && d.selectionId && Array.isArray(d.profiles) && d.profiles.length) {
+        microsoftSelectionId = d.selectionId;
+        microsoftProfiles = d.profiles;
+        microsoftSelectedProfileArn = String(d.profiles[0]?.arn || '');
+        microsoftBusy = false;
+        renderMicrosoftModal();
+        return;
+      }
+      if (d.account) {
+        finishMicrosoftLogin(d.account, d.warning);
+        return;
+      }
+      if (d.stage === 'microsoft' && d.authorizeUrl) {
+        microsoftStage = 'microsoft';
+        microsoftAuthorizeUrl = d.authorizeUrl;
+        microsoftBusy = false;
+        renderMicrosoftModal();
+        return;
+      }
+      toastError(t('common.failed') + ': ' + (d.error || t('microsoft.invalidResponse')));
+    } catch (e) {
+      if (generation === microsoftGeneration) {
+        toastError(t('common.failed') + ': ' + (e.message || ''));
+      }
+    } finally {
+      if (generation === microsoftGeneration && microsoftBusy) {
+        microsoftBusy = false;
+        syncMicrosoftBusyUI();
+      }
+    }
+  }
+  async function selectMicrosoftProfile() {
+    if (microsoftBusy) return;
+    const selected = qsa('input[name="microsoftProfile"]:checked', $('modalBody'))[0];
+    const profileArn = (selected?.value || microsoftSelectedProfileArn || '').trim();
+    if (!profileArn) {
+      toastWarning(t('microsoft.profileRequired'));
+      return;
+    }
+    microsoftBusy = true;
+    syncMicrosoftBusyUI();
+    const generation = microsoftGeneration;
+    try {
+      const res = await api('/auth/microsoft-sso/select-profile', {
+        method: 'POST',
+        body: JSON.stringify({
+          selectionId: microsoftSelectionId,
+          profileArn
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (generation !== microsoftGeneration) return;
+      if (!res.ok || !d.account) {
+        toastError(t('common.failed') + ': ' + (d.error || res.statusText || ''));
+        return;
+      }
+      finishMicrosoftLogin(d.account, d.warning);
+    } catch (e) {
+      if (generation === microsoftGeneration) {
+        toastError(t('common.failed') + ': ' + (e.message || ''));
+      }
+    } finally {
+      if (generation === microsoftGeneration && microsoftBusy) {
+        microsoftBusy = false;
+        syncMicrosoftBusyUI();
+      }
+    }
+  }
+  function finishMicrosoftLogin(account, warning) {
+    resetMicrosoftFlow(false);
+    closeModal();
+    loadAccounts();
+    loadStats();
+    toastPrimary(t('microsoft.success') + ': ' + (account?.email || account?.id || ''));
+    if (warning) toastWarning(String(warning));
+    autoRefreshNewAccount(account?.id);
+  }
   async function autoRefreshNewAccount(id) {
     if (!id) return;
     try { await api('/accounts/' + id + '/refresh', { method: 'POST' }); } catch (e) { }
@@ -3071,10 +3417,7 @@
     if (exportSelectedIds.size === 0) { toastWarning(t('export.noSelection')); return; }
     const jsonPromise = getExportData().then(data => {
       if (!data) throw new Error('no-data');
-      const filtered = (data.accounts || []).map(a => {
-        const { clientId, clientSecret, accessToken, refreshToken } = a.credentials || {};
-        return { clientId, clientSecret, accessToken, refreshToken };
-      });
+      const filtered = (data.accounts || []).map(credentialImportPayloadFromExportAccount);
       return JSON.stringify(filtered, null, 2);
     });
     try {
@@ -3391,6 +3734,12 @@
     $('modalBody').addEventListener('click', e => {
       const m = e.target.closest('[data-method]');
       if (m) { showModal(m.dataset.method); return; }
+      const microsoftBack = e.target.closest('[data-microsoft-back]');
+      if (microsoftBack) {
+        resetMicrosoftFlow(true);
+        showModal('add');
+        return;
+      }
       const g = e.target.closest('[data-modal-goto]');
       if (g) { showModal(g.dataset.modalGoto); return; }
       if (e.target.dataset.closeAdd) closeModal();

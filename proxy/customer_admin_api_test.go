@@ -848,8 +848,8 @@ func TestAdminAddKiroAccountRepairsDeadSlot(t *testing.T) {
 		AuthMethod: "external_idp", Region: "eu-central-1",
 		ProfileArn: "arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABCDEF",
 		ClientID:   "cid-old", TokenEndpoint: "https://idp/old", Scopes: "old",
-		Nickname:   "keep-my-nickname",
-		Enabled:    false, BanStatus: "BANNED", BanReason: "Authentication failed - token invalid or expired",
+		Nickname: "keep-my-nickname",
+		Enabled:  false, BanStatus: "BANNED", BanReason: "Authentication failed - token invalid or expired",
 		BanTime: 12345,
 	}
 	if err := config.AddAccount(dead); err != nil {
@@ -921,8 +921,10 @@ func TestAdminAddKiroAccountDoesNotDedupeDistinctAccounts(t *testing.T) {
 	}
 
 	for _, email := range []string{"a@example.com", "b@example.com"} {
+		// Distinct identities carry distinct refresh tokens — AddAccount rejects a
+		// reused one, and sharing a literal here would test an impossible state.
 		rec := serve(h, adminReq(http.MethodPost, "/admin/add_kiro_account",
-			`{"account":{"accessToken":"at","refreshToken":"rt",`+
+			`{"account":{"accessToken":"at-`+email+`","refreshToken":"rt-`+email+`",`+
 				`"authMethod":"external_idp","region":"eu-central-1","email":"`+email+`",`+
 				`"profileArn":"arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABCDEF",`+
 				`"clientId":"cid","tokenEndpoint":"https://idp/token","scopes":"s"},"enabled":false}`, "topsecret"))
@@ -957,7 +959,7 @@ func TestAdminAddKiroApiKeyDedupesAgainstOAuthAccountByProfileRegion(t *testing.
 		ID: "oauth-1", Email: "shared@example.com", UserId: "kiro-user-S",
 		AccessToken: "at", RefreshToken: "rt", AuthMethod: "external_idp",
 		Region:     "us-east-1",
-		ProfileArn: "arn:aws:codewhisperer:eu-central-1:1:profile/ABC",
+		ProfileArn: "arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABC",
 		Enabled:    true,
 	}
 	if err := config.AddAccount(oauth); err != nil {
@@ -1018,7 +1020,7 @@ func TestAdminAddKiroAccountDoesNotDowngradeAnApiKeySlot(t *testing.T) {
 	rec := serve(h, adminReq(http.MethodPost, "/admin/add_kiro_account",
 		`{"account":{"accessToken":"at-oauth","refreshToken":"rt-oauth","authMethod":"external_idp",`+
 			`"region":"eu-central-1","email":"shared@example.com",`+
-			`"profileArn":"arn:aws:codewhisperer:eu-central-1:1:profile/ABC",`+
+			`"profileArn":"arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABC",`+
 			`"clientId":"cid","tokenEndpoint":"https://idp/token","scopes":"s"},"enabled":false}`, "topsecret"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())

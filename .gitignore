@@ -16,6 +16,11 @@
 .DS_Store
 Thumbs.db
 
+# Agent tooling state (local only)
+.omc/
+**/.omc/
+.codegraph/
+
 # Zeabur local CLI context (contains personal project/service IDs)
 .zeabur/
 

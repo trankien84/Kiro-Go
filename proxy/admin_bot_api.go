@@ -1099,7 +1099,10 @@ func (h *Handler) handleAdminAddKiroAccount(w http.ResponseWriter, r *http.Reque
 		// MachineId is deliberately NOT regenerated — it is a stable per-account
 		// device identity for upstream request tracking, and churning it on every
 		// re-upload would make one account look like a fleet of new machines.
-		if err := config.UpdateAccount(existing.ID, updated); err != nil {
+		//
+		// UpdateAccountCredentials, not UpdateAccount: this path exists to REPLACE
+		// the credential, and UpdateAccount deliberately preserves the stored one.
+		if err := config.UpdateAccountCredentials(existing.ID, updated); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

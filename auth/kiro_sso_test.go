@@ -3,8 +3,6 @@ package auth
 import (
 	"encoding/base64"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"strings"
@@ -69,32 +67,6 @@ func TestExtractEmailFromJWT(t *testing.T) {
 	}
 }
 
-func TestValidateExternalIdpEndpoint(t *testing.T) {
-	valid := []string{
-		"https://login.microsoftonline.com/5fbc183e/v2.0",
-		"https://login.microsoftonline.us/tenant/v2.0",
-		"https://login.microsoftonline.cn/tenant/oauth2/v2.0/token",
-	}
-	for _, u := range valid {
-		if err := validateExternalIdpEndpoint(u); err != nil {
-			t.Fatalf("expected %q to be allowed, got %v", u, err)
-		}
-	}
-	invalid := []string{
-		"http://login.microsoftonline.com/x",      // not https
-		"https://evil-microsoftonline.com/x",       // suffix not anchored to a subdomain boundary
-		"https://login.microsoftonline.com.evil.co", // not an allowed suffix
-		"https://10.0.0.5/x",                        // IP literal
-		"https://accounts.google.com/x",             // not allow-listed
-		"https:///x",                                // no host
-	}
-	for _, u := range invalid {
-		if err := validateExternalIdpEndpoint(u); err == nil {
-			t.Fatalf("expected %q to be rejected", u)
-		}
-	}
-}
-
 func TestExternalIdpAuthorizeURL(t *testing.T) {
 	raw := externalIdpAuthorizeURL(
 		"https://login.microsoftonline.com/t/oauth2/v2.0/authorize",
@@ -140,86 +112,6 @@ func TestExternalIdpAuthorizeURLOmitsEmptyLoginHint(t *testing.T) {
 	}
 }
 
-// TestRefreshExternalIdpToken drives the refresh_token grant against a stub IdP
-// token endpoint and asserts the form encoding and response mapping.
-func TestRefreshExternalIdpToken(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			t.Fatalf("parse form: %v", err)
-		}
-		if r.Form.Get("grant_type") != "refresh_token" {
-			t.Fatalf("grant_type = %q", r.Form.Get("grant_type"))
-		}
-		if r.Form.Get("client_id") != "azure-client" {
-			t.Fatalf("client_id = %q", r.Form.Get("client_id"))
-		}
-		if r.Form.Get("refresh_token") != "old-refresh" {
-			t.Fatalf("refresh_token = %q", r.Form.Get("refresh_token"))
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`))
-	}))
-	defer srv.Close()
-
-	// The POST boundary re-validates tokenEndpoint against the allow-list, which rejects
-	// the httptest URL (http + 127.0.0.1). Install a permissive validator for the test.
-	restore := SetExternalIdpValidatorForTest(func(string) error { return nil })
-	defer SetExternalIdpValidatorForTest(restore)
-
-	access, refresh, expiresAt, profileArn, err := refreshExternalIdpToken(
-		"old-refresh", "azure-client", srv.URL, "api://x/codewhisperer:conversations offline_access", srv.Client(),
-	)
-	if err != nil {
-		t.Fatalf("refreshExternalIdpToken: %v", err)
-	}
-	if access != "new-access" {
-		t.Fatalf("access = %q", access)
-	}
-	if refresh != "new-refresh" {
-		t.Fatalf("refresh = %q", refresh)
-	}
-	if profileArn != "" {
-		t.Fatalf("external IdP refresh should not return a profileArn, got %q", profileArn)
-	}
-	if expiresAt == 0 {
-		t.Fatalf("expected a non-zero absolute expiry")
-	}
-}
-
-// TestRefreshExternalIdpTokenKeepsRefreshTokenWhenOmitted verifies the existing
-// refresh token is retained when the IdP response omits a rotated one.
-func TestRefreshExternalIdpTokenKeepsRefreshTokenWhenOmitted(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_token":"a2","expires_in":1200}`))
-	}))
-	defer srv.Close()
-
-	// See TestRefreshExternalIdpToken: relax the allow-list for the httptest endpoint.
-	restore := SetExternalIdpValidatorForTest(func(string) error { return nil })
-	defer SetExternalIdpValidatorForTest(restore)
-
-	_, refresh, _, _, err := refreshExternalIdpToken("keep-me", "c", srv.URL, "", srv.Client())
-	if err != nil {
-		t.Fatalf("refreshExternalIdpToken: %v", err)
-	}
-	if refresh != "keep-me" {
-		t.Fatalf("expected refresh token to be retained, got %q", refresh)
-	}
-}
-
-// TestRefreshExternalIdpTokenRequiresClientAndEndpoint guards the precondition
-// that distinguishes the external-IdP branch from the AWS OIDC branch.
-func TestRefreshExternalIdpTokenRequiresClientAndEndpoint(t *testing.T) {
-	if _, _, _, _, err := refreshExternalIdpToken("r", "", "https://login.microsoftonline.com/t/token", "", http.DefaultClient); err == nil {
-		t.Fatalf("expected error when clientID is empty")
-	}
-	if _, _, _, _, err := refreshExternalIdpToken("r", "c", "", "", http.DefaultClient); err == nil {
-		t.Fatalf("expected error when tokenEndpoint is empty")
-	}
-}
-
-// TestValidateExternalIdpEndpointAcceptsAllowListed verifies the exported validator
 // accepts real Azure / Microsoft 365 token endpoints (commercial, us-gov, china).
 func TestValidateExternalIdpEndpointAcceptsAllowListed(t *testing.T) {
 	for _, raw := range []string{
@@ -238,8 +130,8 @@ func TestValidateExternalIdpEndpointAcceptsAllowListed(t *testing.T) {
 // and non-allow-listed hosts.
 func TestValidateExternalIdpEndpointRejectsUnsafe(t *testing.T) {
 	for _, raw := range []string{
-		"http://login.microsoftonline.com/x",  // not https
-		"https://127.0.0.1/oauth/token",       // IP literal
+		"http://login.microsoftonline.com/x",   // not https
+		"https://127.0.0.1/oauth/token",        // IP literal
 		"https://evil.example.com/oauth/token", // not allow-listed
 	} {
 		if err := ValidateExternalIdpEndpoint(raw); err == nil {
@@ -278,8 +170,10 @@ func TestDeriveExternalIdpEndpoints(t *testing.T) {
 		t.Fatalf("scopes: got %q", sc)
 	}
 
-	// From the accessToken JWT issuer (bare blobs carry no userId).
-	jwt := "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"`+userID+`"}`)) + "."
+	// From the accessToken JWT issuer (bare blobs carry no userId). Unlike the
+	// KAM userId — which appends the object id after "v2.0" — a real Entra access
+	// token's iss claim ends at "/<tenant>/v2.0", so the fixture uses that shape.
+	jwt := "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"`+wantIss+`"}`)) + "."
 	te2, iss2, sc2 := DeriveExternalIdpEndpoints("", clientID, jwt)
 	if te2 != wantTE || iss2 != wantIss {
 		t.Fatalf("from accessToken JWT: te=%q iss=%q (want %q / %q)", te2, iss2, wantTE, wantIss)

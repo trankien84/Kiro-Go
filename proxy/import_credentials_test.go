@@ -144,12 +144,12 @@ func authOidcURL() func(string) string { return auth.GetOIDCTokenURLForTest() }
 // clientSecret, so the old default branch misclassified them as "social".
 func TestNormalizeImportAuthMethod(t *testing.T) {
 	cases := []struct {
-		name           string
-		authMethod     string
-		clientID       string
-		clientSecret   string
-		tokenEndpoint  string
-		want           string
+		name          string
+		authMethod    string
+		clientID      string
+		clientSecret  string
+		tokenEndpoint string
+		want          string
 	}{
 		{"explicit external_idp", "external_idp", "c", "", "https://login.microsoftonline.com/t/oauth2/v2.0/token", "external_idp"},
 		{"azure alias", "AzureAD", "c", "", "https://login.microsoftonline.com/t/oauth2/v2.0/token", "external_idp"},
@@ -345,7 +345,9 @@ func TestApiImportCredentialsExternalIdpPreservesFullRecordIdentity(t *testing.T
 	h := &Handler{pool: accountpool.GetPool()}
 
 	const providedID = "11111111-2222-3333-4444-555555555555"
-	body := fmt.Sprintf(`{"id":%q,"email":"ada@example.com","profileArn":"arn:aws:codewhisperer:eu-central-1:1:profile/PRESERVED","authMethod":"external_idp","refreshToken":"rt","clientId":"c","tokenEndpoint":%q,"region":"eu-central-1"}`, providedID, fake.URL)
+	// Account-ID segment must be a real 12-digit AWS account id (kiroAccountPattern);
+	// "1" was a shorthand placeholder that no longer parses as a valid profile ARN.
+	body := fmt.Sprintf(`{"id":%q,"email":"ada@example.com","profileArn":"arn:aws:codewhisperer:eu-central-1:123456789012:profile/PRESERVED","authMethod":"external_idp","refreshToken":"rt","clientId":"c","tokenEndpoint":%q,"region":"eu-central-1"}`, providedID, fake.URL)
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	h.apiImportCredentials(rec, req)
@@ -360,7 +362,7 @@ func TestApiImportCredentialsExternalIdpPreservesFullRecordIdentity(t *testing.T
 	if got.Email != "ada@example.com" {
 		t.Fatalf("Email: want ada@example.com (GetUserInfo empty in test → fallback), got %q", got.Email)
 	}
-	if got.ProfileArn != "arn:aws:codewhisperer:eu-central-1:1:profile/PRESERVED" {
+	if got.ProfileArn != "arn:aws:codewhisperer:eu-central-1:123456789012:profile/PRESERVED" {
 		t.Fatalf("ProfileArn: want preserved, got %q", got.ProfileArn)
 	}
 }
@@ -472,5 +474,159 @@ func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) 
 	}
 	if got.RefreshToken != "rt" {
 		t.Fatalf("RefreshToken: want the pasted token (not rotated), got %q", got.RefreshToken)
+	}
+}
+
+// TestApiImportCredentialsAPIKeySuccess verifies importing a Kiro API-key
+// credential: it persists AuthMethod "api_key" with the key mirrored into
+// AccessToken (so pool selection logic that only looks at AccessToken still
+// works), region parsed from the "key|region" suffix, and no OAuth fields set.
+func TestApiImportCredentialsAPIKeySuccess(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	// The import handler spawns a background, un-awaited model-list refresh
+	// for enabled accounts. Route it through a stub transport with no Proxy
+	// configured (rather than the real http.ProxyFromEnvironment-backed
+	// client) and restore to an equally inert stub afterward — never back to
+	// the real client — since the goroutine may still be in flight after this
+	// test returns and would otherwise poison TestBuildKiroTransport*, which
+	// relies on http.ProxyFromEnvironment reading env vars for the first time.
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
+
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"kiroApiKey":"ksk_test_import|eu-central-1","authMethod":"api_key","nickname":"cli-key"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	accs := config.GetAccounts()
+	if len(accs) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(accs))
+	}
+	got := accs[0]
+	if got.AuthMethod != "api_key" || got.KiroApiKey != "ksk_test_import" {
+		t.Fatalf("unexpected account: %+v", got)
+	}
+	if got.AccessToken != "ksk_test_import" {
+		t.Fatalf("accessToken should mirror api key, got %q", got.AccessToken)
+	}
+	if got.Region != "eu-central-1" {
+		t.Fatalf("region = %q", got.Region)
+	}
+	if got.RefreshToken != "" || got.ExpiresAt != 0 || got.ProfileArn != "" {
+		t.Fatalf("oauth fields should be empty: %+v", got)
+	}
+	if got.MachineId != config.MachineIdFromAPIKey("ksk_test_import") {
+		t.Fatalf("machineId = %q", got.MachineId)
+	}
+}
+
+// TestApiImportCredentialsAPIKeyDuplicateRejected verifies re-importing the
+// same Kiro API key is rejected with 409 rather than creating a duplicate
+// account entry.
+func TestApiImportCredentialsAPIKeyDuplicateRejected(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	// See TestApiImportCredentialsAPIKeySuccess: avoid ever restoring the real
+	// http.ProxyFromEnvironment-backed client, since the background model
+	// refresh goroutine may still be in flight after this test returns.
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
+
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"kiroApiKey":"ksk_dup_import","authMethod":"api_key"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first import expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req2 := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec2 := httptest.NewRecorder()
+	h.apiImportCredentials(rec2, req2)
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("duplicate expected 409, got %d body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// TestApiImportCredentialsAPIKeyDropsUnverifiedIdentityOnProbeFailure is the
+// regression test for H1: when resolveApiKeyRegion's live probe fails (network
+// down, key mistyped, transient upstream outage — the import must still
+// succeed per the CLI export/restore trust-on-import contract, matching
+// TestApiImportCredentialsAPIKeySuccess), the caller-supplied email/userId
+// were previously persisted verbatim with NO live confirmation they actually
+// belong to this key. findAccountForKiroIdentity (admin_bot_api.go) later
+// matches on exactly those fields to recognize "the same Kiro account" — so a
+// bad-key import carrying a real account's identity could plant a slot that
+// makes a later legitimate supply-side add either get discarded as a false
+// duplicate or overwrite its live credential into the planted slot. The fix
+// drops (blanks) email/userId whenever the probe could not verify them; the
+// key and region still import unchanged (availability preserved).
+func TestApiImportCredentialsAPIKeyDropsUnverifiedIdentityOnProbeFailure(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	// Network disabled → resolveApiKeyRegion's probe fails for every candidate
+	// region, exactly like TestApiImportCredentialsAPIKeySuccess.
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
+
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"kiroApiKey":"ksk_unverified|eu-central-1","authMethod":"api_key","email":"real-owner@example.com","userId":"real-owner-uid"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (trust-on-import must still succeed), got %d body=%s", rec.Code, rec.Body.String())
+	}
+	accs := config.GetAccounts()
+	if len(accs) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(accs))
+	}
+	got := accs[0]
+	if got.KiroApiKey != "ksk_unverified" || got.Region != "eu-central-1" {
+		t.Fatalf("key/region should still import from the unverifiable request: %+v", got)
+	}
+	// UserId has no synthetic fallback (config.NormalizeAPIKeyAccount only
+	// backfills Email), so it staying blank directly proves the caller-supplied
+	// value was dropped. Email gets a synthetic "api-key-<fingerprint>" display
+	// placeholder deterministically derived from the KEY itself when blank
+	// (NormalizeAPIKeyAccount) — harmless for identity matching (an attacker
+	// cannot steer it to collide with a real account's email) — so the
+	// assertion is "not the attacker-supplied value", not "empty".
+	if got.UserId != "" {
+		t.Fatalf("userId=%q, want blank — a failed probe must not let unverified caller-supplied identity into the account", got.UserId)
+	}
+	if got.Email == "real-owner@example.com" {
+		t.Fatalf("email=%q, want the caller-supplied (unverified) identity dropped, not persisted verbatim", got.Email)
 	}
 }

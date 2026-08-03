@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"errors"
+	"hash/crc32"
 	"io"
 	"testing"
 )
@@ -51,8 +52,9 @@ func (b *closeTrackingBody) Close() error { b.closed = true; return nil }
 
 // buildAssistantResponseEvent builds a minimal AWS event-stream frame carrying
 // an assistantResponseEvent with the given content, so a test can drive
-// parseEventStream's OnText callback without a live upstream. The prelude and
-// message CRC32 fields are zeroed — parseEventStream does not verify them.
+// parseEventStream's OnText callback without a live upstream. Both CRC32 fields
+// are computed for real: the parser verifies the prelude CRC and the message CRC
+// and rejects the frame before dispatch if either is wrong.
 func buildAssistantResponseEvent(content string) []byte {
 	payload := []byte(`{"content":"` + content + `"}`)
 	const eventType = "assistantResponseEvent"
@@ -66,19 +68,34 @@ func buildAssistantResponseEvent(content string) []byte {
 	h.WriteString(eventType)
 	headers := h.Bytes()
 	totalLength := 12 + len(headers) + len(payload) + 4
+
+	// Prelude: total_len(4) + headers_len(4) + crc32(first 8 bytes).
+	prelude := make([]byte, 12)
+	prelude[0] = byte(totalLength >> 24)
+	prelude[1] = byte(totalLength >> 16)
+	prelude[2] = byte(totalLength >> 8)
+	prelude[3] = byte(totalLength)
+	prelude[4] = byte(len(headers) >> 24)
+	prelude[5] = byte(len(headers) >> 16)
+	prelude[6] = byte(len(headers) >> 8)
+	prelude[7] = byte(len(headers))
+	preludeCRC := crc32.ChecksumIEEE(prelude[:8])
+	prelude[8] = byte(preludeCRC >> 24)
+	prelude[9] = byte(preludeCRC >> 16)
+	prelude[10] = byte(preludeCRC >> 8)
+	prelude[11] = byte(preludeCRC)
+
+	// Message CRC covers the full prelude plus headers+payload.
+	body := append(append([]byte{}, headers...), payload...)
+	messageCRC := eventStreamChecksum(prelude, body)
+
 	var f bytes.Buffer
-	f.WriteByte(byte(totalLength >> 24))
-	f.WriteByte(byte(totalLength >> 16))
-	f.WriteByte(byte(totalLength >> 8))
-	f.WriteByte(byte(totalLength))
-	f.WriteByte(byte(len(headers) >> 24))
-	f.WriteByte(byte(len(headers) >> 16))
-	f.WriteByte(byte(len(headers) >> 8))
-	f.WriteByte(byte(len(headers)))
-	f.Write(make([]byte, 4)) // prelude CRC (zeroed; parseEventStream does not verify)
-	f.Write(headers)
-	f.Write(payload)
-	f.Write(make([]byte, 4)) // message CRC (zeroed; parseEventStream does not verify)
+	f.Write(prelude)
+	f.Write(body)
+	f.WriteByte(byte(messageCRC >> 24))
+	f.WriteByte(byte(messageCRC >> 16))
+	f.WriteByte(byte(messageCRC >> 8))
+	f.WriteByte(byte(messageCRC))
 	return f.Bytes()
 }
 

@@ -60,19 +60,81 @@ func refreshLockFor(id string) *sync.Mutex {
 // for id-less accounts (login validation, which has no shared state to
 // coordinate against) and as the inner step of the locked RefreshToken.
 func refreshTokenDirect(account *config.Account) (string, string, int64, string, error) {
+	// Kiro API-key credentials (ksk_...) ARE the bearer token: there is no
+	// refresh grant behind them, so a refresh attempt would only produce a
+	// confusing upstream error. Reject explicitly (upstream behaviour).
+	if config.IsAPIKeyAccount(account) {
+		return "", "", 0, "", fmt.Errorf("API Key credentials do not support token refresh")
+	}
+	// Resolve per-account proxy: account.ProxyURL > global config
 	proxyURL := account.ProxyURL
 	if proxyURL == "" {
 		proxyURL = config.GetProxyURL()
 	}
 	client := GetAuthClientForProxy(proxyURL)
-	switch account.AuthMethod {
-	case "external_idp":
-		return refreshExternalIdpToken(account.RefreshToken, account.ClientID, account.TokenEndpoint, account.Scopes, client)
-	case "social":
-		return refreshSocialToken(account.RefreshToken, client)
-	default:
-		return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
+
+	// External-IdP (enterprise SSO) accounts refresh against the IdP's own token
+	// endpoint, not the AWS SSO OIDC endpoint. EqualFold/TrimSpace tolerates the
+	// casing/whitespace variance that pasted-credential imports produce.
+	//
+	// MicrosoftSSOAuthMethod is literally "external_idp", which our fork also
+	// persists for GENERIC (non-Microsoft) enterprise IdPs. Dispatching on that
+	// string alone would push every generic account into the Microsoft refresh,
+	// which unconditionally uuid.Parse()es the client_id and tenant-matches the
+	// issuer — so a perfectly valid Okta/Ping/Keycloak credential could never
+	// refresh, failing locally with "Microsoft client_id is not a valid UUID"
+	// before the IdP was ever contacted. Provider is the persisted classification
+	// written at import/login time, so it — not the shared AuthMethod string — is
+	// what selects the strict path.
+	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), MicrosoftSSOAuthMethod) {
+		if isMicrosoftExternalIdp(account.Provider) {
+			// IssuerURL is passed so the refresh binds the token endpoint to the
+			// same tenant as the issuer before the refresh token leaves the process.
+			accessToken, refreshToken, expiresAt, profileArn, err := refreshExternalIdpToken(
+				account.RefreshToken,
+				account.ClientID,
+				account.TokenEndpoint,
+				account.IssuerURL,
+				account.Scopes,
+				client,
+			)
+			if err != nil && IsMicrosoftValidationShapeError(err) {
+				// The interactive enterprise-SSO login (kiro_sso.go's exchange())
+				// hardcodes Provider="AzureAD" for every external_idp login,
+				// regardless of which IdP the portal descriptor actually named —
+				// so isMicrosoftExternalIdp above can be wrong for a genuinely
+				// generic (Okta/Ping/Keycloak/v1-issuer) account. A LOCAL
+				// validation-shape failure (unexpected scope, non-UUID client_id,
+				// non-Entra issuer/tenant shape) — never a network call or an
+				// actual IdP rejection — is exactly that mis-classification
+				// surfacing, so retry once via the generic OAuth2 refresh, which
+				// is what this account would have used pre-classification and
+				// imposes no Microsoft-specific shape. postGenericExternalIdpToken
+				// still re-runs the SSRF host allow-list, so this does not relax
+				// where the refresh token may be sent.
+				logger.Warnf("[ExternalIdP] account %s classified Microsoft (Provider=%q) but failed strict validation (%v); falling back to generic OAuth2 refresh", account.Email, account.Provider, err)
+				return refreshGenericExternalIdpToken(
+					account.RefreshToken,
+					account.ClientID,
+					account.TokenEndpoint,
+					account.Scopes,
+					client,
+				)
+			}
+			return accessToken, refreshToken, expiresAt, profileArn, err
+		}
+		return refreshGenericExternalIdpToken(
+			account.RefreshToken,
+			account.ClientID,
+			account.TokenEndpoint,
+			account.Scopes,
+			client,
+		)
 	}
+	if account.AuthMethod == "social" {
+		return refreshSocialToken(account.RefreshToken, client)
+	}
+	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
 }
 
 // RefreshToken refreshes the account's access token. For id-bearing accounts it
@@ -85,6 +147,24 @@ func refreshTokenDirect(account *config.Account) (string, string, int64, string,
 //
 // Returns: accessToken, refreshToken, expiresAt, profileArn, error.
 func RefreshToken(account *config.Account) (string, string, int64, string, error) {
+	return refreshTokenLocked(account, false)
+}
+
+// RefreshTokenForce is RefreshToken without the "already fresh → skip the POST"
+// short-circuit. It still takes the per-account lock (so a forced refresh cannot
+// interleave with an implicit one and lose a rotated refresh token), but it
+// always performs the IdP round-trip.
+//
+// This exists because the skip is a refresh-storm optimization for IMPLICIT
+// refreshes, and silently applying it to an explicit "refresh this account now"
+// request (admin panel, credential re-validation) would make that request a
+// no-op whenever the cached token merely looks fresh. Callers that pass a force
+// flag must use this entry point; everything else should use RefreshToken.
+func RefreshTokenForce(account *config.Account) (string, string, int64, string, error) {
+	return refreshTokenLocked(account, true)
+}
+
+func refreshTokenLocked(account *config.Account, force bool) (string, string, int64, string, error) {
 	if account == nil {
 		return "", "", 0, "", fmt.Errorf("RefreshToken: nil account")
 	}
@@ -101,13 +181,17 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	defer lock.Unlock()
 
 	// Double-checked locking: a concurrent refresh may have renewed the token
-	// while we waited. Re-read the canonical expiry from config; if it is still
-	// valid, propagate it and skip the IdP POST. Either way adopt the canonical
-	// fields (a concurrent refresh may have rotated the refresh token).
+	// while we waited. Re-read the canonical fields either way — a concurrent
+	// refresh may have rotated the refresh token, and replaying the stale one
+	// would be rejected (Entra refresh tokens are single-use). When not forced and
+	// the canonical token is still valid, propagate it and skip the IdP POST; that
+	// skip is what collapses a refresh storm into one round-trip.
 	if live, ok := config.GetAccountByID(account.ID); ok {
 		*account = live
-		if now := time.Now().Unix(); live.ExpiresAt > 0 && now < live.ExpiresAt-refreshSkewSeconds {
-			return live.AccessToken, live.RefreshToken, live.ExpiresAt, live.ProfileArn, nil
+		if !force {
+			if now := time.Now().Unix(); live.ExpiresAt > 0 && now < live.ExpiresAt-refreshSkewSeconds {
+				return live.AccessToken, live.RefreshToken, live.ExpiresAt, live.ProfileArn, nil
+			}
 		}
 	}
 
@@ -139,13 +223,36 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	return accessToken, refreshToken, expiresAt, profileArn, nil
 }
 
-// refreshExternalIdpToken refreshes an external-IdP (enterprise SSO) access token
-// through the IdP token endpoint using the OAuth2 refresh_token grant for a public
-// client (no client secret). offline_access in the original scopes is what makes a
-// refresh token available. The IdP issues no profileArn (it is resolved separately
-// via ListAvailableProfiles using the EXTERNAL_IDP token type), so "" is returned
-// for the profileArn.
-func refreshExternalIdpToken(refreshToken, clientID, tokenEndpoint, scopes string, client *http.Client) (string, string, int64, string, error) {
+// microsoftExternalIdpProviders is the set of Provider values that mean "this
+// external_idp account is a Microsoft Entra / Azure AD tenant" and therefore
+// must use the strict, tenant-bound refresh. Mirrors the provider spellings the
+// credential-import path accepts (handler.go) so classification at import and
+// dispatch at refresh cannot drift apart.
+var microsoftExternalIdpProviders = map[string]bool{
+	"azuread": true, "azure": true, "azure-ad": true, "azure_ad": true,
+	"entra": true, "entra-id": true, "entra_id": true,
+	"microsoft": true, "m365": true, "office365": true,
+}
+
+// isMicrosoftExternalIdp reports whether an external_idp account is Microsoft
+// classified. An unknown or empty Provider is deliberately treated as GENERIC:
+// the generic refresh is a plain OAuth2 refresh_token grant that also works
+// against Entra, so mis-classifying Microsoft as generic merely skips extra
+// validation, whereas the reverse would hard-fail a valid non-Microsoft account
+// that can never satisfy the UUID/tenant checks.
+func isMicrosoftExternalIdp(provider string) bool {
+	return microsoftExternalIdpProviders[strings.ToLower(strings.TrimSpace(provider))]
+}
+
+// refreshGenericExternalIdpToken refreshes a NON-Microsoft enterprise-IdP access
+// token: a standard OAuth2 refresh_token grant for a public client (no client
+// secret; offline_access in the original scopes is what makes a refresh token
+// available). It imposes no Microsoft-specific shape on client_id, issuer, or
+// scopes, which is the whole point of the generic path.
+//
+// The IdP issues no profileArn (that is resolved separately via
+// ListAvailableProfiles with the EXTERNAL_IDP token type), so "" is returned for it.
+func refreshGenericExternalIdpToken(refreshToken, clientID, tokenEndpoint, scopes string, client *http.Client) (string, string, int64, string, error) {
 	if clientID == "" || tokenEndpoint == "" {
 		return "", "", 0, "", fmt.Errorf("external IdP refresh requires clientId and tokenEndpoint")
 	}
@@ -156,34 +263,31 @@ func refreshExternalIdpToken(refreshToken, clientID, tokenEndpoint, scopes strin
 	if scopes != "" {
 		form.Set("scope", scopes)
 	}
-	accessToken, newRefreshToken, expiresIn, err := postExternalIdpToken(client, tokenEndpoint, form)
+	accessToken, newRefreshToken, expiresIn, err := postGenericExternalIdpToken(client, tokenEndpoint, form)
 	if err != nil {
 		return "", "", 0, "", err
 	}
-	// Some IdPs (Azure AD) rotate refresh tokens; others omit it on refresh. Keep the
+	// Some IdPs rotate refresh tokens; others omit it on refresh. Keep the
 	// existing refresh token when the response does not carry a new one.
 	if newRefreshToken == "" {
 		newRefreshToken = refreshToken
 	}
-	expiresAt := time.Now().Unix() + int64(expiresIn)
-	return accessToken, newRefreshToken, expiresAt, "", nil
+	return accessToken, newRefreshToken, time.Now().Unix() + int64(expiresIn), "", nil
 }
 
-// postExternalIdpToken performs a form-encoded POST to an external-IdP token
-// endpoint and maps the snake_case OAuth2 token response onto the standard return
-// shape. Shared by the authorization-code exchange (login) and the refresh_token
-// grant (renewal).
-func postExternalIdpToken(client *http.Client, tokenEndpoint string, form url.Values) (accessToken, refreshToken string, expiresIn int, err error) {
+// postGenericExternalIdpToken performs the form-encoded POST and maps the
+// snake_case OAuth2 token response onto the standard return shape.
+//
+// It re-validates the endpoint at the outbound-POST boundary through the
+// exported ValidateExternalIdpEndpoint so the refresh token is never sent to a
+// non-allow-listed host — even if a persisted TokenEndpoint was set out-of-band
+// (backup restore, an external file write, a caller that stored it without
+// validating). Going through the exported symbol keeps the test seam
+// (SetExternalIdpValidatorForTest) effective for httptest servers.
+func postGenericExternalIdpToken(client *http.Client, tokenEndpoint string, form url.Values) (accessToken, refreshToken string, expiresIn int, err error) {
 	if strings.TrimSpace(tokenEndpoint) == "" {
 		return "", "", 0, fmt.Errorf("external IdP token endpoint is empty")
 	}
-	// Defense-in-depth: re-validate the endpoint at the outbound-POST boundary so the
-	// refresh token is never sent to a non-allow-listed host — even if a persisted
-	// account's TokenEndpoint was set out-of-band (backup restore, an external file
-	// write, or a future caller that stores an endpoint without validating). This makes
-	// allow-list validation an invariant of the exfiltration-sensitive operation itself
-	// rather than of every caller. Uses the exported ValidateExternalIdpEndpoint so the
-	// test seam (SetExternalIdpValidatorForTest) still relaxes it for httptest servers.
 	if err := ValidateExternalIdpEndpoint(tokenEndpoint); err != nil {
 		return "", "", 0, fmt.Errorf("external IdP token endpoint rejected: %w", err)
 	}

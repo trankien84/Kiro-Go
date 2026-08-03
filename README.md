@@ -6,17 +6,17 @@
 
 Convert Kiro accounts to OpenAI / Anthropic compatible API service.
 
-[English](README.md) | [中文](README_CN.md)
+[English](README.md) | [中文](README_CN.md) | [Tiếng Việt](README_VI.md)
 
 If this project helps you, a Star would mean a lot.
 
 ## Features
 
-- Anthropic `/v1/messages` & OpenAI `/v1/chat/completions`
+- Anthropic `/v1/messages`, OpenAI `/v1/chat/completions` & OpenAI `/v1/responses`
 - Multi-account pool with round-robin load balancing
 - Auto token refresh, SSE streaming, Web admin panel
-- Multiple auth: AWS Builder ID, IAM Identity Center (Enterprise SSO), SSO Token, local cache, credentials JSON
-- Usage tracking, account import/export, i18n (CN / EN)
+- Multiple auth: AWS Builder ID, IAM Identity Center (Enterprise SSO), Microsoft Enterprise SSO, SSO Token, local cache, credentials JSON, Kiro API Key
+- Usage tracking, account import/export, i18n (CN / EN / VI)
 - Support configuring outbound proxy (SOCKS5 / HTTP)
 
 ## Quick Start
@@ -95,6 +95,21 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer any" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello!"}]}'
 ```
+
+### Add a Kiro API Key account
+
+In the admin panel, choose **API Key** when adding an account and paste `ksk_...` (or `ksk_...|region`).
+
+You can also import via the credentials API:
+
+```bash
+curl -X POST http://localhost:8080/admin/api/auth/credentials \
+  -H "Content-Type: application/json" \
+  -H "Cookie: <admin-session>" \
+  -d '{"kiroApiKey":"ksk_your_key|us-east-1","authMethod":"api_key","nickname":"cli-key"}'
+```
+
+API Key accounts call the Kiro CLI runtime (`https://runtime.{region}.kiro.dev/`) with `tokentype: API_KEY`. They skip OAuth refresh and do not use `profileArn`.
 
 ## Thinking Mode
 
