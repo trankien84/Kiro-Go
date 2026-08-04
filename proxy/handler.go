@@ -85,10 +85,21 @@ type Handler struct {
 	// reasoningCapabilityForModel. A burst of cold requests must trigger exactly
 	// one refresh, not one per request — refreshModelsCache fans out a live
 	// ListAvailableModels call per enabled account.
-	modelsWarming      int32
-	promptCache        *promptCacheTracker
-	tokenRefreshMu     sync.Mutex
-	credentialImportMu sync.Mutex
+	modelsWarming int32
+	// lastWarmAttemptNanos is the unix-nanos timestamp of the last warm attempt
+	// (successful or not), used to rate-limit warmModelsCacheAsync. Single-flight
+	// alone is not enough: refreshModelsCache only writes cachedModels when it
+	// gets at least one model back (handler.go's "if len(aggregated) > 0" guard),
+	// so a total outage (every Kiro account failing) leaves the cache empty
+	// forever — the very next request re-arms the CAS instantly and reruns the
+	// full account fan-out, hammering already-failing accounts into
+	// handleAccountFailure on every request and accelerating auto-ban. A pool
+	// with zero Kiro-capable accounts hits this on literally every request
+	// forever.
+	lastWarmAttemptNanos int64
+	promptCache          *promptCacheTracker
+	tokenRefreshMu       sync.Mutex
+	credentialImportMu   sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
@@ -718,17 +729,46 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 	}
 }
 
+// minWarmModelsCacheInterval bounds how often a cold cache can trigger a real
+// refreshModelsCache fan-out. See lastWarmAttemptNanos on Handler for why the
+// single-flight CAS alone is not enough.
+const minWarmModelsCacheInterval = 30 * time.Second
+
 // warmModelsCacheAsync refreshes the model cache off the request goroutine.
 //
 // Single-flighted via CAS: a cold pool taking a burst of concurrent requests
 // must fan out ListAvailableModels once, not once per request. The flag clears
 // when the refresh finishes, so a later cold request can retry — this is a warm
 // hint, not a one-shot latch.
+//
+// Also rate-limited via lastWarmAttemptNanos, independent of the CAS: on a
+// total outage (every Kiro account failing) refreshModelsCache never writes
+// cachedModels, so the cache stays empty and the CAS stays available to
+// re-arm on literally the next request. Without this gate that turns every
+// request during the outage into a fresh live fan-out across every enabled
+// account, feeding handleAccountFailure once per account per request and
+// accelerating auto-ban — and, in a Bedrock-only pool, churns a warm goroutine
+// forever for a refresh that can never succeed.
 func (h *Handler) warmModelsCacheAsync() {
+	if last := atomic.LoadInt64(&h.lastWarmAttemptNanos); last != 0 &&
+		time.Since(time.Unix(0, last)) < minWarmModelsCacheInterval {
+		return
+	}
 	if !atomic.CompareAndSwapInt32(&h.modelsWarming, 0, 1) {
 		return
 	}
+	atomic.StoreInt64(&h.lastWarmAttemptNanos, time.Now().UnixNano())
 	go func() {
+		// net/http recovers panics on a request's own handler goroutine, but NOT
+		// on a bare `go func()` spawned from one — an unrecovered panic here
+		// would take down the whole process. Recover first (before releasing the
+		// single-flight below) so a bug in refreshModelsCache degrades to a
+		// logged error instead of an outage.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Errorf("[ModelsCache] warm goroutine panicked: %v", r)
+			}
+		}()
 		defer atomic.StoreInt32(&h.modelsWarming, 0)
 		h.refreshModelsCache()
 	}()
@@ -1012,6 +1052,28 @@ func (h *Handler) reasoningCapabilityForModel(modelID string) ModelReasoningCapa
 	}
 }
 
+// reasoningBuildErrorIsFatal decides whether a schema-validation error from
+// Build{Claude,OpenAI}AdditionalModelRequestFields should hard-fail the
+// request with a 400, or be dropped and let the request continue.
+//
+// Kiro's schema-driven reasoning validation (reasoningCapabilityForModel,
+// above) is built from cachedModels, which is populated exclusively by
+// probing Kiro accounts (refreshModelsCache skips Bedrock/custom_api
+// entirely). In a pool with no Kiro-capable account at all, that schema is
+// necessarily empty/stale for every model, so rejecting a client's
+// thinking/effort request against it is validating against the wrong
+// backend: a Bedrock account speaks native Anthropic Messages directly (no
+// Kiro schema involved) and would accept e.g. thinking.type:"enabled" fine.
+// This runs BEFORE the per-account dispatch loop (handler.go's
+// account-selection loop further down), so at this point we only know
+// whether the pool *could* serve the request via Kiro — not which account
+// will actually be picked. Degrading here, rather than in the dispatch loop,
+// keeps the fix in one place instead of duplicating it across every
+// dispatch branch.
+func (h *Handler) reasoningBuildErrorIsFatal() bool {
+	return h.hasKiroCapableAccount()
+}
+
 func mergeStringLists(base []string, extra []string) []string {
 	if len(extra) == 0 {
 		return base
@@ -1068,8 +1130,17 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 	additionalFields, nativeRequested, buildErr := BuildClaudeAdditionalModelRequestFields(&req, capability)
 	if buildErr != nil {
-		h.sendClaudeError(w, 400, "invalid_request_error", buildErr.Error())
-		return
+		// See reasoningBuildErrorIsFatal: a Bedrock/custom_api-only pool has no
+		// Kiro schema for this request to be validated against at all. count_tokens
+		// has no account-dispatch loop of its own, so this is the only place that
+		// decision can be made for this endpoint.
+		if h.reasoningBuildErrorIsFatal() {
+			h.sendClaudeError(w, 400, "invalid_request_error", buildErr.Error())
+			return
+		}
+		logger.Warnf("[Reasoning] count_tokens: dropping unsupported reasoning request for model %s (no Kiro-capable account in pool): %v", actualModel, buildErr)
+		additionalFields = nil
+		nativeRequested = false
 	}
 
 	thinkingRequested = thinkingRequested || nativeRequested
@@ -1156,11 +1227,40 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// Build only reasoning fields supported by this model.
 	additionalFields, nativeRequested, buildErr := BuildClaudeAdditionalModelRequestFields(&req, capability)
 	if buildErr != nil {
-		h.sendClaudeError(w, 400, "invalid_request_error", buildErr.Error())
-		return
+		// See reasoningBuildErrorIsFatal: this runs ahead of the per-account
+		// dispatch loop below, so a mixed pool with no Kiro-capable account for
+		// this request (e.g. all-Bedrock) must not 400 here — Bedrock speaks
+		// native Anthropic Messages and needs no Kiro schema at all. Only hard-fail
+		// when a Kiro-capable account actually exists to serve this request.
+		if h.reasoningBuildErrorIsFatal() {
+			h.sendClaudeError(w, 400, "invalid_request_error", buildErr.Error())
+			return
+		}
+		logger.Warnf("[Reasoning] messages: dropping unsupported reasoning request for model %s (no Kiro-capable account in pool): %v", actualModel, buildErr)
+		additionalFields = nil
+		nativeRequested = false
 	}
 
-	thinking := legacyOrClientThinking || nativeRequested
+	// thinking gates response SHAPE: whether reasoning content is emitted to the
+	// client at all (see handleClaudeStream's `if !thinking { return }` and
+	// friends) and, via thinkingResponseOpts below, which wire format it uses.
+	// nativeRequested alone is NOT a safe signal for this: it goes true for a
+	// client that only sent output_config.effort (or the OpenAI-style
+	// reasoning_effort/top-level field) with NO thinking object at all —
+	// BuildClaudeAdditionalModelRequestFields sets requested=true purely from
+	// an effort value. thinkingResponseOpts (below) is keyed off req.Thinking
+	// only and falls back to the operator's configured thinkingCfg.ClaudeFormat
+	// when req.Thinking is nil, so an effort-only request that never mentioned
+	// "thinking" could otherwise have reasoning content injected into its
+	// response — e.g. inlined as `<think>...</think>` in the plain text stream
+	// if the operator's format is "think" — even though the client's own
+	// request never asked for a thinking block. Require an explicit
+	// req.Thinking object (already what legacyOrClientThinking demands for its
+	// own suffix/config-forced case) before nativeRequested can broaden the
+	// shape, so effort-only requests keep the pre-existing (pre-PR-#6)
+	// behavior: reasoning may still be requested from Kiro via additionalFields
+	// above, but is not surfaced as a distinct block/tag in the response.
+	thinking := legacyOrClientThinking || (req.Thinking != nil && nativeRequested)
 
 	if diagnostics.Reasoning() {
 		logger.Infof(
@@ -2191,8 +2291,17 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	additionalFields, nativeRequested, buildErr := BuildOpenAIAdditionalModelRequestFields(&req, capability)
 	if buildErr != nil {
-		h.sendOpenAIError(w, 400, "invalid_request_error", buildErr.Error())
-		return
+		// See reasoningBuildErrorIsFatal on the Claude path above — same
+		// reasoning applies here: don't 400 a request the pool would have routed
+		// to Bedrock/custom_api just because it fails validation against a Kiro
+		// schema that has nothing to do with how it will actually be served.
+		if h.reasoningBuildErrorIsFatal() {
+			h.sendOpenAIError(w, 400, "invalid_request_error", buildErr.Error())
+			return
+		}
+		logger.Warnf("[Reasoning] chat/completions: dropping unsupported reasoning request for model %s (no Kiro-capable account in pool): %v", actualModel, buildErr)
+		additionalFields = nil
+		nativeRequested = false
 	}
 
 	thinking := suffixThinking || nativeRequested
@@ -5523,11 +5632,12 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":         config.GetApiKey(),
-		"requireApiKey":  config.IsApiKeyRequired(),
-		"port":           config.GetPort(),
-		"host":           config.GetHost(),
-		"allowOverUsage": config.GetAllowOverUsage(),
+		"apiKey":            config.GetApiKey(),
+		"requireApiKey":     config.IsApiKeyRequired(),
+		"port":              config.GetPort(),
+		"host":              config.GetHost(),
+		"allowOverUsage":    config.GetAllowOverUsage(),
+		"agentToolSteering": config.GetAgentToolSteering(),
 	})
 }
 
@@ -5576,10 +5686,11 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey         *string `json:"apiKey,omitempty"`
-		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
-		Password       string  `json:"password,omitempty"`
-		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
+		ApiKey            *string `json:"apiKey,omitempty"`
+		RequireApiKey     *bool   `json:"requireApiKey,omitempty"`
+		Password          string  `json:"password,omitempty"`
+		AllowOverUsage    *bool   `json:"allowOverUsage,omitempty"`
+		AgentToolSteering *bool   `json:"agentToolSteering,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5602,6 +5713,14 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
 		h.pool.Reload()
+	}
+
+	if req.AgentToolSteering != nil {
+		if err := config.UpdateAgentToolSteering(*req.AgentToolSteering); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})

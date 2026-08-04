@@ -369,9 +369,34 @@ func swapKiroEndpointsForTest(t *testing.T, server *httptest.Server) func() {
 	}}
 	oldClient := kiroHttpStore.Load()
 	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+
+	// reasoningCapabilityForModel (handler.go) warms the model cache off the
+	// request goroutine on a cache miss (warmModelsCacheAsync), so ANY test
+	// using this helper that reaches a Claude/OpenAI/count_tokens entrypoint
+	// with an empty cachedModels can now kick a background
+	// refreshModelsCache -> ListAvailableModels call. That goes through
+	// kiroRestHttpStore's REAL client (buildKiroTransport,
+	// Proxy: http.ProxyFromEnvironment) — NOT the local server swapped above,
+	// since ListAvailableModels targets kiroRestAPIBase, a separate constant
+	// this helper does not touch. Firing http.ProxyFromEnvironment ANYWHERE
+	// in the process caches env vars in a process-wide sync.Once on first
+	// call, permanently poisoning any later test (e.g.
+	// TestBuildKiroTransportFallsBackToEnvironmentProxy) that relies on
+	// t.Setenv("HTTPS_PROXY", ...) actually taking effect. Stub it to fail
+	// fast without touching the network, and always restore an equally inert
+	// stub (never the real ProxyFromEnvironment-backed client) since a
+	// background warm goroutine may still be in flight after the test
+	// returns and must not be able to re-poison anything when it completes.
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errTest("network disabled in test")
+		}),
+	})
+
 	return func() {
 		kiroEndpoints = oldEndpoints
 		kiroHttpStore.Store(oldClient)
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
 	}
 }
 

@@ -298,14 +298,32 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 提取系统提示
 	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
-	toolSteeringInjected := len(req.Tools) > 0 && !claudeToolChoiceIsNone(req.ToolChoice)
+	// toolSteeringEligible is the request-shape gate alone (tool-bearing,
+	// tool_choice not explicitly "none"); actual injection additionally
+	// requires the operator to have opted in via config.AgentToolSteering
+	// (default off — read once here so both injection sites in this function
+	// agree on a single value even if the flag is flipped concurrently by an
+	// admin request). See the field comment in config/config.go: this proxy is
+	// sold as a transparent Claude passthrough, so undisclosed instructions
+	// must never be appended unless an operator explicitly asked for them.
+	toolSteeringEligible := len(req.Tools) > 0 && !claudeToolChoiceIsNone(req.ToolChoice)
+	agentToolSteeringEnabled := config.GetAgentToolSteering()
+	toolSteeringInjected := toolSteeringEligible && agentToolSteeringEnabled
 
 	if diagnostics.Reasoning() {
 		logger.Infof(
-			"[ToolSteering] tools=%d toolChoice=%v injected=%t", len(req.Tools), req.ToolChoice, toolSteeringInjected)
+			"[ToolSteering] tools=%d toolChoice=%v eligible=%t enabled=%t injected=%t",
+			len(req.Tools), req.ToolChoice, toolSteeringEligible, agentToolSteeringEnabled, toolSteeringInjected)
 	}
 
 	// Reinforce tool execution for active agent turns.
+	//
+	// NOTE: handler.go computes estimatedInputTokens from the pre-injection
+	// request, before ClaudeToKiro runs — so when this flag is on, the token
+	// estimate under-counts the actual bytes sent to Kiro by roughly the
+	// length of agentToolExecutionPrompt (~150 tokens) per tool-bearing
+	// request. Not restructured here; flagging so the discrepancy is
+	// discoverable rather than silently wrong.
 	if toolSteeringInjected {
 		if systemPrompt != "" {
 			systemPrompt += "\n\n"
@@ -419,13 +437,17 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	// Reinforce tool execution on fresh user turns.
+	// Reinforce tool execution on fresh user turns. Gated by the same
+	// agentToolSteeringEnabled read (config.AgentToolSteering, default off)
+	// computed above, so this site and the system-prompt injection above agree
+	// for the whole request.
 	//
 	// Do not add this to tool-result continuations because those already belong
 	// to an active tool loop.
 	if len(req.Tools) > 0 &&
 		len(currentToolResults) == 0 &&
-		!claudeToolChoiceIsNone(req.ToolChoice) {
+		!claudeToolChoiceIsNone(req.ToolChoice) &&
+		agentToolSteeringEnabled {
 
 		if finalContent != "" {
 			finalContent += "\n\n"

@@ -284,6 +284,18 @@ type Config struct {
 	// the same account (sticky routing) for a TTL window. Default false.
 	SessionAffinityEnabled bool `json:"sessionAffinityEnabled,omitempty"`
 
+	// AgentToolSteering injects extra instructions (a system-prompt addendum
+	// plus a per-turn reminder, see proxy/translator.go's
+	// agentToolExecutionPrompt/agentToolTurnReminder) into every tool-bearing
+	// Claude request, pushing the model to actually invoke tools instead of
+	// just narrating them. Default false: this proxy is sold as a transparent
+	// Claude passthrough for a metered-key resale business, and unconditionally
+	// appending undisclosed instructions to a customer's own system prompt and
+	// user turn breaks that contract. Operators who want steering back (e.g.
+	// for a coding-agent deployment where tool-use reliability matters more
+	// than byte-for-byte passthrough) opt in explicitly.
+	AgentToolSteering bool `json:"agentToolSteering,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -1456,6 +1468,26 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// GetAgentToolSteering returns whether agent tool-execution steering prompts
+// are injected into tool-bearing Claude requests. Defaults to false (see the
+// AgentToolSteering field comment).
+func GetAgentToolSteering() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.AgentToolSteering
+}
+
+// UpdateAgentToolSteering sets the agent tool-steering flag and persists it.
+func UpdateAgentToolSteering(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.AgentToolSteering = enabled
 	return Save()
 }
 

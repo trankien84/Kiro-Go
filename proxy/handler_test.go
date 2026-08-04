@@ -604,28 +604,11 @@ func TestOpenAIStreamReportsPostOutputUpstreamFailure(t *testing.T) {
 		_, _ = w.Write([]byte{0, 0, 1})
 	}))
 	defer server.Close()
+	// swapKiroEndpointsForTest also stubs kiroRestHttpStore (see its comment):
+	// handleOpenAIChat's reasoningCapabilityForModel warms the model cache in
+	// the background on a miss, and that must not be able to touch the real
+	// network / ProxyFromEnvironment from this test.
 	defer swapKiroEndpointsForTest(t, server)()
-
-	// handleOpenAIChat calls reasoningCapabilityForModel, which — since this
-	// Handler starts with an empty model cache — synchronously calls
-	// refreshModelsCache -> ListAvailableModels for the one enabled account.
-	// That goes through kiroRestHttpStore's REAL client (buildKiroTransport,
-	// Proxy: http.ProxyFromEnvironment), NOT the swapped test server above
-	// (only the data-plane client is swapped). ProxyFromEnvironment caches
-	// env vars in a process-wide sync.Once on first call, permanently
-	// poisoning any later test (e.g.
-	// TestBuildKiroTransportFallsBackToEnvironmentProxy) that relies on
-	// t.Setenv("HTTPS_PROXY", ...) actually taking effect. Stub the REST
-	// client so that call hits this instead, and restore an equally inert
-	// stub afterward (never the real ProxyFromEnvironment-backed client).
-	kiroRestHttpStore.Store(&http.Client{
-		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return nil, errTest("network disabled in test")
-		}),
-	})
-	t.Cleanup(func() {
-		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
-	})
 
 	p := accountpool.GetPool()
 	p.Reload()

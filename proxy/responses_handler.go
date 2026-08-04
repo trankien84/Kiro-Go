@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"net/http"
 	"strings"
 	"time"
@@ -125,13 +126,22 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 			capability,
 		)
 	if buildErr != nil {
-		h.sendOpenAIError(
-			w,
-			400,
-			"invalid_request_error",
-			buildErr.Error(),
-		)
-		return
+		// See reasoningBuildErrorIsFatal (handler.go) — this runs ahead of
+		// account dispatch, so a pool with no Kiro-capable account for this
+		// request must not 400 here; that schema has nothing to do with how the
+		// request will actually be served (Bedrock/custom_api passthrough).
+		if h.reasoningBuildErrorIsFatal() {
+			h.sendOpenAIError(
+				w,
+				400,
+				"invalid_request_error",
+				buildErr.Error(),
+			)
+			return
+		}
+		logger.Warnf("[Reasoning] responses: dropping unsupported reasoning request for model %s (no Kiro-capable account in pool): %v", actualModel, buildErr)
+		additionalFields = nil
+		nativeRequested = false
 	}
 
 	thinking := suffixThinking || nativeRequested

@@ -130,7 +130,89 @@ func TestWarmModelsCacheAsyncSingleFlights(t *testing.T) {
 	// Give the goroutines time to reach the transport before counting.
 	time.Sleep(200 * time.Millisecond)
 
-	if got := atomic.LoadInt32(&calls); got > 1 {
-		t.Fatalf("warmModelsCacheAsync fanned out %d refreshes for one cold burst, want at most 1", got)
+	// Exactly 1, not merely "at most 1": the account is enabled with a token, so
+	// a working single-flight must produce one real attempt, not zero (a bug
+	// that swallowed every call would satisfy `> 1` just as wrongly as a
+	// stampede would).
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("warmModelsCacheAsync fanned out %d refreshes for one cold burst, want exactly 1", got)
+	}
+}
+
+// waitForWarmToFinish polls until a warm goroutine's single-flight flag
+// clears, so tests can deterministically observe post-attempt state instead
+// of racing a fixed sleep against the background goroutine.
+func waitForWarmToFinish(t *testing.T, h *Handler) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&h.modelsWarming) == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("warm goroutine did not finish in time")
+}
+
+// TestWarmModelsCacheAsyncIsRateLimited pins F5: single-flighting via the
+// modelsWarming CAS alone does not protect a pool stuck in total outage.
+// refreshModelsCache only commits cachedModels when it recovers at least one
+// model, so a total outage (every Kiro account failing) leaves the cache
+// permanently empty — and the CAS permanently available to re-arm the instant
+// the failed attempt returns. Without lastWarmAttemptNanos, every subsequent
+// cold request would kick a fresh live fan-out across every enabled account,
+// feeding handleAccountFailure once per account per request and accelerating
+// auto-ban during exactly the outage this cache exists to smooth over.
+func TestWarmModelsCacheAsyncIsRateLimited(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "acct-ratelimit",
+		Enabled:     true,
+		AccessToken: "token-x",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/TEST",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+
+	var calls int32
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			atomic.AddInt32(&calls, 1)
+			return nil, errTest("network disabled in test")
+		}),
+	})
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p}
+
+	h.warmModelsCacheAsync()
+	waitForWarmToFinish(t, h)
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected exactly 1 initial warm attempt, got %d", got)
+	}
+
+	// The refresh failed (network disabled), so cachedModels is still empty —
+	// exactly the total-outage shape the rate limit exists for. A request
+	// arriving immediately after must be suppressed, not re-fire the fan-out.
+	h.warmModelsCacheAsync()
+	waitForWarmToFinish(t, h)
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected the immediate re-attempt to be rate-limited, got %d total calls", got)
+	}
+
+	// Backdate the last attempt past the rate-limit window: a genuinely new
+	// attempt (e.g. after 30s) must still be allowed through.
+	atomic.StoreInt64(&h.lastWarmAttemptNanos, time.Now().Add(-minWarmModelsCacheInterval-time.Second).UnixNano())
+	h.warmModelsCacheAsync()
+	waitForWarmToFinish(t, h)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("expected a second attempt once the rate-limit window passed, got %d total calls", got)
 	}
 }
