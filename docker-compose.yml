@@ -36,6 +36,17 @@ services:
       # CLIProxyAPI_*.json into ./data/imports and the account appears with no
       # restart and no manual API call. Imports go through the same persisted path
       # the live server owns, so they never race the in-memory config.
+      #
+      # SECURITY: this makes filesystem write access to ./data/imports equivalent
+      # to admin-authenticated account creation — no admin password is checked on
+      # this path, and it is a more reliable injection route than editing
+      # data/config.json (which the running server's in-memory state overwrites on
+      # its next save). That is an acceptable default here only because
+      # ./data/imports sits inside the same host directory as data/config.json, so
+      # anyone who can write it can already read every stored credential. If you
+      # ever mount the imports folder more widely than the data folder — a shared
+      # volume, a less-trusted uid, a syncing directory — set this to 0 and import
+      # through the admin API instead.
       - KIRO_IMPORT_WATCH=1
       # Bind host for the Enterprise SSO callback listener INSIDE the container.
       # Default (unset) is loopback-only (127.0.0.1/::1), which the published port
