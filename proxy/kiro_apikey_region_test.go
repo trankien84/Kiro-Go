@@ -10,9 +10,18 @@ import (
 )
 
 // reprobeApiKeyRegion must discover the region a ksk_ key actually serves when the
-// stored region is wrong, persist it to config, and mutate the in-memory account so
-// the caller's immediate retry targets the new region.
-func TestReprobeApiKeyRegionRedetectsAndPersists(t *testing.T) {
+// stored region is wrong, and mutate the in-memory account so the caller's
+// immediate retry targets the new region — but it must NOT persist that region to
+// config itself. probeKiroApiKey only validates the REST plane (GetUsageLimits);
+// the auth failure that triggers a reprobe comes from the RUNTIME plane
+// (runtime.{region}.kiro.dev), a different service that can disagree. Persisting
+// here, before the runtime plane confirms the candidate, is exactly the bug M1
+// fixed: it could permanently strand an account on a region the runtime plane never
+// actually accepted. Persistence now happens only in CallKiroAPIContext, after its
+// runtime-plane retry succeeds — see TestCallKiroAPIRegionReprobeRetriesOnAuthFailure
+// (persists) and TestCallKiroAPIRegionReprobeDoesNotPersistWhenRuntimeRetryFails
+// (does not).
+func TestReprobeApiKeyRegionRedetectsButDoesNotPersist(t *testing.T) {
 	mustInitConfig(t)
 
 	acc := config.Account{
@@ -49,15 +58,17 @@ func TestReprobeApiKeyRegionRedetectsAndPersists(t *testing.T) {
 	if account.Region != "eu-central-1" {
 		t.Fatalf("in-memory account region not updated, got %q", account.Region)
 	}
-	// Persisted to config so future calls skip the reprobe entirely.
+	// NOT persisted to config: reprobeApiKeyRegion only proves the REST plane; the
+	// caller (CallKiroAPIContext) persists only once the runtime-plane retry
+	// actually succeeds.
 	var persisted string
 	for _, a := range config.GetAccounts() {
 		if a.ID == "acct-1" {
 			persisted = a.Region
 		}
 	}
-	if persisted != "eu-central-1" {
-		t.Fatalf("persisted region not updated, got %q", persisted)
+	if persisted != "us-east-1" {
+		t.Fatalf("reprobeApiKeyRegion must not persist by itself, got persisted region %q", persisted)
 	}
 }
 
@@ -225,6 +236,125 @@ func TestCallKiroAPIRegionReprobeSurfacesOriginalAuthErrorWhenKeyIsDead(t *testi
 	}
 }
 
+// M1 regression test: a candidate region can pass the REST-plane probe
+// (probeKiroApiKey -> GetUsageLimits -> q.{region}.amazonaws.com) while the RUNTIME
+// plane (runtime.{region}.kiro.dev, the service the original request actually
+// failed against) still rejects it — the two are different services and can
+// disagree. Before the M1 fix, config.UpdateAccountRegion was called inside the
+// probe loop and never rolled back, so this scenario permanently stranded the
+// account on a region the runtime plane never accepted (unbanning it afterwards did
+// not restore service). The fix defers persistence to after the runtime retry
+// succeeds, so a wrong candidate must cost exactly one failed retry and leave both
+// the persisted and in-memory region untouched.
+func TestCallKiroAPIRegionReprobeDoesNotPersistWhenRuntimeRetryFails(t *testing.T) {
+	mustInitConfig(t)
+
+	acc := config.Account{
+		ID:         "acct-runtime-mismatch",
+		AuthMethod: "api_key",
+		KiroApiKey: "ksk_test",
+		Region:     "us-east-1", // wrong region
+		ProxyURL:   kiroRetryTestProxyURL,
+	}
+	if err := config.AddAccount(acc); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	// REST plane accepts eu-central-1 as a candidate...
+	origProbe := probeKiroApiKey
+	defer func() { probeKiroApiKey = origProbe }()
+	probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
+		if region == "eu-central-1" {
+			return &config.AccountInfo{Email: "a@example.com", UserId: "u-1"}, nil
+		}
+		return nil, errTest("HTTP 403: not served in " + region)
+	}
+
+	// ...but the runtime plane rejects BOTH the original and the re-detected region
+	// (e.g. a transient runtime-side outage independent of the REST plane).
+	var hosts []string
+	installKiroStreamTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		hosts = append(hosts, req.URL.Host)
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Body:       io.NopCloser(bytes.NewReader([]byte(`{"message":"The bearer token included in the request is invalid."}`))),
+			Header:     make(http.Header),
+		}, nil
+	}))
+
+	account := acc
+	err := CallKiroAPI(&account, newKiroRetryTestPayload(), &KiroStreamCallback{})
+	if err == nil {
+		t.Fatalf("expected the runtime-plane auth error to surface")
+	}
+	if !pool.IsAuthFailure(err) {
+		t.Fatalf("expected an auth-classified error so the caller's failover/ban logic still fires, got: %v", err)
+	}
+	if len(hosts) != 2 {
+		t.Fatalf("expected exactly 2 upstream calls (original + one bounded retry), got %d: %v", len(hosts), hosts)
+	}
+	if hosts[0] != "runtime.us-east-1.kiro.dev" || hosts[1] != "runtime.eu-central-1.kiro.dev" {
+		t.Fatalf("hosts = %v, want the retry to target the REST-plane candidate", hosts)
+	}
+	// The optimistic in-memory region set for the retry must be rolled back once the
+	// runtime plane rejects the candidate too.
+	if account.Region != "us-east-1" {
+		t.Fatalf("in-memory account region must be rolled back to the original, got %q", account.Region)
+	}
+	// And the wrong candidate must never have reached persistent config.
+	var persisted string
+	for _, a := range config.GetAccounts() {
+		if a.ID == "acct-runtime-mismatch" {
+			persisted = a.Region
+		}
+	}
+	if persisted != "us-east-1" {
+		t.Fatalf("persisted region must be unchanged when the runtime-plane retry fails, got %q", persisted)
+	}
+}
+
+// M2 regression test: kiroApiKeyCandidateRegions can be sourced from
+// KIRO_PROFILE_REGIONS (an operator-controlled env var, unlike a customer request,
+// but still not pattern-checked at its own definition site, unlike
+// kiroProfileRegionCandidates). A malformed entry must never reach probeKiroApiKey
+// (which turns it into an outbound host) and must never be considered a valid
+// candidate to persist.
+func TestReprobeApiKeyRegionRejectsMalformedCandidateRegion(t *testing.T) {
+	mustInitConfig(t)
+	t.Setenv("KIRO_PROFILE_REGIONS", "evil.amazonaws.com,../../etc,eu-west-1")
+
+	account := &config.Account{
+		ID:         "acct-malformed-region",
+		AuthMethod: "api_key",
+		KiroApiKey: "ksk_x",
+		Region:     "us-east-1",
+	}
+
+	var probed []string
+	origProbe := probeKiroApiKey
+	defer func() { probeKiroApiKey = origProbe }()
+	probeKiroApiKey = func(key, region string) (*config.AccountInfo, error) {
+		probed = append(probed, region)
+		if region == "eu-west-1" {
+			return &config.AccountInfo{Email: "a@example.com", UserId: "u-1"}, nil
+		}
+		return nil, errTest("HTTP 403: not served in " + region)
+	}
+
+	region, ok := reprobeApiKeyRegion(account)
+	if !ok {
+		t.Fatalf("expected the well-formed candidate to be found")
+	}
+	if region != "eu-west-1" {
+		t.Fatalf("region = %q, want eu-west-1", region)
+	}
+	for _, r := range probed {
+		if r != "eu-west-1" {
+			t.Fatalf("probed malformed candidate region %q — it must be filtered before reaching probeKiroApiKey", r)
+		}
+	}
+}
+
 // Bedrock and custom_api accounts must never enter the api_key reprobe path: the
 // AuthMethod string is mutually exclusive (IsApiKeyCredential/IsBedrock/IsCustomApi
 // all key off the same field), but this pins that contract at the CallKiroAPI
@@ -232,7 +362,11 @@ func TestCallKiroAPIRegionReprobeSurfacesOriginalAuthErrorWhenKeyIsDead(t *testi
 func TestCallKiroAPIRegionReprobeSkipsBedrockAndCustomApi(t *testing.T) {
 	for _, method := range []string{"bedrock", "custom_api"} {
 		t.Run(method, func(t *testing.T) {
-			account := &config.Account{ID: "acct-" + method, AuthMethod: method, Region: "us-east-1"}
+			// KiroApiKey is deliberately non-empty here: reprobeApiKeyRegion checks
+			// IsApiKeyCredential() before the empty-key check, but with an empty key
+			// both accounts would short-circuit on the key check first and this test
+			// would pass even if the AuthMethod guard were deleted entirely.
+			account := &config.Account{ID: "acct-" + method, AuthMethod: method, Region: "us-east-1", KiroApiKey: "ksk_x"}
 			if account.IsApiKeyCredential() {
 				t.Fatalf("%s account must not classify as an api_key credential", method)
 			}

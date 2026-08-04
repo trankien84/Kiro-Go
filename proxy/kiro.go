@@ -460,8 +460,29 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 	// for an error the reprobe can never fix.
 	if err != nil && !emittedAny && account != nil && account.IsApiKeyCredential() &&
 		pool.IsAuthFailure(err) && !pool.IsSuspensionError(err) {
-		if _, ok := reprobeApiKeyRegion(account); ok {
-			_, err = callKiroEndpointsOnce(ctx, account, payload, callback)
+		// reprobeApiKeyRegion only validates the REST plane; it sets account.Region
+		// in-memory to the candidate but deliberately does not persist. Remember the
+		// prior value so a runtime-plane retry failure (M1: REST and runtime can
+		// disagree) can be rolled back instead of leaving the account silently
+		// pointed at an unconfirmed region for every subsequent request too.
+		previousRegion := account.Region
+		if region, ok := reprobeApiKeyRegion(account); ok {
+			_, retryErr := callKiroEndpointsOnce(ctx, account, payload, callback)
+			if retryErr == nil {
+				// The runtime plane (the service that actually failed) just
+				// confirmed this region works. Only now is it safe to persist.
+				if updateErr := config.UpdateAccountRegion(account.ID, region); updateErr != nil {
+					logger.Warnf("[KiroAPI] failed to persist re-detected region %s for %s: %v", region, accountEmailForLog(account), updateErr)
+				}
+			} else {
+				// The REST-plane probe passed but the runtime-plane retry still
+				// failed: this candidate was wrong. Roll back the optimistic
+				// in-memory region so the account doesn't drift to an unconfirmed
+				// region, and let the original (or retry, which is equally
+				// auth-classified here) error continue to surface below.
+				account.Region = previousRegion
+			}
+			err = retryErr
 		}
 	}
 	return err

@@ -187,12 +187,21 @@ func kiroProfileRegionCandidates(account *config.Account) []string {
 //
 // It probes each candidate region (skipping the one that just failed) using the
 // same key-validating probe the "add Kiro API key" flow uses (probeKiroApiKey), and
-// on the first region that accepts the key it persists the new region to config +
-// the in-memory account and returns it. Returns ("", false) when no other region
-// accepts the key (the key is genuinely dead / revoked), so the caller surfaces the
-// original auth error unchanged — this is a bounded, single-pass probe over a fixed
-// candidate list, never a retry loop, so it cannot amplify one failed request into
-// an unbounded fan-out.
+// on the first region that accepts the key it sets the in-memory account.Region so
+// the caller's retry targets the new region, then returns it. Returns ("", false)
+// when no other region accepts the key (the key is genuinely dead / revoked), so the
+// caller surfaces the original auth error unchanged — this is a bounded, single-pass
+// probe over a fixed candidate list, never a retry loop, so it cannot amplify one
+// failed request into an unbounded fan-out.
+//
+// IMPORTANT: this function deliberately does NOT call config.UpdateAccountRegion.
+// probeKiroApiKey only validates the REST plane (GetUsageLimits against
+// q.{region}.amazonaws.com), but the auth failure that triggered a reprobe came from
+// the RUNTIME plane (runtime.{region}.kiro.dev) — a different service that can
+// disagree with the REST plane. Persisting here, before the runtime plane actually
+// confirms the candidate, can permanently strand the account on a wrong region (see
+// CallKiroAPIContext, which performs the runtime retry and persists only once that
+// retry succeeds).
 func reprobeApiKeyRegion(account *config.Account) (string, bool) {
 	if account == nil || !account.IsApiKeyCredential() {
 		return "", false
@@ -203,6 +212,14 @@ func reprobeApiKeyRegion(account *config.Account) (string, bool) {
 	}
 	current := normalizeRegion(account.Region)
 	for _, region := range kiroApiKeyCandidateRegions() {
+		// Defense in depth: kiroApiKeyCandidateRegions can be sourced from the
+		// KIRO_PROFILE_REGIONS env var, which is not pattern-checked at its own
+		// definition site. A malformed candidate must never reach probeKiroApiKey
+		// (which builds an outbound host from it) or, further down, config.
+		if !kiroRegionPattern.MatchString(strings.TrimSpace(strings.ToLower(region))) {
+			logger.Warnf("[KiroAPI] skipping malformed candidate region %q for %s", region, accountEmailForLog(account))
+			continue
+		}
 		if normalizeRegion(region) == current {
 			continue
 		}
@@ -211,18 +228,16 @@ func reprobeApiKeyRegion(account *config.Account) (string, bool) {
 			logger.Debugf("[KiroAPI] api_key region probe failed for %s in %s: %v", accountEmailForLog(account), region, err)
 			continue
 		}
-		// This region accepts the key. Persist it so subsequent calls target it
-		// directly and no longer trip the auth-error -> reprobe path.
+		// This region accepts the key on the REST plane. Set it in-memory so the
+		// caller's runtime-plane retry targets it, but leave persistence to the
+		// caller — see the function comment above.
 		account.Region = region
-		if updateErr := config.UpdateAccountRegion(account.ID, region); updateErr != nil {
-			logger.Warnf("[KiroAPI] failed to persist re-detected region %s for %s: %v", region, accountEmailForLog(account), updateErr)
-		}
 		if info != nil {
 			if infoErr := config.UpdateAccountInfo(account.ID, *info); infoErr != nil {
 				logger.Debugf("[KiroAPI] failed to persist account info after region re-detect for %s: %v", accountEmailForLog(account), infoErr)
 			}
 		}
-		logger.Infof("[KiroAPI] api_key account %s re-detected region %s after auth error", accountEmailForLog(account), region)
+		logger.Infof("[KiroAPI] api_key account %s found candidate region %s (REST plane) after auth error; awaiting runtime-plane confirmation", accountEmailForLog(account), region)
 		return region, true
 	}
 	return "", false

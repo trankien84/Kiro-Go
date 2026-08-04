@@ -1065,13 +1065,23 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 }
 
 // UpdateAccountRegion persists a re-detected data-plane region for an account.
-// Used by the api_key region auto-detection path (proxy.reprobeApiKeyRegion): a
-// ksk_ key is bound to the region it was minted in, so when a call is rejected as
-// an invalid bearer token in the stored region the caller probes other regions and
+// Used by the api_key region auto-detection path (proxy.CallKiroAPIContext, after
+// proxy.reprobeApiKeyRegion's candidate is confirmed on the runtime plane): a ksk_
+// key is bound to the region it was minted in, so when a call is rejected as an
+// invalid bearer token in the stored region the caller probes other regions and
 // persists the one that works here, so future calls target it directly. A missing
 // id is an error so callers cannot mistake a no-op for a successful write; a Save
 // failure rolls the in-memory field back so it cannot drift from the on-disk value.
+//
+// This is an exported, standalone write path (unlike NormalizeAPIKeyAccount, which
+// every account-creation route funnels through), so it re-validates the region as a
+// safe DNS host label itself rather than trusting the caller — a malformed or
+// hostile region string must never reach config, since cliRuntimeURL interpolates
+// Account.Region directly into an outbound https://runtime.%s.kiro.dev/ URL.
 func UpdateAccountRegion(id, region string) error {
+	if err := validateKiroRegionHostLabel(region); err != nil {
+		return fmt.Errorf("invalid region %q: %w", region, err)
+	}
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {

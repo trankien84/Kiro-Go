@@ -53,6 +53,41 @@ func TestAddAccountRejectsDuplicateAPIKey(t *testing.T) {
 	}
 }
 
+// M2 defense-in-depth: UpdateAccountRegion is an exported, standalone write path
+// (unlike NormalizeAPIKeyAccount, which every account-creation route funnels
+// through) so it must validate the region itself rather than trust the caller.
+// cliRuntimeURL (proxy/kiro.go) interpolates Account.Region directly into
+// https://runtime.%s.kiro.dev/ with only a TrimSpace, so a region containing "/"
+// would escape the intended host if it ever reached persisted config.
+func TestUpdateAccountRegionRejectsMalformedRegion(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	acc := Account{ID: "acct-region-validate", KiroApiKey: "ksk_x", AuthMethod: "api_key", Region: "us-east-1", Enabled: true}
+	if err := AddAccount(acc); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+
+	if err := UpdateAccountRegion("acct-region-validate", "evil.amazonaws.com/../x"); err == nil {
+		t.Fatalf("expected UpdateAccountRegion to reject a malformed region")
+	}
+
+	var persisted string
+	for _, a := range GetAccounts() {
+		if a.ID == "acct-region-validate" {
+			persisted = a.Region
+		}
+	}
+	if persisted != "us-east-1" {
+		t.Fatalf("region must be left unchanged after a rejected update, got %q", persisted)
+	}
+
+	// A well-formed region still succeeds through the same path.
+	if err := UpdateAccountRegion("acct-region-validate", "eu-central-1"); err != nil {
+		t.Fatalf("expected a well-formed region to be accepted: %v", err)
+	}
+}
+
 func TestSplitKiroAPIKeyAndRegionValidation(t *testing.T) {
 	key, region, err := SplitKiroAPIKeyAndRegion("ksk_abc|us-east-1")
 	if err != nil || key != "ksk_abc" || region != "us-east-1" {
