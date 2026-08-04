@@ -2,10 +2,19 @@ package proxy
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// maxIdeCacheFileBytes bounds how much of the IDE cache file readIdeCacheCredential
+// will read, matching the 1 MiB cap every HTTP import route applies via
+// http.MaxBytesReader. Without a cap here, a KIRO_IDE_CACHE (or the default
+// path, if an operator's HOME resolves somewhere attacker-influenced) pointed
+// at an unbounded source — a device file, a fifo, a huge log — would be read
+// into memory in full (see FIX4).
+const maxIdeCacheFileBytes = 1 << 20
 
 // IDE-cache import: turn the credential the Kiro IDE already minted on this host
 // into a Kiro-Go account, with no browser sign-in. The Kiro IDE caches its SSO
@@ -46,7 +55,7 @@ func ideCachePath(explicit string) string {
 // missing, unreadable, malformed, or lacks the refresh material a refreshable
 // credential needs (the proxy refreshes against refreshToken on every import).
 func readIdeCacheCredential(path string) (importCredentialRequest, error) {
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return importCredentialRequest{}, &importValidationError{
@@ -57,6 +66,22 @@ func readIdeCacheCredential(path string) (importCredentialRequest, error) {
 		}
 		return importCredentialRequest{}, &importValidationError{
 			"cannot read Kiro IDE cache " + path + ": " + err.Error(),
+		}
+	}
+	defer f.Close()
+	// Bounded read (maxIdeCacheFileBytes): a device file, fifo, or huge log at
+	// this path must not be read into memory in full (see FIX4). Read one byte
+	// past the cap so an over-limit file is detected rather than silently
+	// truncated into a confusing "invalid JSON" error.
+	raw, err := io.ReadAll(io.LimitReader(f, maxIdeCacheFileBytes+1))
+	if err != nil {
+		return importCredentialRequest{}, &importValidationError{
+			"cannot read Kiro IDE cache " + path + ": " + err.Error(),
+		}
+	}
+	if len(raw) > maxIdeCacheFileBytes {
+		return importCredentialRequest{}, &importValidationError{
+			fmt.Sprintf("Kiro IDE cache %s exceeds the %d byte limit", path, maxIdeCacheFileBytes),
 		}
 	}
 

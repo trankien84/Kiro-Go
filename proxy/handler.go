@@ -5603,7 +5603,19 @@ func (h *Handler) apiImportCliJson(w http.ResponseWriter, r *http.Request) {
 	for i, req := range reqs {
 		result, impErr := h.importCredential(req)
 		if impErr != nil {
-			errs = append(errs, fmt.Sprintf("item %d: %s", i+1, impErr.Error()))
+			// FIX5: a persistence failure (duplicate id/refresh-token/api-key, or a
+			// config write error) can land AFTER the IdP already rotated the
+			// refresh token — the original is now dead at the IdP and, without
+			// surfacing the rotated value here, the credential would be
+			// permanently bricked (needs a full interactive re-login). The other
+			// two import routes (apiImportCredentials, apiImportIdeCache) already
+			// surface this via writeAddAccountError; do the same here for the
+			// batch/per-item shape.
+			msg := fmt.Sprintf("item %d: %s", i+1, impErr.Error())
+			if rotated := strings.TrimSpace(result.RotatedRefreshToken); rotated != "" {
+				msg = fmt.Sprintf("%s (identity provider rotated the refresh token before persistence failed; retry with rotatedRefreshToken=%s)", msg, rotated)
+			}
+			errs = append(errs, msg)
 			continue
 		}
 		imported = append(imported, map[string]interface{}{
@@ -5642,18 +5654,34 @@ func (h *Handler) apiImportCliJson(w http.ResponseWriter, r *http.Request) {
 
 // apiImportIdeCache imports the credential the Kiro IDE already cached on this
 // host (~/.aws/sso/cache/kiro-auth-token.json), with no browser sign-in. The
-// optional JSON body { "path": "..." } overrides the cache location (else the
-// KIRO_IDE_CACHE env var, else the default path). It funnels through the same
+// cache location comes ONLY from the server-side KIRO_IDE_CACHE env var, else
+// the default path — NEVER from the request body. It funnels through the same
 // h.importCredential core as every other import path, so the persisted account
 // is identical to an interactive Enterprise SSO login.
 func (h *Handler) apiImportIdeCache(w http.ResponseWriter, r *http.Request) {
+	// Cap the body like every other import route (apiImportCredentials,
+	// apiImportCliJson) — even though its one field is now ignored (see
+	// below), a client can still send an oversized body that would otherwise
+	// be read into memory unbounded.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var body struct {
 		Path string `json:"path"`
 	}
-	// Body is optional; ignore a decode error (including an empty body).
+	// Body is optional; ignore a decode error (including an empty body). Decoding
+	// is kept only so a client posting a (now-inert) legacy body still gets a
+	// tolerant-of-garbage 200 path rather than a hard decode error.
+	//
+	// body.Path is deliberately NEVER read below. It used to override the cache
+	// file location via ideCachePath(body.Path), but that field is
+	// REQUEST-controlled, not operator-controlled: handleAdminAPI accepts a
+	// cookie with no CSRF token, so a browser-delivered cross-site POST can
+	// drive this route. {"path":"/dev/zero"} was an uncapped os.ReadFile -> OOM
+	// (concrete DoS); {"path":"/etc/shadow"} was a file-existence/readability
+	// oracle via distinct error strings. The cache path is now resolved only
+	// from KIRO_IDE_CACHE / the default — see ideCachePath.
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
-	path := ideCachePath(body.Path)
+	path := ideCachePath("")
 	req, err := readIdeCacheCredential(path)
 	if err != nil {
 		w.WriteHeader(importErrorStatus(err))
@@ -5702,20 +5730,32 @@ var externalIdpAuthMethodAliases = map[string]bool{
 }
 
 // normalizeImportAuthMethod maps a pasted credential JSON's authMethod (plus its
-// clientId/clientSecret/tokenEndpoint) onto one of the three canonical methods
-// ("external_idp" | "idc" | "social"). external_idp MUST be detected before the
-// clientId+clientSecret→idc inference, because external_idp accounts carry clientId
-// but NO clientSecret, so the old default branch misclassified them as "social" and
-// refresh hit the wrong endpoint.
+// clientId/clientSecret/tokenEndpoint) onto one of the four canonical methods
+// ("external_idp" | "idc" | "social" | "api_key"). external_idp MUST be detected
+// before the clientId+clientSecret→idc inference, because external_idp accounts
+// carry clientId but NO clientSecret, so the old default branch misclassified
+// them as "social" and refresh hit the wrong endpoint.
 //
 // It preserves the pre-existing idc/social heuristics:
 //   - empty authMethod + clientId present             -> idc
 //   - empty authMethod, no clientId                   -> social
 //   - "enterprise" (Kiro Account Manager IdC label)   -> idc
 //   - unrecognized non-empty + clientId+clientSecret  -> idc, else social
+//
+// The explicit api_key aliases exist so duplicateAccountReason (import_watcher.go)
+// can compare a dropped file's raw authMethod against a persisted api_key
+// account's canonical AuthMethod (FIX8): without this case an api_key blob fell
+// through to "social" here, so email+method never matched a real api_key
+// duplicate and the file landed in failed/ instead of processed/ on every
+// re-drop of an already-imported key (a real duplicate is still caught by
+// config.AddAccount's own AccountAPIKeyExists check — this only affects which
+// subdir the watcher files the drop into, not whether the duplicate is allowed
+// through).
 func normalizeImportAuthMethod(authMethod, clientID, clientSecret, tokenEndpoint string) string {
 	am := strings.ToLower(strings.TrimSpace(authMethod))
 	switch {
+	case am == "api_key" || am == "apikey" || am == "kiro_api_key":
+		return "api_key"
 	case externalIdpAuthMethodAliases[am]:
 		return "external_idp"
 	case am == "social" || am == "google" || am == "github":

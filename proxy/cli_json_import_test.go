@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -98,26 +99,73 @@ func TestNormalizeRawCredentialPreservesExplicitProvider(t *testing.T) {
 // normalizeRawCredential's doc comment) and is tested independently here.
 func TestNormalizeAuthMethodInference(t *testing.T) {
 	cases := []struct {
-		name                                 string
-		raw, tokenEndpoint, clientID, secret string
-		want                                 string
+		name                                                                        string
+		raw, tokenEndpoint, clientID, secret, kiroApiKey, accessToken, refreshToken string
+		want                                                                        string
 	}{
-		{"external via tokenEndpoint+clientId", "", "https://x/token", "cid", "", "external_idp"},
-		{"idc via clientId+secret", "", "", "cid", "sec", "idc"},
-		{"social bare", "", "", "", "", "social"},
-		{"explicit azure alias", "azuread", "", "", "", "external_idp"},
-		{"explicit m365 alias", "m365", "", "", "", "external_idp"},
-		{"explicit github", "github", "", "", "", "social"},
-		{"explicit builderid", "builderid", "", "", "", "idc"},
+		{"external via tokenEndpoint+clientId", "", "https://x/token", "cid", "", "", "", "", "external_idp"},
+		{"idc via clientId+secret", "", "", "cid", "sec", "", "", "", "idc"},
+		{"social bare", "", "", "", "", "", "", "", "social"},
+		{"explicit azure alias", "azuread", "", "", "", "", "", "", "external_idp"},
+		{"explicit m365 alias", "m365", "", "", "", "", "", "", "external_idp"},
+		{"explicit github", "github", "", "", "", "", "", "", "social"},
+		{"explicit builderid", "builderid", "", "", "", "", "", "", "idc"},
+		// Regression coverage for the api_key detection FIX1 adds: neither of
+		// these carries an explicit auth_method, so before the fix both fell
+		// through to the "social" default — which forced the OAuth us-east-1
+		// region default onto an api_key import (normalizeRawCredential) and, via
+		// that, collapsed resolveApiKeyRegion's probe to a single wrong region
+		// (see TestApiImportCredentialsBareApiKeyFieldNoAuthMethodDiscoversRegion
+		// and TestApiImportCredentialsBareAccessTokenApiKeyNoAuthMethodDiscoversRegion
+		// below for the end-to-end proof).
+		{"kiro_api_key field present, no auth_method", "", "", "", "", "ksk_abc123", "", "", "api_key"},
+		{"accessToken looks like a key, no refreshToken, no auth_method", "", "", "", "", "", "ksk_abc123", "", "api_key"},
+		// A refreshToken alongside a ksk_-shaped accessToken is NOT an api_key
+		// import (mirrors isAPIKeyImport's own refreshToken=="" guard in
+		// handler.go) — it falls through to the ordinary inference below.
+		{"ksk_-shaped accessToken WITH a refreshToken is not api_key", "", "", "", "", "", "ksk_abc123", "rt-1", "social"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := normalizeAuthMethod(tc.raw, tc.tokenEndpoint, tc.clientID, tc.secret)
+			got := normalizeAuthMethod(tc.raw, tc.tokenEndpoint, tc.clientID, tc.secret, tc.kiroApiKey, tc.accessToken, tc.refreshToken)
 			if got != tc.want {
-				t.Fatalf("normalizeAuthMethod(%q,%q,%q,%q) = %q, want %q",
-					tc.raw, tc.tokenEndpoint, tc.clientID, tc.secret, got, tc.want)
+				t.Fatalf("normalizeAuthMethod(%q,%q,%q,%q,%q,%q,%q) = %q, want %q",
+					tc.raw, tc.tokenEndpoint, tc.clientID, tc.secret, tc.kiroApiKey, tc.accessToken, tc.refreshToken, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestNormalizeRawCredentialApiKeyFieldRegionNotDefaulted is the direct
+// regression test for FIX1's decode-level bug: a blob carrying a kiro_api_key
+// field but no explicit auth_method must NOT get the OAuth us-east-1 region
+// default, because that default silently overrides an embedded "key|region"
+// suffix once it reaches h.importCredential's SplitKiroAPIKeyAndRegion (the
+// "if req.Region == \"\"" guard at handler.go around the api_key branch only
+// applies embeddedRegion when Region arrived empty).
+func TestNormalizeRawCredentialApiKeyFieldRegionNotDefaulted(t *testing.T) {
+	req, err := decodeImportRequest([]byte(`{"kiroApiKey":"ksk_xxx|eu-central-1"}`))
+	if err != nil {
+		t.Fatalf("decodeImportRequest: %v", err)
+	}
+	if req.Region != "" {
+		t.Fatalf("Region = %q, want empty so SplitKiroAPIKeyAndRegion's embedded eu-central-1 is not discarded", req.Region)
+	}
+	if req.AuthMethod != "" {
+		t.Fatalf("AuthMethod = %q, want raw/empty (bucketing is internal to normalizeAuthMethod)", req.AuthMethod)
+	}
+}
+
+// TestNormalizeRawCredentialBareAccessTokenApiKeyRegionNotDefaulted is the same
+// regression as above for the OTHER detection form: no kiroApiKey field, just a
+// refreshToken-less accessToken that looks like a ksk_ key.
+func TestNormalizeRawCredentialBareAccessTokenApiKeyRegionNotDefaulted(t *testing.T) {
+	req, err := decodeImportRequest([]byte(`{"accessToken":"ksk_xxx|eu-central-1"}`))
+	if err != nil {
+		t.Fatalf("decodeImportRequest: %v", err)
+	}
+	if req.Region != "" {
+		t.Fatalf("Region = %q, want empty so SplitKiroAPIKeyAndRegion's embedded eu-central-1 is not discarded", req.Region)
 	}
 }
 
@@ -175,6 +223,61 @@ func TestNormalizeCliJsonFixtureFile(t *testing.T) {
 	}
 	if req.TokenEndpoint == "" || req.IssuerURL == "" || req.ClientID == "" {
 		t.Fatalf("fixture external_idp fields incomplete: %+v", req)
+	}
+}
+
+// TestNormalizeCliJsonFilesWrapperImportsAllFiles is FIX2's regression test:
+// {"files":[a,b,c]} must import all three entries, not just the first. Before
+// the fix, the wrapper's file loop `return`ed after the FIRST parsable file,
+// silently dropping every entry after it with no error and no warning.
+func TestNormalizeCliJsonFilesWrapperImportsAllFiles(t *testing.T) {
+	raw := []byte(`{"files":[
+		"{\"refresh_token\":\"r1\",\"client_id\":\"c1\",\"token_endpoint\":\"https://login.microsoftonline.com/t/token\"}",
+		"{\"refresh_token\":\"r2\",\"client_id\":\"c2\",\"token_endpoint\":\"https://login.microsoftonline.com/t/token\"}",
+		"{\"refresh_token\":\"r3\",\"client_id\":\"c3\",\"token_endpoint\":\"https://login.microsoftonline.com/t/token\"}"
+	]}`)
+	reqs, _, err := normalizeCliJson(raw)
+	if err != nil {
+		t.Fatalf("normalizeCliJson: %v", err)
+	}
+	if len(reqs) != 3 {
+		t.Fatalf("got %d requests, want 3 (all files must import, not just the first)", len(reqs))
+	}
+	got := map[string]bool{}
+	for _, r := range reqs {
+		got[r.RefreshToken] = true
+	}
+	for _, want := range []string{"r1", "r2", "r3"} {
+		if !got[want] {
+			t.Fatalf("missing request with refreshToken %q; got %+v", want, reqs)
+		}
+	}
+}
+
+// TestDecodeConcatenatedObjectsSurfacesTruncationWarning is FIX3's unit-level
+// regression test: a blob whose second object is malformed must still return
+// the first (valid) object, but with a warning naming the break point —
+// previously it silently returned (out, nil), indistinguishable from a fully
+// clean parse.
+func TestDecodeConcatenatedObjectsSurfacesTruncationWarning(t *testing.T) {
+	text := `{"refresh_token":"r1"}
+
+{not valid json`
+	out, warning, err := decodeConcatenatedObjects(text)
+	if err != nil {
+		t.Fatalf("decodeConcatenatedObjects: %v", err)
+	}
+	if len(out) != 1 || out[0].RefreshTokenSnake != "r1" {
+		t.Fatalf("expected the one valid object to still parse, got %+v", out)
+	}
+	if warning == "" {
+		t.Fatal("expected a non-empty truncation warning, got none")
+	}
+	if !isTruncationWarning(warning) {
+		t.Fatalf("warning %q does not carry the truncationWarningPrefix", warning)
+	}
+	if !strings.Contains(warning, "object 2") {
+		t.Fatalf("warning = %q, want it to name object 2 as the break point", warning)
 	}
 }
 

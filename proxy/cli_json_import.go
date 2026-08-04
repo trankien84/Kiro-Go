@@ -105,7 +105,23 @@ func firstNonBlank(vals ...string) string {
 // When the method is absent or unrecognized it is inferred from which
 // credential material is present (Kiro API key > external IdP material > IdC
 // client secret > social).
-func normalizeAuthMethod(raw, tokenEndpoint, clientID, clientSecret string) string {
+func normalizeAuthMethod(raw, tokenEndpoint, clientID, clientSecret, kiroApiKey, accessToken, refreshToken string) string {
+	// Kiro API-key detection MUST mirror h.importCredential's isAPIKeyImport
+	// check (handler.go) exactly and run first, ahead of every other signal:
+	// an explicit kiro_api_key/kiroApiKey field, or a refreshToken-less blob
+	// whose accessToken is ksk_-shaped, is unambiguously an API-key credential
+	// even when the caller also supplied a stale/absent auth_method. Before this
+	// check existed, a blob like {"kiro_api_key":"ksk_..."} or a bare
+	// {"accessToken":"ksk_..."} with no refreshToken fell through to the
+	// "social" default below, which wrongly forced the OAuth us-east-1 region
+	// default onto an api_key import and collapsed resolveApiKeyRegion's probe
+	// to that single region (see normalizeRawCredential's region-default
+	// comment) — the exact regression this function's doc comment always
+	// claimed was handled ("Kiro API key > ...") but never actually was.
+	if strings.TrimSpace(kiroApiKey) != "" ||
+		(strings.TrimSpace(refreshToken) == "" && looksLikeKiroAPIKey(accessToken)) {
+		return "api_key"
+	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "external_idp", "azure", "azuread", "entra", "entraid", "m365", "microsoft365", "microsoft":
 		return "external_idp"
@@ -156,12 +172,16 @@ func normalizeRawCredential(rc rawCredential) importCredentialRequest {
 	profileArn := firstNonBlank(rc.ProfileArnSnake, rc.ProfileArnCamel)
 	authMethodRaw := strings.TrimSpace(firstNonBlank(rc.AuthMethodSnake, rc.AuthMethodCamel))
 	provider := firstNonBlank(rc.Provider, rc.IDP)
+	kiroApiKey := firstNonBlank(rc.KiroApiKeySnake, rc.KiroApiKeyCamel)
 
 	// bucket is used ONLY for the region-default decision immediately below —
 	// NOT for Provider. The actual Microsoft-vs-generic classification happens
 	// exactly once, inside h.importCredential, off the RAW authMethodRaw
-	// preserved in the returned struct's AuthMethod field.
-	bucket := normalizeAuthMethod(authMethodRaw, tokenEndpoint, clientID, clientSecret)
+	// preserved in the returned struct's AuthMethod field. It is passed the same
+	// kiroApiKey/accessToken/refreshToken material h.importCredential's own
+	// isAPIKeyImport check uses, so this bucket call can never disagree with
+	// that check about whether a blob is an api_key import.
+	bucket := normalizeAuthMethod(authMethodRaw, tokenEndpoint, clientID, clientSecret, kiroApiKey, accessToken, refreshToken)
 
 	// Region default is deliberately NOT applied to api_key credentials: those are
 	// never refreshed, so apiImportCredentials probes the key to discover its real
@@ -188,7 +208,7 @@ func normalizeRawCredential(rc rawCredential) importCredentialRequest {
 		ProfileARN:    profileArn,
 		UserID:        firstNonBlank(rc.UserIDSnake, rc.UserIDCamel),
 		ID:            strings.TrimSpace(rc.ID),
-		KiroApiKey:    firstNonBlank(rc.KiroApiKeySnake, rc.KiroApiKeyCamel),
+		KiroApiKey:    kiroApiKey,
 		Email:         firstNonBlank(rc.Email, rc.PreferredUsername, rc.UPN),
 		Nickname:      strings.TrimSpace(rc.Nickname),
 	}
@@ -246,17 +266,22 @@ func normalizeCliJson(raw []byte) ([]importCredentialRequest, []string, error) {
 			Accounts []rawCredential   `json:"accounts"`
 		}
 		if err := json.Unmarshal([]byte(trimmed), &wrapper); err == nil && (len(wrapper.Files) > 0 || len(wrapper.Accounts) > 0) {
-			var rcs []rawCredential
-			rcs = append(rcs, wrapper.Accounts...)
+			// Accumulate every wrapper "accounts" entry AND every parsed "files"
+			// entry across the WHOLE loop, returning only after it finishes. The
+			// previous code `return`ed from inside this loop after the FIRST
+			// parsable file, so for {"files":[a,b,c]} only `a` ever imported — `b`
+			// and `c` were silently dropped with no error and no warning.
+			out := collect(wrapper.Accounts)
 			for _, f := range wrapper.Files {
-				inner, _, err := normalizeCliJsonInner(f)
-				if err != nil {
-					warnings = append(warnings, err.Error())
+				inner, innerWarnings, ferr := normalizeCliJsonInner(f)
+				warnings = append(warnings, innerWarnings...)
+				if ferr != nil {
+					warnings = append(warnings, ferr.Error())
 					continue
 				}
-				return appendRequests(inner, collect(rcs), warnings)
+				out = append(out, inner...)
 			}
-			return collect(rcs), warnings, nil
+			return out, warnings, nil
 		}
 		// Plain single object.
 		var rc rawCredential
@@ -267,9 +292,12 @@ func normalizeCliJson(raw []byte) ([]importCredentialRequest, []string, error) {
 
 	// Slow path: multiple JSON objects in one blob (concatenated or
 	// blank-line-separated). Use a streaming decoder over the whole text.
-	rcs, decErr := decodeConcatenatedObjects(trimmed)
+	rcs, truncWarning, decErr := decodeConcatenatedObjects(trimmed)
 	if decErr != nil {
 		return nil, warnings, decErr
+	}
+	if truncWarning != "" {
+		warnings = append(warnings, truncWarning)
 	}
 	if len(rcs) == 0 {
 		return nil, warnings, fmt.Errorf("no credential objects found")
@@ -288,17 +316,28 @@ func normalizeCliJsonInner(raw []byte) ([]importCredentialRequest, []string, err
 	return normalizeCliJson(raw)
 }
 
-// appendRequests is a tiny helper to merge file-derived requests with wrapper
-// account requests while preserving the accumulated warnings.
-func appendRequests(fileReqs []importCredentialRequest, acctReqs []importCredentialRequest, warnings []string) ([]importCredentialRequest, []string, error) {
-	return append(acctReqs, fileReqs...), warnings, nil
+// truncationWarningPrefix marks a warning produced when decodeConcatenatedObjects
+// had to stop partway through a blob because an object failed to parse. Callers
+// that decide whether a source is "fully handled" (the import watcher's
+// processed/ vs failed/ routing, see import_watcher.go) key off this prefix so a
+// partially-consumed blob is never treated as done just because SOME of its
+// objects happened to import successfully before the break point.
+const truncationWarningPrefix = "partial parse: "
+
+// isTruncationWarning reports whether w was produced by a stopped-early
+// decodeConcatenatedObjects parse (see truncationWarningPrefix).
+func isTruncationWarning(w string) bool {
+	return strings.HasPrefix(w, truncationWarningPrefix)
 }
 
 // decodeConcatenatedObjects streams successive JSON objects out of a single blob,
 // tolerating whitespace/newlines between them. It returns the raw decoded
 // credentials so the caller's collect() applies type-warning and normalization
-// uniformly across every parse path.
-func decodeConcatenatedObjects(text string) ([]rawCredential, error) {
+// uniformly across every parse path, plus a warning (isTruncationWarning) when it
+// had to stop early because an object failed to parse — silently discarding that
+// signal previously let a partially-imported drop-folder file get moved to
+// processed/ as if every credential in it had been handled.
+func decodeConcatenatedObjects(text string) ([]rawCredential, string, error) {
 	dec := json.NewDecoder(strings.NewReader(text))
 	var out []rawCredential
 	for {
@@ -308,13 +347,18 @@ func decodeConcatenatedObjects(text string) ([]rawCredential, error) {
 			if err == io.EOF {
 				break
 			}
-			// Stop at the first malformed object; return what parsed so far if any.
+			// Stop at the first malformed object; return what parsed so far (if
+			// any) PLUS a warning naming the 1-indexed object position that broke
+			// and why, so the caller can tell "fully imported" apart from
+			// "partially imported, the rest was silently dropped".
 			if len(out) > 0 {
-				return out, nil
+				warning := fmt.Sprintf("%sobject %d: %v (parsing stopped here; anything after it in this document was not imported)",
+					truncationWarningPrefix, len(out)+1, err)
+				return out, warning, nil
 			}
-			return nil, fmt.Errorf("could not parse credential JSON: %w", err)
+			return nil, "", fmt.Errorf("could not parse credential JSON: %w", err)
 		}
 		out = append(out, rc)
 	}
-	return out, nil
+	return out, "", nil
 }

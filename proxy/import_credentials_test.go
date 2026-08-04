@@ -9,6 +9,7 @@ import (
 	accountpool "kiro-go/pool"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +165,12 @@ func TestNormalizeImportAuthMethod(t *testing.T) {
 		{"google alias", "google", "", "", "", "social"},
 		{"unrecognized with clientid+secret -> idc", "weird", "c", "s", "", "idc"},
 		{"unrecognized without secret -> social", "weird", "c", "", "", "social"},
+		// FIX8 regression: an explicit api_key alias must bucket to "api_key" so
+		// duplicateAccountReason (import_watcher.go) can match it against a
+		// persisted api_key account's canonical AuthMethod instead of silently
+		// falling through to "social" and never recognizing a real duplicate.
+		{"explicit api_key", "api_key", "", "", "", "api_key"},
+		{"kiro_api_key alias", "kiro_api_key", "", "", "", "api_key"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -533,6 +540,77 @@ func TestApiImportCredentialsAPIKeySuccess(t *testing.T) {
 	}
 }
 
+// TestApiImportCredentialsBareApiKeyFieldNoAuthMethodDiscoversRegion is FIX1's
+// end-to-end regression test. Before the fix, a kiroApiKey-only blob with NO
+// explicit authMethod fell through normalizeAuthMethod's inference to
+// "social" (it never inspected the kiroApiKey field), which made
+// normalizeRawCredential apply the OAuth us-east-1 region default. That
+// non-empty req.Region then made h.importCredential's
+// `if req.Region == ""` guard false, so SplitKiroAPIKeyAndRegion's parsed
+// "eu-central-1" was discarded AND resolveApiKeyRegion's probe collapsed to
+// the single wrong region (us-east-1) instead of discovering the real one —
+// the key would 403 forever and the S1 identity guard would blank
+// email/userId on every restart. Using stubProbeKiroApiKey (which only
+// answers for "eu-central-1") makes that collapse observable: the import
+// must succeed with the discovered region and identity, not a blanked one.
+func TestApiImportCredentialsBareApiKeyFieldNoAuthMethodDiscoversRegion(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	stubProbeKiroApiKey(t, "eu-central-1")
+
+	h := &Handler{pool: accountpool.GetPool()}
+	// Deliberately NO authMethod field — the whole point of this regression.
+	body := `{"kiroApiKey":"ksk_noauthmethod|eu-central-1"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	stored := findAccountByKey("ksk_noauthmethod")
+	if stored == nil {
+		t.Fatal("imported api_key account not persisted")
+	}
+	if stored.Region != "eu-central-1" {
+		t.Fatalf("region = %q, want eu-central-1 (probe must not collapse to the us-east-1 default)", stored.Region)
+	}
+	if stored.UserId != "kiro-user-probe" {
+		t.Fatalf("userId = %q, want the probed identity (proves the probe actually ran against eu-central-1, not a blanked-on-failure us-east-1 miss)", stored.UserId)
+	}
+}
+
+// TestApiImportCredentialsBareAccessTokenApiKeyNoAuthMethodDiscoversRegion is
+// the same FIX1 regression as above for the OTHER detection form: no
+// kiroApiKey field at all, just a refreshToken-less accessToken that looks
+// like a ksk_ key (the shape a plain-text CLI export can produce).
+func TestApiImportCredentialsBareAccessTokenApiKeyNoAuthMethodDiscoversRegion(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	stubProbeKiroApiKey(t, "eu-central-1")
+
+	h := &Handler{pool: accountpool.GetPool()}
+	body := `{"accessToken":"ksk_bareaccesstoken|eu-central-1"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	stored := findAccountByKey("ksk_bareaccesstoken")
+	if stored == nil {
+		t.Fatal("imported api_key account not persisted")
+	}
+	if stored.Region != "eu-central-1" {
+		t.Fatalf("region = %q, want eu-central-1 (probe must not collapse to the us-east-1 default)", stored.Region)
+	}
+}
+
 // TestApiImportCredentialsAPIKeyDuplicateRejected verifies re-importing the
 // same Kiro API key is rejected with 409 rather than creating a duplicate
 // account entry.
@@ -723,5 +801,57 @@ func TestApiImportCliJsonBatch(t *testing.T) {
 	}
 	if accs := config.GetAccounts(); len(accs) != 2 {
 		t.Fatalf("expected 2 accounts persisted, got %d", len(accs))
+	}
+}
+
+// TestApiImportCliJsonSurfacesRotatedRefreshTokenOnPersistFailure is FIX5's
+// regression test for the batch route: when the IdP rotates the refresh token
+// during h.importCredential's mandatory refresh AND THEN config.AddAccount
+// fails to persist (config write error, or a duplicate caught late), the
+// original refresh token is already dead at the IdP — dropping the rotated
+// value here would permanently brick the credential (needs a full
+// interactive re-login). apiImportCredentials/apiImportIdeCache already
+// surface this via writeAddAccountError; this proves the batch/per-item path
+// does too.
+func TestApiImportCliJsonSurfacesRotatedRefreshTokenOnPersistFailure(t *testing.T) {
+	cfgPath := t.TempDir() + "/config.json"
+	if err := config.Init(cfgPath); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	defer installCleanAuthClient(t)()
+	bypassExternalIdpValidator(t)
+
+	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"access_token":"at-rotate","refresh_token":"rotated-cli-json","expires_in":3600}`)
+	}))
+	defer idp.Close()
+
+	// Sabotage the config file AFTER Init so config.AddAccount's Save fails —
+	// deterministically reproduces "IdP already rotated the token, THEN
+	// persistence failed" without racing a real duplicate-id/refresh-token check.
+	if err := os.Remove(cfgPath); err != nil {
+		t.Fatalf("remove config file: %v", err)
+	}
+	if err := os.Mkdir(cfgPath, 0o700); err != nil {
+		t.Fatalf("replace config file with directory: %v", err)
+	}
+
+	h := &Handler{pool: accountpool.GetPool()}
+	body := fmt.Sprintf(`{"refreshToken":"orig-cli-json","clientId":"azure-client","authMethod":"external_idp","tokenEndpoint":%q}`, idp.URL)
+	req := httptest.NewRequest("POST", "/auth/import-cli-json", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.apiImportCliJson(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 (persistence failed), got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
+	}
+	errMsg, _ := resp["error"].(string)
+	if !strings.Contains(errMsg, "rotated-cli-json") {
+		t.Fatalf("error = %q, want it to surface the rotated refresh token rotated-cli-json so the credential is not bricked", errMsg)
 	}
 }
