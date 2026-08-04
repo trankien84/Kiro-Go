@@ -630,3 +630,98 @@ func TestApiImportCredentialsAPIKeyDropsUnverifiedIdentityOnProbeFailure(t *test
 		t.Fatalf("email=%q, want the caller-supplied (unverified) identity dropped, not persisted verbatim", got.Email)
 	}
 }
+
+// TestApiImportCredentialsExternalIdpRejectsMissingTokenEndpoint verifies the
+// actionable up-front 400 (before any refresh attempt) when an external_idp
+// import omits token_endpoint and carries no userId/accessToken to derive it
+// from, and that no account is persisted.
+func TestApiImportCredentialsExternalIdpRejectsMissingTokenEndpoint(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	defer installCleanAuthClient(t)()
+
+	h := &Handler{pool: accountpool.GetPool()}
+
+	body := `{"auth_method":"external_idp","client_id":"azure-client","refresh_token":"rt","region":"us-east-1"}`
+	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.apiImportCredentials(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !strings.Contains(resp["error"], "token_endpoint") {
+		t.Fatalf("expected actionable token_endpoint error, got %q", resp["error"])
+	}
+	if accs := config.GetAccounts(); len(accs) != 0 {
+		t.Fatalf("expected no account persisted, got %d", len(accs))
+	}
+}
+
+// TestApiImportCliJsonBatch verifies the dedicated helper-JSON endpoint imports a
+// JSON array of external_idp documents and reports per-item results.
+//
+// NOTE: the two items intentionally use DIFFERENT refresh tokens (rt1/rt2), and
+// the fake IdP deliberately omits "refresh_token" from its response (so neither
+// token rotates). h.importCredential preserves the pre-existing
+// config.AccountCredentialExists duplicate guard (RefreshTokenFingerprint in
+// handler.go), which matches on EITHER the original OR the current persisted
+// RefreshToken — a real, pre-existing anti-duplicate-account protection that
+// predates and is orthogonal to this PR, and this adaptation does not weaken
+// it. A same-token fixture (or a fake IdP that rotates both items to the same
+// value) would collide on that guard and item 2 would correctly be rejected as
+// a duplicate; this fixture avoids both.
+func TestApiImportCliJsonBatch(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	defer installCleanAuthClient(t)()
+
+	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"access_token":"at","expires_in":3600}`)
+	}))
+	defer idp.Close()
+
+	// idp.URL is http + 127.0.0.1; h.importCredential now enforces the IdP
+	// allow-list on every import path, so bypass the validator as the other
+	// external_idp tests do.
+	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer auth.SetExternalIdpValidatorForTest(restore)
+
+	h := &Handler{pool: accountpool.GetPool()}
+
+	body := `[
+	  {"auth_method":"external_idp","client_id":"c1","refresh_token":"rt1","token_endpoint":"` + idp.URL + `","email":"a@example.com","type":"kiro"},
+	  {"auth_method":"external_idp","client_id":"c2","refresh_token":"rt2","token_endpoint":"` + idp.URL + `","email":"b@example.com","type":"kiro"}
+	]`
+	req := httptest.NewRequest("POST", "/auth/import-cli-json", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.apiImportCliJson(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Success  bool                     `json:"success"`
+		Imported []map[string]interface{} `json:"imported"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.Success || len(resp.Imported) != 2 {
+		t.Fatalf("expected 2 imported, got success=%v imported=%d body=%s", resp.Success, len(resp.Imported), rec.Body.String())
+	}
+	if accs := config.GetAccounts(); len(accs) != 2 {
+		t.Fatalf("expected 2 accounts persisted, got %d", len(accs))
+	}
+}

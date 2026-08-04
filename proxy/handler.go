@@ -337,6 +337,8 @@ func NewHandler() *Handler {
 	go h.backgroundStatsSaver()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
+	// Opt-in auto-ingest watcher (KIRO_IMPORT_WATCH); no-op when disabled.
+	h.startImportWatcher()
 	return h
 }
 
@@ -3228,6 +3230,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
 		h.apiImportCredentials(w, r)
+	case path == "/auth/import-cli-json" && r.Method == "POST":
+		h.apiImportCliJson(w, r)
+	case path == "/auth/import-ide-cache" && r.Method == "POST":
+		h.apiImportIdeCache(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -5032,56 +5038,107 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	// limit an oversized token is a memory-amplification DoS. Mirrors the io.LimitReader
 	// guard on outbound IdP responses in auth/kiro_sso.go's oidcDiscover.
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	var req struct {
-		// Optional identity preservation when pasting a full account record.
-		ID    string `json:"id"`
-		Email string `json:"email"`
-		// userId (account-level in Kiro Account Manager exports) embeds the Azure
-		// tenant, from which tokenEndpoint/issuerUrl/scopes are derived when missing.
-		UserID     string `json:"userId"`
-		Nickname   string `json:"nickname"`
-		ProfileARN string `json:"profileArn"`
-
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		KiroApiKey   string `json:"kiroApiKey"`
-		ClientID     string `json:"clientId"`
-		ClientSecret string `json:"clientSecret"`
-		AuthMethod   string `json:"authMethod"`
-		Provider     string `json:"provider"`
-		Region       string `json:"region"`
-		// external_idp (enterprise SSO / Azure AD) refresh material.
-		TokenEndpoint string `json:"tokenEndpoint"`
-		IssuerURL     string `json:"issuerUrl"`
-		Scopes        string `json:"scopes"`
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// decodeImportRequest (cli_json_import.go) accepts both the legacy camelCase
+	// payload this endpoint has always taken AND the kiro-login-helper.py
+	// snake_case shape (token_endpoint, issuer_url, profile_arn, ...), so a raw
+	// helper export can be pasted here unmodified. It intentionally does NOT
+	// collapse authMethod onto a canonical bucket — see importCredentialRequest's
+	// doc comment: the classifier below needs the raw alias (e.g. "AzureAD") to
+	// detect an explicit Microsoft declaration before any bucketing happens.
+	req, err := decodeImportRequest(body)
+	if err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
 
+	// h.importCredential is the single core every import path (this endpoint,
+	// /auth/import-cli-json, /auth/import-ide-cache, and the directory watcher)
+	// funnels through, so all of them get identical classification, SSRF
+	// allow-listing, and trust-on-import behavior — see its doc comment.
+	result, err := h.importCredential(req)
+	if err != nil {
+		if _, ok := err.(*importValidationError); ok {
+			w.WriteHeader(importErrorStatus(err))
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		// Persistence failure (duplicate id/refresh-token/api-key, or a config
+		// write error). A refresh may have already rotated the IdP refresh token
+		// before persistence failed; surface it so the operator can retry without
+		// a full interactive re-login (writeAddAccountError's existing contract).
+		h.writeAddAccountError(w, err, result.RotatedRefreshToken)
+		return
+	}
+
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"account": map[string]interface{}{
+			"id":    result.Account.ID,
+			"email": result.Account.Email,
+		},
+	})
+}
+
+// importCredentialResult carries the account a successful h.importCredential
+// call persisted, plus any refresh token the IdP rotated before a LATER step
+// (persistence) failed — the legacy single-item endpoint surfaces that via
+// writeAddAccountError's "retry with rotatedRefreshToken" hint even though the
+// import itself did not succeed.
+type importCredentialResult struct {
+	Account             config.Account
+	RotatedRefreshToken string
+}
+
+// importValidationError marks an import failure caused by bad/missing input (a
+// 400) as opposed to a persistence failure (409 on a known duplicate, else 500
+// — writeAddAccountError already maps those). importErrorStatus maps it to the
+// right HTTP status so every caller (this endpoint, the batch cli-json
+// endpoint, the IDE-cache endpoint) is consistent.
+type importValidationError struct{ msg string }
+
+func (e *importValidationError) Error() string { return e.msg }
+
+func importErrorStatus(err error) int {
+	if _, ok := err.(*importValidationError); ok {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
+// importCredential is the single source of truth for turning a normalized
+// importCredentialRequest into a persisted account. apiImportCredentials,
+// apiImportCliJson, apiImportIdeCache, and the directory watcher all funnel
+// through here — this is deliberate: it is the ONLY place that decides whether
+// an external_idp credential is "genuinely Microsoft" (strict client_id/tenant
+// validation, mandatory live refresh) or "generic" (loose allow-list only,
+// trust-on-import). Forking a second classifier for a new import path would
+// risk the exact regression this classifier was written to fix — see the
+// microsoftClassified comment below.
+func (h *Handler) importCredential(req importCredentialRequest) (importCredentialResult, error) {
 	req.RefreshToken = strings.TrimSpace(req.RefreshToken)
 	req.KiroApiKey = strings.TrimSpace(req.KiroApiKey)
 	req.AccessToken = strings.TrimSpace(req.AccessToken)
 	methodHint := strings.ToLower(strings.TrimSpace(req.AuthMethod))
 	isAPIKeyImport := req.KiroApiKey != "" ||
-		methodHint == "api_key" || methodHint == "apikey" ||
+		methodHint == "api_key" || methodHint == "apikey" || methodHint == "kiro_api_key" ||
 		(req.RefreshToken == "" && looksLikeKiroAPIKey(req.AccessToken))
 	if isAPIKeyImport && req.KiroApiKey == "" {
 		// Allow plain-text / AccessToken-only API key imports.
 		req.KiroApiKey = req.AccessToken
 	}
 	if !isAPIKeyImport && req.RefreshToken == "" {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "refreshToken or kiroApiKey is required"})
-		return
+		return importCredentialResult{}, &importValidationError{"refreshToken or kiroApiKey is required"}
 	}
 	if len(req.RefreshToken) > 512<<10 || len(req.AccessToken) > 512<<10 || len(req.KiroApiKey) > 512<<10 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "credential token is too long"})
-		return
+		return importCredentialResult{}, &importValidationError{"credential token is too long"}
 	}
 	originalRefreshToken := req.RefreshToken
 	h.credentialImportMu.Lock()
@@ -5089,13 +5146,10 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	accountID := strings.TrimSpace(req.ID)
 	if accountID != "" {
 		if _, err := uuid.Parse(accountID); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "id must be a UUID"})
-			return
+			return importCredentialResult{}, &importValidationError{"id must be a UUID"}
 		}
 		if config.AccountIDExists(accountID) {
-			h.writeAddAccountError(w, config.ErrDuplicateAccountID)
-			return
+			return importCredentialResult{}, config.ErrDuplicateAccountID
 		}
 	}
 
@@ -5109,9 +5163,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		// bare key and an inline region is honored even when req.Region is empty.
 		bareKey, embeddedRegion, splitErr := config.SplitKiroAPIKeyAndRegion(req.KiroApiKey)
 		if splitErr != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": splitErr.Error()})
-			return
+			return importCredentialResult{}, &importValidationError{splitErr.Error()}
 		}
 		req.KiroApiKey = bareKey
 		if strings.TrimSpace(req.Region) == "" {
@@ -5172,19 +5224,14 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			Enabled:    true,
 		}
 		if err := config.NormalizeAPIKeyAccount(&account); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
+			return importCredentialResult{}, &importValidationError{err.Error()}
 		}
 		if config.AccountAPIKeyExists(account.KiroApiKey) {
-			h.writeAddAccountError(w, config.ErrDuplicateAPIKey)
-			return
+			return importCredentialResult{}, config.ErrDuplicateAPIKey
 		}
 		if err := config.AddAccount(account); err != nil {
-			h.writeAddAccountError(w, err)
-			return
+			return importCredentialResult{}, err
 		}
-		h.pool.Reload()
 		if account.Enabled && account.AccessToken != "" {
 			go func(acc config.Account) {
 				if err := h.fetchAndCacheAccountModels(&acc); err != nil {
@@ -5192,19 +5239,11 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 				}
 			}(account)
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-			"account": map[string]interface{}{
-				"id":    account.ID,
-				"email": account.Email,
-			},
-		})
-		return
+		return importCredentialResult{Account: account}, nil
 	}
 
 	if config.AccountCredentialExists(originalRefreshToken) {
-		h.writeAddAccountError(w, config.ErrDuplicateRefreshToken)
-		return
+		return importCredentialResult{}, config.ErrDuplicateRefreshToken
 	}
 
 	// 设置默认值
@@ -5332,15 +5371,11 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		}
 		normalizedScopes, err := auth.NormalizeExternalIdpScopes(req.Scopes, req.ClientID)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
+			return importCredentialResult{}, &importValidationError{err.Error()}
 		}
 		req.Scopes = normalizedScopes
 		if err := auth.ValidateExternalIdpConfiguration(req.ClientID, req.TokenEndpoint, req.IssuerURL, req.Scopes); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
+			return importCredentialResult{}, &importValidationError{err.Error()}
 		}
 		req.Provider = auth.MicrosoftSSOProvider
 		req.ClientSecret = ""
@@ -5361,20 +5396,16 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			req.Scopes = derivedScopes
 		}
 		if req.ClientID == "" || req.TokenEndpoint == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "external_idp requires clientId and tokenEndpoint (or userId/accessToken to derive it)"})
-			return
+			return importCredentialResult{}, &importValidationError{
+				"external_idp requires clientId and token_endpoint (or userId/accessToken to derive it)",
+			}
 		}
 		if err := auth.ValidateExternalIdpEndpoint(req.TokenEndpoint); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "external IdP endpoint rejected: " + err.Error()})
-			return
+			return importCredentialResult{}, &importValidationError{"external IdP endpoint rejected: " + err.Error()}
 		}
 		if req.IssuerURL != "" {
 			if err := auth.ValidateExternalIdpEndpoint(req.IssuerURL); err != nil {
-				w.WriteHeader(http.StatusBadRequest)
-				json.NewEncoder(w).Encode(map[string]string{"error": "external IdP issuer rejected: " + err.Error()})
-				return
+				return importCredentialResult{}, &importValidationError{"external IdP issuer rejected: " + err.Error()}
 			}
 		}
 		if strings.TrimSpace(req.Provider) == "" {
@@ -5386,9 +5417,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	if profileARN != "" {
 		canonicalARN, _, ok := parseKiroProfileArn(profileARN)
 		if !ok {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is invalid"})
-			return
+			return importCredentialResult{}, &importValidationError{"profileArn is invalid"}
 		}
 		profileARN = canonicalARN
 	}
@@ -5433,9 +5462,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		// grant instead (same allow-list guard, no Microsoft-specific validation).
 		a, newRefreshToken, ea, err := refreshGenericExternalIdpToken(req.RefreshToken, req.ClientID, req.TokenEndpoint, req.Scopes)
 		if err != nil {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
-			return
+			return importCredentialResult{}, &importValidationError{"Token refresh failed: " + err.Error()}
 		}
 		accessToken = a
 		expiresAt = ea
@@ -5446,9 +5473,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	if accessToken == "" {
 		a, newRefreshToken, ea, pa, err := auth.RefreshToken(tempAccount)
 		if err != nil {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
-			return
+			return importCredentialResult{}, &importValidationError{"Token refresh failed: " + err.Error()}
 		}
 		accessToken = a
 		expiresAt = ea
@@ -5493,11 +5518,9 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		probeAccount.ExpiresAt = expiresAt
 		offeredProfiles, discoverErr := DiscoverKiroProfiles(&probeAccount)
 		if discoverErr != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error": "Unable to verify profileArn against Kiro profiles: " + discoverErr.Error(),
-			})
-			return
+			return importCredentialResult{}, &importValidationError{
+				"Unable to verify profileArn against Kiro profiles: " + discoverErr.Error(),
+			}
 		}
 		offered := false
 		for _, profile := range offeredProfiles {
@@ -5507,18 +5530,14 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !offered {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error": "profileArn was not offered for this credential",
-			})
-			return
+			return importCredentialResult{}, &importValidationError{"profileArn was not offered for this credential"}
 		}
 	}
 
 	// 创建账号
 	// external_idp records imported without an explicit provider still need one for
-	// the UI badge; upstream already stamps auth.MicrosoftSSOProvider on the
-	// Microsoft branch, so this only backfills hand-written blobs.
+	// the UI badge; the Microsoft branch above already stamps auth.MicrosoftSSOProvider,
+	// so this only backfills hand-written blobs.
 	if strings.TrimSpace(req.Provider) == "" && req.AuthMethod == auth.MicrosoftSSOAuthMethod {
 		req.Provider = auth.MicrosoftSSOProvider
 	}
@@ -5545,16 +5564,123 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := config.AddAccount(account); err != nil {
-		h.writeAddAccountError(w, err, rotatedRefreshToken)
+		return importCredentialResult{RotatedRefreshToken: rotatedRefreshToken}, err
+	}
+
+	return importCredentialResult{Account: account}, nil
+}
+
+// apiImportCliJson ingests one or many CLIProxyAPI_*.json documents produced by
+// kiro-login-helper.py (the standalone Microsoft 365 / Entra ID sign-in helper).
+// It accepts a single helper object, a JSON array, a { "files": [...] } /
+// { "accounts": [...] } wrapper, or raw text with several objects, normalizes
+// each (snake_case native, camelCase tolerated), and imports each through
+// h.importCredential — the SAME core apiImportCredentials uses. Per-item
+// results are returned so a partial batch still reports which credentials
+// landed.
+func (h *Handler) apiImportCliJson(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
+	}
+
+	reqs, warnings, err := normalizeCliJson(body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  false,
+			"error":    err.Error(),
+			"warnings": warnings,
+		})
+		return
+	}
+
+	var imported []map[string]interface{}
+	var errs []string
+	for i, req := range reqs {
+		result, impErr := h.importCredential(req)
+		if impErr != nil {
+			errs = append(errs, fmt.Sprintf("item %d: %s", i+1, impErr.Error()))
+			continue
+		}
+		imported = append(imported, map[string]interface{}{
+			"id":         result.Account.ID,
+			"email":      result.Account.Email,
+			"authMethod": result.Account.AuthMethod,
+		})
+	}
+
+	if len(imported) > 0 {
+		h.pool.Reload()
+	}
+
+	// Match the batch convention in apiImportSsoToken: 500 only when nothing landed.
+	if len(imported) == 0 {
+		w.WriteHeader(500)
+		errMsg := "no credentials imported"
+		if len(errs) > 0 {
+			errMsg = strings.Join(errs, "; ")
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  false,
+			"error":    errMsg,
+			"warnings": warnings,
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"imported": imported,
+		"errors":   errs,
+		"warnings": warnings,
+	})
+}
+
+// apiImportIdeCache imports the credential the Kiro IDE already cached on this
+// host (~/.aws/sso/cache/kiro-auth-token.json), with no browser sign-in. The
+// optional JSON body { "path": "..." } overrides the cache location (else the
+// KIRO_IDE_CACHE env var, else the default path). It funnels through the same
+// h.importCredential core as every other import path, so the persisted account
+// is identical to an interactive Enterprise SSO login.
+func (h *Handler) apiImportIdeCache(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path string `json:"path"`
+	}
+	// Body is optional; ignore a decode error (including an empty body).
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	path := ideCachePath(body.Path)
+	req, err := readIdeCacheCredential(path)
+	if err != nil {
+		w.WriteHeader(importErrorStatus(err))
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	result, err := h.importCredential(req)
+	if err != nil {
+		if _, ok := err.(*importValidationError); ok {
+			w.WriteHeader(importErrorStatus(err))
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		h.writeAddAccountError(w, err, result.RotatedRefreshToken)
 		return
 	}
 
 	h.pool.Reload()
+	logger.Infof("[Import] %s (account %s)", describeIdeCacheImport(path, result.Account.AuthMethod), result.Account.Email)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
+		"source":  path,
 		"account": map[string]interface{}{
-			"id":    account.ID,
-			"email": account.Email,
+			"id":         result.Account.ID,
+			"email":      result.Account.Email,
+			"authMethod": result.Account.AuthMethod,
 		},
 	})
 }
