@@ -13,6 +13,7 @@ import (
 	"kiro-go/config"
 	"kiro-go/diagnostics"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net"
 	"net/http"
 	"net/url"
@@ -439,6 +440,43 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 		}
 	}
 
+	emittedAny, err := callKiroEndpointsOnce(ctx, account, payload, callback)
+	// A Kiro API-key (ksk_) key is region-bound: a request sent to the wrong
+	// data-plane region is rejected as an invalid bearer token (HTTP 401/403) even
+	// though the key is valid elsewhere. On that auth failure, re-detect the key's
+	// region and, if a different region accepts it, retry once there.
+	//
+	// The retry is gated on !emittedAny — NOT merely on the error being pre-stream
+	// by construction — because pool.IsAuthFailure is a substring/status-token
+	// matcher over the error message (it also matches "unauthorized", "invalid
+	// token", a bare "403" in an upstream error body, etc.), so it can in principle
+	// be satisfied by an error surfaced AFTER streaming already began. emittedAny
+	// is the one signal callKiroEndpointsOnce threads out that is actually tied to
+	// "did any output already reach the client" (see its "Emitted" comment below),
+	// so gating on it is what makes "cannot double-emit" true by construction
+	// instead of by argument about where 401/403 happen to be checked today.
+	// IsSuspensionError is excluded too: a suspended account fails every candidate
+	// region, so without this it would cost N extra live probe calls per request
+	// for an error the reprobe can never fix.
+	if err != nil && !emittedAny && account != nil && account.IsApiKeyCredential() &&
+		pool.IsAuthFailure(err) && !pool.IsSuspensionError(err) {
+		if _, ok := reprobeApiKeyRegion(account); ok {
+			_, err = callKiroEndpointsOnce(ctx, account, payload, callback)
+		}
+	}
+	return err
+}
+
+// callKiroEndpointsOnce performs a single pass over the configured Kiro endpoints
+// for the account's currently-resolved region, returning on the first success or on
+// a terminal (401/403/402) error. CallKiroAPIContext wraps it with a bounded (single
+// retry) api_key region-failover: this function itself never retries the region.
+//
+// The bool return is "emitted" — whether any output callback ran before the
+// returned error — so CallKiroAPIContext's region-failover retry can refuse to
+// fire once the client has already received bytes, regardless of what the error
+// text happens to say.
+func callKiroEndpointsOnce(ctx context.Context, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) (bool, error) {
 	// Build endpoint list ordered by configuration / credential type.
 	endpoints := resolveKiroEndpoints(account)
 	isAPIKey := config.IsAPIKeyAccount(account)
@@ -453,7 +491,7 @@ endpointLoop:
 		// API Key accounts use the CLI runtime host instead of IDE/Q hosts.
 		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
 		if err := ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
 		if isAPIKey {
 			epURL = cliRuntimeURL(account)
@@ -480,7 +518,7 @@ endpointLoop:
 		// can correlate them as retries of one logical call.
 		for streamAttempt := 1; streamAttempt <= maxStreamAttemptsPerEndpoint; streamAttempt++ {
 			if err := ctx.Err(); err != nil {
-				return err
+				return false, err
 			}
 			// Requests and bodies cannot be reused after an HTTP attempt.
 			req, err := http.NewRequestWithContext(ctx, "POST", epURL, bytes.NewReader(reqBody))
@@ -515,7 +553,7 @@ endpointLoop:
 				lastErr = err
 				logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
 				if !isRetryableStreamError(err) {
-					return err
+					return false, err
 				}
 				continue endpointLoop
 			}
@@ -539,7 +577,7 @@ endpointLoop:
 				// retry across endpoints. Other status codes fall through to the next
 				// endpoint.
 				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
-					return lastErr
+					return false, lastErr
 				}
 				logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
 				continue endpointLoop
@@ -550,21 +588,23 @@ endpointLoop:
 			// TCP connection to the transport pool instead of leaking it.
 			emitted, err := parseAndStreamTracked(resp.Body, callback)
 			if err == nil {
-				return nil
+				return true, nil
 			}
 			lastErr = err
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
+				return emitted, ctxErr
 			}
 			// "Emitted" deliberately means that an output callback ran. This
 			// conservative boundary also protects buffered/non-stream callers:
 			// retrying after their callback mutated state would concatenate two
-			// attempts even if no network bytes were flushed yet.
+			// attempts even if no network bytes were flushed yet. It is also what
+			// CallKiroAPIContext's region-reprobe retry gates on, so a client that
+			// already received bytes can never see a second, region-shifted attempt.
 			if emitted {
-				return err
+				return true, err
 			}
 			if !isRetryableStreamError(err) {
-				return err
+				return false, err
 			}
 
 			hasSameEndpointRetry := streamAttempt < maxStreamAttemptsPerEndpoint
@@ -576,7 +616,7 @@ endpointLoop:
 			logger.Warnf("[KiroAPI] Endpoint %s stream failed before any output (attempt %d/%d): %v",
 				ep.Name, streamAttempt, maxStreamAttemptsPerEndpoint, err)
 			if err := streamRetryWait(ctx, streamRetryBackoff); err != nil {
-				return err
+				return false, err
 			}
 			if !hasSameEndpointRetry {
 				continue endpointLoop
@@ -585,9 +625,9 @@ endpointLoop:
 	}
 
 	if lastErr != nil {
-		return lastErr
+		return false, lastErr
 	}
-	return fmt.Errorf("all endpoints failed")
+	return false, fmt.Errorf("all endpoints failed")
 }
 
 func isRetryableStreamError(err error) bool {
