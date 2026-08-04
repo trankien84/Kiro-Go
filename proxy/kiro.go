@@ -11,6 +11,7 @@ import (
 	"hash/crc32"
 	"io"
 	"kiro-go/config"
+	"kiro-go/diagnostics"
 	"kiro-go/logger"
 	"net"
 	"net/http"
@@ -84,6 +85,9 @@ var kiroCLIEndpoint = kiroEndpoint{
 var kiroHttpStore atomic.Pointer[http.Client]
 var kiroRestHttpStore atomic.Pointer[http.Client]
 
+// Allow long-running agent streams to finish.
+const kiroStreamingTimeout = 15 * time.Minute
+
 // proxyClientCache caches http.Client instances keyed by proxy URL for per-account proxy support.
 var proxyClientCache sync.Map
 
@@ -101,7 +105,7 @@ func GetClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		Timeout:   kiroStreamingTimeout,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -159,7 +163,7 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
+		Timeout:   kiroStreamingTimeout,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
@@ -187,6 +191,10 @@ type KiroPayload struct {
 	} `json:"conversationState"`
 	ProfileArn      string           `json:"profileArn,omitempty"`
 	InferenceConfig *InferenceConfig `json:"inferenceConfig,omitempty"`
+
+	// Native model-specific request configuration discovered from
+	// ListAvailableModels.additionalModelRequestFieldsSchema.
+	AdditionalModelRequestFields map[string]interface{} `json:"additionalModelRequestFields,omitempty"`
 
 	// ToolNameMap maps sanitized tool names (sent to Kiro) back to the
 	// original names supplied by the client. Used to restore original names
@@ -451,6 +459,13 @@ endpointLoop:
 			epURL = cliRuntimeURL(account)
 		}
 
+		// Log reasoning fields without exposing the full payload.
+		if diagnostics.Reasoning() && len(payload.AdditionalModelRequestFields) > 0 {
+			logger.Infof("[KiroOutboundReasoning] endpoint=%s fields=%s", ep.Name, reasoningFieldsJSON(
+				payload.AdditionalModelRequestFields),
+			)
+		}
+
 		reqBody, _ := json.Marshal(payload)
 		host := ""
 		if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
@@ -618,6 +633,17 @@ const maxEventStreamMessageBytes = 16 * 1024 * 1024
 // allocating gigabytes.
 var errEventStreamFrameTooLarge = errors.New("event-stream: frame totalLength exceeds maximum")
 
+func diagnosticPreview(value string) string {
+	const maxRunes = 512
+
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+
+	return string(runes[:maxRunes]) + "…[truncated]"
+}
+
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	_, err := parseEventStreamTracked(body, callback)
@@ -649,11 +675,33 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	}
 	callback = &trackedCallback
 
+	// Stream diagnostics counters. Populated only when diagnostics.Stream() is
+	// enabled (default off); see diagnostics/flags.go.
+	var eventCount, assistantEventCount, reasoningEventCount, toolEventCount int
+	var assistantChars, reasoningChars int
+	var lastEventType string
+
 	for {
 		// Prelude: total length, headers length, and prelude CRC.
 		prelude := make([]byte, 12)
 		_, readErr := io.ReadFull(body, prelude)
 		if readErr == io.EOF {
+			// Collect stream metrics only when diagnostics are enabled.
+			if diagnostics.Stream() {
+				logger.Infof(
+					"[KiroStream] EOF events=%d last=%q assistantEvents=%d reasoningEvents=%d reasoningChars=%d toolEvents=%d assistantChars=%d inputTokens=%d outputTokens=%d credits=%.3f",
+					eventCount,
+					lastEventType,
+					assistantEventCount,
+					reasoningEventCount,
+					reasoningChars,
+					toolEventCount,
+					assistantChars,
+					inputTokens,
+					outputTokens,
+					totalCredits,
+				)
+			}
 			break
 		}
 		if readErr != nil {
@@ -711,33 +759,70 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 			return emitted, fmt.Errorf("%w: %s", errKiroEventStreamUpstream, detail)
 		}
 
+		// Collect stream metrics only when diagnostics are enabled.
+		if diagnostics.Stream() {
+			eventCount++
+			lastEventType = headers[":event-type"]
+		}
+
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
 
 		switch headers[":event-type"] {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
 				sawOutput = true
+
+				if diagnostics.Stream() {
+					assistantEventCount++
+					assistantChars += len([]rune(content))
+				}
+				if diagnostics.Chunks() {
+					logger.Infof(
+						"[StreamChunk] type=assistant raw=%q",
+						diagnosticPreview(content),
+					)
+				}
+
 				if callback.OnText != nil {
 					emitted = true
 					callback.OnText(content, false)
 				}
 			}
+
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
 				sawOutput = true
+
+				if diagnostics.Stream() {
+					reasoningEventCount++
+					reasoningChars += len([]rune(text))
+				}
+				if diagnostics.Chunks() {
+					logger.Infof(
+						"[StreamChunk] type=reasoning raw=%q",
+						diagnosticPreview(text),
+					)
+				}
+
 				if callback.OnText != nil {
 					emitted = true
 					callback.OnText(text, true)
 				}
 			}
+
 		case "toolUseEvent":
+			if diagnostics.Stream() {
+				toolEventCount++
+			}
 			if toolErr := handleToolUseEvent(event, pending, callback); toolErr != nil {
 				return emitted, toolErr
 			}
+
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
+
 		case "contextUsageEvent":
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				contextUsagePercentages = append(contextUsagePercentages, pct)
@@ -749,6 +834,12 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" && callback.OnStopReason != nil {
 				callback.OnStopReason(reason)
 			}
+
+		default:
+			logger.Debugf(
+				"[KiroStream] unhandled event type=%q",
+				headers[":event-type"],
+			)
 		}
 	}
 

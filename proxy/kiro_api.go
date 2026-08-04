@@ -947,4 +947,6 @@ type ModelInfo struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
+	// Model-specific request schema returned by Kiro.
+	AdditionalModelRequestFieldsSchema json.RawMessage `json:"additionalModelRequestFieldsSchema,omitempty"`
 }
