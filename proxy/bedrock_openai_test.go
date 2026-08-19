@@ -200,9 +200,9 @@ func TestOpenAIToAnthropicMessages_ParamsAndSkips(t *testing.T) {
 			{"role": "assistant", "content": null},
 			{"role": "user", "content": "hi"}
 		],
-		"temperature": 1.7,
-		"stop": ["STOP", ""],
-		"tools": [{"type": "function", "function": {"name": "f"}}],
+		"temperature": 0.7,
+		"stop": ["STOP"],
+		"tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}],
 		"tool_choice": "required"
 	}`)
 	out, err := openAIToAnthropicMessages(body)
@@ -218,11 +218,11 @@ func TestOpenAIToAnthropicMessages_ParamsAndSkips(t *testing.T) {
 		t.Fatalf("messages len = %d, want 1 (empty turns skipped)", len(msgs))
 	}
 
-	// temperature clamped 1.7 -> 1.
-	if m["temperature"] != float64(1) {
-		t.Errorf("temperature = %v, want clamped 1", m["temperature"])
+	// Bedrock projection is lossless: valid sampling values are preserved.
+	if m["temperature"] != float64(0.7) {
+		t.Errorf("temperature = %v, want 0.7", m["temperature"])
 	}
-	// stop -> stop_sequences, empty dropped.
+	// stop -> stop_sequences without changing sequence semantics.
 	seqs := m["stop_sequences"].([]interface{})
 	if len(seqs) != 1 || seqs[0] != "STOP" {
 		t.Errorf("stop_sequences = %v, want [STOP]", seqs)

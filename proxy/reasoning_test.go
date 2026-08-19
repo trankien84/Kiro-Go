@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -591,9 +592,7 @@ func TestOpenAIReasoningEffortPrecedence(t *testing.T) {
 	}
 }
 
-func TestOpenAIReasoningEffortNoneDisablesReasoning(
-	t *testing.T,
-) {
+func TestOpenAIReasoningEffortNoneDoesNotRequestReasoning(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "test-model",
 		Reasoning: &OpenAIReasoningConfig{
@@ -616,27 +615,39 @@ func TestOpenAIReasoningEffortNoneDisablesReasoning(
 		},
 	}
 
-	fields, requested, err :=
-		BuildOpenAIAdditionalModelRequestFields(
-			req,
-			capability,
-		)
-
+	fields, requested, err := BuildOpenAIAdditionalModelRequestFields(req, capability)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 	if requested {
-		t.Fatal(
-			"reasoning should not be requested for effort=none",
-		)
+		t.Fatalf("effort=none must not become an explicit native reasoning request: %#v", fields)
+	}
+	if len(fields) != 0 {
+		t.Fatalf("effort=none must not synthesize native reasoning fields: %#v", fields)
+	}
+}
+
+func TestSchemaAdvertisedFutureThinkingTypeIsAccepted(t *testing.T) {
+	req := &OpenAIRequest{
+		Model:    "future-model",
+		Thinking: &ClaudeThinkingConfig{Type: "forced"},
+	}
+	capability := ModelReasoningCapability{
+		ModelID:          "future-model",
+		SupportsThinking: true,
+		ThinkingTypes:    []string{"adaptive", "forced", "disabled"},
 	}
 
-	if len(fields) != 0 {
-		t.Fatalf(
-			"expected no native reasoning fields, got %#v",
-			fields,
-		)
+	fields, requested, err := BuildOpenAIAdditionalModelRequestFields(req, capability)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !requested {
+		t.Fatal("explicit schema-advertised thinking type must be recognized as reasoning")
+	}
+	thinking := requireReasoningMap(t, fields, "thinking")
+	if got := thinking["type"]; got != "forced" {
+		t.Fatalf("thinking.type=%#v, want forced", got)
 	}
 }
 
@@ -757,4 +768,136 @@ func requireReasoningMap(
 	}
 
 	return result
+}
+
+func TestParseThinkingDefaultsFromSchema(t *testing.T) {
+	model := ModelInfo{
+		ModelId: "custom-claude",
+		AdditionalModelRequestFieldsSchema: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"thinking": {
+					"type": "object",
+					"default": {"type": "adaptive", "display": "omitted"},
+					"properties": {
+						"type": {"enum": ["adaptive", "disabled"]},
+						"display": {"enum": ["summarized", "omitted"]}
+					}
+				}
+			}
+		}`),
+	}
+
+	capability := ParseModelReasoningCapability(model)
+	if capability.DefaultThinkingType != "adaptive" {
+		t.Fatalf("default thinking type = %q, want adaptive", capability.DefaultThinkingType)
+	}
+	if capability.DefaultThinkingDisplay != "omitted" {
+		t.Fatalf("default thinking display = %q, want omitted", capability.DefaultThinkingDisplay)
+	}
+}
+
+func TestClaudeOpus5DisabledThinkingAllowsHighOrLower(t *testing.T) {
+	capability := fallbackClaudeReasoningCapability("claude-opus-5")
+
+	for _, effort := range []string{"low", "medium", "high"} {
+		t.Run(effort, func(t *testing.T) {
+			req := &ClaudeRequest{
+				Model:    capability.ModelID,
+				Thinking: &ClaudeThinkingConfig{Type: "disabled"},
+				OutputConfig: &ClaudeOutputConfig{
+					Effort: effort,
+				},
+			}
+
+			fields, requested, err := BuildClaudeAdditionalModelRequestFields(req, capability)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !requested {
+				t.Fatal("expected native fields to be requested")
+			}
+
+			thinking := requireReasoningMap(t, fields, "thinking")
+			if got := thinking["type"]; got != "disabled" {
+				t.Fatalf("thinking.type = %#v, want disabled", got)
+			}
+
+			outputConfig := requireReasoningMap(t, fields, "output_config")
+			if got := outputConfig["effort"]; got != effort {
+				t.Fatalf("effort = %#v, want %q", got, effort)
+			}
+		})
+	}
+}
+
+func TestClaudeOpus5DisabledThinkingRejectsXHighAndMax(t *testing.T) {
+	capability := fallbackClaudeReasoningCapability("claude-opus-5")
+
+	for _, effort := range []string{"xhigh", "max"} {
+		t.Run(effort, func(t *testing.T) {
+			req := &ClaudeRequest{
+				Model:    capability.ModelID,
+				Thinking: &ClaudeThinkingConfig{Type: "disabled"},
+				OutputConfig: &ClaudeOutputConfig{
+					Effort: effort,
+				},
+			}
+
+			_, requested, err := BuildClaudeAdditionalModelRequestFields(req, capability)
+			if !requested {
+				t.Fatal("explicit config must be recognized")
+			}
+			if err == nil {
+				t.Fatalf("expected disabled + %s to fail", effort)
+			}
+		})
+	}
+}
+
+func TestClaudeEnabledWithoutBudgetMapsToAdaptive(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:    "claude-opus-5",
+		Thinking: &ClaudeThinkingConfig{Type: "enabled"},
+	}
+	capability := ModelReasoningCapability{
+		ModelID:          "claude-opus-5",
+		SupportsThinking: true,
+		ThinkingTypes:    []string{"adaptive", "disabled"},
+	}
+
+	fields, requested, err := BuildClaudeAdditionalModelRequestFields(req, capability)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !requested {
+		t.Fatal("expected reasoning to be requested")
+	}
+
+	thinking := requireReasoningMap(t, fields, "thinking")
+	if got := thinking["type"]; got != "adaptive" {
+		t.Fatalf("thinking.type = %#v, want adaptive", got)
+	}
+	if _, exists := thinking["budget_tokens"]; exists {
+		t.Fatalf("adaptive-only model must not receive budget_tokens: %#v", thinking)
+	}
+}
+
+func TestFallbackClaudeReasoningCapabilityForOpus5(t *testing.T) {
+	capability := fallbackClaudeReasoningCapability("claude-opus-5")
+	if !capability.SupportsThinking {
+		t.Fatal("expected Opus 5 fallback to support thinking")
+	}
+	if capability.DefaultThinkingType != "adaptive" {
+		t.Fatalf("default thinking type = %q, want adaptive", capability.DefaultThinkingType)
+	}
+	if capability.DefaultThinkingDisplay != "omitted" {
+		t.Fatalf("default thinking display = %q, want omitted", capability.DefaultThinkingDisplay)
+	}
+	if capability.EffortPath != ReasoningSchemaOutputConfig {
+		t.Fatalf("effort path = %q, want output_config", capability.EffortPath)
+	}
+	if got := strings.Join(capability.Efforts, ","); got != "low,medium,high,xhigh,max" {
+		t.Fatalf("efforts = %q", got)
+	}
 }

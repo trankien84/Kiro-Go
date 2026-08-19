@@ -379,7 +379,7 @@ func TestBuildFlushContent_WebSearchAsServerTool(t *testing.T) {
 	}
 }
 
-func TestConvertClaudeTools_SkipsNativeWebSearchAndInjectsSchema(t *testing.T) {
+func TestConvertClaudeTools_SkipsNativeWebSearchAndKeepsClientTools(t *testing.T) {
 	tools := []ClaudeTool{
 		{Type: "web_search_20250305", Name: "web_search"},
 		{Name: "Bash", Description: "run", InputSchema: map[string]interface{}{"type": "object"}},
@@ -391,20 +391,12 @@ func TestConvertClaudeTools_SkipsNativeWebSearchAndInjectsSchema(t *testing.T) {
 		switch {
 		case name == "web_search":
 			sawWeb = true
-			schema, ok := tspec.ToolSpecification.InputSchema.JSON.(map[string]interface{})
-			if !ok {
-				t.Fatal("web_search schema must be object map")
-			}
-			props, _ := schema["properties"].(map[string]interface{})
-			if props == nil || props["query"] == nil {
-				t.Fatalf("web_search schema missing query: %+v", schema)
-			}
 		case name == "Bash" || name == "bash" || nameMap[name] == "Bash":
 			sawClient = true
 		}
 	}
-	if !sawWeb {
-		t.Error("expected injected web_search schema for mixed tools")
+	if sawWeb {
+		t.Error("native server web_search must not be serialized as a Kiro client function")
 	}
 	if !sawClient {
 		t.Errorf("expected client Bash tool in %+v (nameMap=%v)", kiroTools, nameMap)

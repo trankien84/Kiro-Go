@@ -28,6 +28,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -168,47 +169,167 @@ func dedupeSortedModelIDs(foundation, profiles []string) []string {
 type bedrockDiscoveryEntry struct {
 	models  []string
 	expires time.Time
+	failure string
 }
 
 var (
 	bedrockDiscoveryMu    sync.RWMutex
-	bedrockDiscoveryCache = map[string]bedrockDiscoveryEntry{}
+	bedrockDiscoveryCache = map[accountLifecycleKey]bedrockDiscoveryEntry{}
 )
 
-// getCachedBedrockModels returns a DEFENSIVE COPY of the cached set so callers
-// (which append fallback ids) can never mutate the shared backing array.
-func getCachedBedrockModels(accountID string) ([]string, bool) {
+// getCachedBedrockModelsResult returns a defensive copy and preserves whether a
+// negative-cache entry represents a discovery failure. An empty successful list
+// is different from a transport/permission failure and must not replace a stale
+// provider snapshot as if it were freshly verified.
+func getCachedBedrockModelsResultForAccount(account *config.Account) ([]string, bool, error) {
+	key := lifecycleOrLegacyKeyForAccount(account)
+	if key.accountID == "" {
+		return nil, false, nil
+	}
 	bedrockDiscoveryMu.RLock()
 	defer bedrockDiscoveryMu.RUnlock()
-	e, ok := bedrockDiscoveryCache[accountID]
+	e, ok := bedrockDiscoveryCache[key]
 	if !ok || time.Now().After(e.expires) {
-		return nil, false
+		return nil, false, nil
 	}
-	return append([]string(nil), e.models...), true
+	models := append([]string(nil), e.models...)
+	if strings.TrimSpace(e.failure) != "" {
+		return models, true, errors.New(e.failure)
+	}
+	return models, true, nil
 }
 
-func setCachedBedrockModels(accountID string, models []string) {
-	setCachedBedrockModelsTTL(accountID, models, bedrockDiscoveryTTL)
+// getCachedBedrockModels is the resolver-facing compatibility view. Failed
+// negative-cache entries remain cached (so the hot path does not retry network)
+// but expose no provider evidence.
+func getCachedBedrockModelsForAccount(account *config.Account) ([]string, bool) {
+	models, cached, _ := getCachedBedrockModelsResultForAccount(account)
+	return models, cached
+}
+
+func setCachedBedrockModelsForAccount(account *config.Account, models []string) {
+	setCachedBedrockModelsTTLForAccount(account, models, bedrockDiscoveryTTL)
 }
 
 // clearBedrockModelCache drops any cached discovery for an account so the next
 // lookup re-discovers. Used by the explicit "refresh models" admin action.
 func clearBedrockModelCache(accountID string) {
 	bedrockDiscoveryMu.Lock()
-	delete(bedrockDiscoveryCache, accountID)
+	for key := range bedrockDiscoveryCache {
+		if key.accountID == accountID {
+			delete(bedrockDiscoveryCache, key)
+		}
+	}
 	bedrockDiscoveryMu.Unlock()
+	bedrockDiscoveryInflight.Range(func(rawKey, _ any) bool {
+		if key, ok := rawKey.(accountLifecycleKey); ok && key.accountID == accountID {
+			bedrockDiscoveryInflight.Delete(key)
+		}
+		return true
+	})
+}
+
+func clearBedrockModelCacheForLifecycle(account *config.Account) bool {
+	if account == nil || strings.TrimSpace(account.ID) == "" || account.DispatchGeneration == 0 {
+		return false
+	}
+	key := accountLifecycleKey{accountID: account.ID, generation: account.DispatchGeneration}
+	bedrockDiscoveryMu.Lock()
+	delete(bedrockDiscoveryCache, key)
+	bedrockDiscoveryMu.Unlock()
+	bedrockDiscoveryInflight.Delete(key)
+	return true
 }
 
 // setCachedBedrockModelsTTL stores a COPY of models with an explicit TTL (a short
 // TTL is used for negative results so a transient control-plane failure recovers
 // quickly instead of being pinned for the full success TTL).
-func setCachedBedrockModelsTTL(accountID string, models []string, ttl time.Duration) {
+func setCachedBedrockModelsTTLForAccount(account *config.Account, models []string, ttl time.Duration) {
+	key := lifecycleOrLegacyKeyForAccount(account)
+	if !lifecycleRuntimeKeyCanPublish(key) {
+		return
+	}
 	bedrockDiscoveryMu.Lock()
 	defer bedrockDiscoveryMu.Unlock()
-	bedrockDiscoveryCache[accountID] = bedrockDiscoveryEntry{
+	bedrockDiscoveryCache[key] = bedrockDiscoveryEntry{
 		models:  append([]string(nil), models...),
 		expires: time.Now().Add(ttl),
 	}
+}
+
+func setCachedBedrockDiscoveryFailureForAccount(account *config.Account, err error, ttl time.Duration) {
+	message := "bedrock model discovery failed"
+	if err != nil && strings.TrimSpace(err.Error()) != "" {
+		message = err.Error()
+	}
+	key := lifecycleOrLegacyKeyForAccount(account)
+	if !lifecycleRuntimeKeyCanPublish(key) {
+		return
+	}
+	bedrockDiscoveryMu.Lock()
+	defer bedrockDiscoveryMu.Unlock()
+	bedrockDiscoveryCache[key] = bedrockDiscoveryEntry{
+		expires: time.Now().Add(ttl),
+		failure: message,
+	}
+}
+
+// Legacy ID-only cache helpers are retained for existing tests/admin seams. They
+// intentionally use generation 0, a namespace that request dispatch never uses.
+// Request-derived state must go through the *ForAccount variants above so stale
+// completions cannot publish into a recreated account with the same textual ID.
+func getCachedBedrockModelsResult(accountID string) ([]string, bool, error) {
+	if accountID == "" {
+		return nil, false, nil
+	}
+	bedrockDiscoveryMu.RLock()
+	defer bedrockDiscoveryMu.RUnlock()
+	e, ok := bedrockDiscoveryCache[legacyBedrockLifecycleKey(accountID)]
+	if !ok || time.Now().After(e.expires) {
+		return nil, false, nil
+	}
+	models := append([]string(nil), e.models...)
+	if strings.TrimSpace(e.failure) != "" {
+		return models, true, errors.New(e.failure)
+	}
+	return models, true, nil
+}
+
+func getCachedBedrockModels(accountID string) ([]string, bool) {
+	models, cached, _ := getCachedBedrockModelsResult(accountID)
+	return models, cached
+}
+
+func setCachedBedrockModels(accountID string, models []string) {
+	setCachedBedrockModelsTTL(accountID, models, bedrockDiscoveryTTL)
+}
+
+func setCachedBedrockModelsTTL(accountID string, models []string, ttl time.Duration) {
+	if accountID == "" {
+		return
+	}
+	bedrockDiscoveryMu.Lock()
+	bedrockDiscoveryCache[legacyBedrockLifecycleKey(accountID)] = bedrockDiscoveryEntry{
+		models:  append([]string(nil), models...),
+		expires: time.Now().Add(ttl),
+	}
+	bedrockDiscoveryMu.Unlock()
+}
+
+func setCachedBedrockDiscoveryFailure(accountID string, err error, ttl time.Duration) {
+	if accountID == "" {
+		return
+	}
+	message := "bedrock model discovery failed"
+	if err != nil && strings.TrimSpace(err.Error()) != "" {
+		message = err.Error()
+	}
+	bedrockDiscoveryMu.Lock()
+	bedrockDiscoveryCache[legacyBedrockLifecycleKey(accountID)] = bedrockDiscoveryEntry{
+		expires: time.Now().Add(ttl),
+		failure: message,
+	}
+	bedrockDiscoveryMu.Unlock()
 }
 
 // --- network discovery ------------------------------------------------------
@@ -285,45 +406,61 @@ func (h *Handler) discoverBedrockModels(account *config.Account) ([]string, erro
 	if len(all) == 0 {
 		ttl = bedrockDiscoveryNegativeTTL
 	}
-	setCachedBedrockModelsTTL(account.ID, all, ttl)
+	setCachedBedrockModelsTTLForAccount(account, all, ttl)
 	logger.Infof("[Bedrock] discovered %d models for account %s in %s (%d on-demand text foundation + %d inference profiles)",
 		len(all), account.ID, bedrockRegionFor(account), len(foundation), len(profiles))
 	return all, nil
 }
 
-// cachedOrDiscoverBedrockModels returns the cached callable set, refreshing it via
-// discovery when the cache is cold or stale. Errors are logged and result in an
-// empty set (callers fall back to static config), so model lookup never blocks on
-// a control-plane hiccup.
-func (h *Handler) cachedOrDiscoverBedrockModels(account *config.Account) []string {
-	if m, ok := getCachedBedrockModels(account.ID); ok {
-		return m
+// cachedOrDiscoverBedrockModelsResult returns the cached/discovered callable set
+// and preserves discovery failures so provider snapshot freshness cannot be
+// renewed by a negative cache entry.
+func (h *Handler) cachedOrDiscoverBedrockModelsResult(account *config.Account) ([]string, error) {
+	if account == nil {
+		return nil, errors.New("bedrock account is nil")
+	}
+	if models, cached, err := getCachedBedrockModelsResultForAccount(account); cached {
+		return models, err
 	}
 	// Singleflight per account: serialize concurrent cold-cache callers so only one
 	// runs the control-plane list calls; the rest read the freshly populated cache.
-	lk := bedrockDiscoveryLock(account.ID)
+	lk := bedrockDiscoveryLockForAccount(account)
 	lk.Lock()
 	defer lk.Unlock()
-	if m, ok := getCachedBedrockModels(account.ID); ok {
-		return m
+	if models, cached, err := getCachedBedrockModelsResultForAccount(account); cached {
+		return models, err
 	}
-	m, err := h.discoverBedrockModels(account)
+	models, err := h.discoverBedrockModels(account)
 	if err != nil {
 		// Negative-cache the failure briefly so a key lacking
 		// bedrock:ListFoundationModels doesn't pay a round-trip on every call.
 		logger.Warnf("[Bedrock] model discovery failed for account %s: %v", account.ID, err)
-		setCachedBedrockModelsTTL(account.ID, nil, bedrockDiscoveryNegativeTTL)
-		return nil
+		setCachedBedrockDiscoveryFailureForAccount(account, err, bedrockDiscoveryNegativeTTL)
+		return nil, err
 	}
-	return m
+	return models, nil
+}
+
+// cachedOrDiscoverBedrockModels is retained for resolver/admin callers that only
+// need the current evidence set. Snapshot publication uses the error-aware form.
+func (h *Handler) cachedOrDiscoverBedrockModels(account *config.Account) []string {
+	models, _ := h.cachedOrDiscoverBedrockModelsResult(account)
+	return models
 }
 
 // bedrockDiscoveryInflight holds a per-account mutex used to collapse concurrent
 // cold-cache discovery into a single control-plane fan-out.
-var bedrockDiscoveryInflight sync.Map // accountID -> *sync.Mutex
+var bedrockDiscoveryInflight sync.Map // accountLifecycleKey -> *sync.Mutex
+
+func bedrockDiscoveryLockForAccount(account *config.Account) *sync.Mutex {
+	key := lifecycleOrLegacyKeyForAccount(account)
+	v, _ := bedrockDiscoveryInflight.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
 
 func bedrockDiscoveryLock(accountID string) *sync.Mutex {
-	v, _ := bedrockDiscoveryInflight.LoadOrStore(accountID, &sync.Mutex{})
+	key := legacyBedrockLifecycleKey(accountID)
+	v, _ := bedrockDiscoveryInflight.LoadOrStore(key, &sync.Mutex{})
 	return v.(*sync.Mutex)
 }
 
@@ -334,20 +471,38 @@ func bedrockDiscoveryLock(accountID string) *sync.Mutex {
 // token is a suffix of exactly one callable id (e.g. "claude-haiku-4-5" ->
 // "anthropic.claude-haiku-4-5-20251001-v1:0"). Returns "" when the cache is empty
 // or the match is ambiguous. Reads the cache only — never the network.
+func discoveredBedrockModelForAccount(account *config.Account, requested string) string {
+	models, ok := getCachedBedrockModelsForAccount(account)
+	if !ok {
+		return ""
+	}
+	return discoveredBedrockModelFromList(models, requested)
+}
+
+// bedrockModelCore reduces a Bedrock model id to its model-name core by stripping
+// the leading region/vendor prefix (everything through the last ".") and the
+// trailing version/date suffix. Examples:
+//
+//	anthropic.claude-haiku-4-5-20251001-v1:0 -> claude-haiku-4-5
+//	us.amazon.nova-lite-v1:0                 -> nova-lite
+//	meta.llama3-8b-instruct-v1:0             -> llama3-8b-instruct
+
+// discoveredBedrockModelFor is the legacy generation-0 resolver used by older
+// tests/admin code. Request routing uses discoveredBedrockModelForAccount.
 func discoveredBedrockModelFor(accountID, requested string) string {
 	models, ok := getCachedBedrockModels(accountID)
 	if !ok {
 		return ""
 	}
+	return discoveredBedrockModelFromList(models, requested)
+}
+
+func discoveredBedrockModelFromList(models []string, requested string) string {
 	for _, m := range models {
 		if m == requested {
 			return m
 		}
 	}
-	// Alias match: a unique callable id whose model-name CORE (vendor/region
-	// prefix and version/date suffix stripped) exactly equals the requested alias.
-	// Core equality — not substring — so "claude-sonnet-4" cannot match
-	// "claude-sonnet-4-5-...".
 	var matches []string
 	for _, m := range models {
 		if bedrockModelCore(m) == requested {
@@ -360,13 +515,6 @@ func discoveredBedrockModelFor(accountID, requested string) string {
 	return ""
 }
 
-// bedrockModelCore reduces a Bedrock model id to its model-name core by stripping
-// the leading region/vendor prefix (everything through the last ".") and the
-// trailing version/date suffix. Examples:
-//
-//	anthropic.claude-haiku-4-5-20251001-v1:0 -> claude-haiku-4-5
-//	us.amazon.nova-lite-v1:0                 -> nova-lite
-//	meta.llama3-8b-instruct-v1:0             -> llama3-8b-instruct
 func bedrockModelCore(id string) string {
 	core := id
 	if k := strings.LastIndex(core, "."); k >= 0 {

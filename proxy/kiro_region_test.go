@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"kiro-go/config"
+	"path/filepath"
 	"testing"
 )
 
@@ -109,6 +110,87 @@ func TestKiroProfileRegionCandidatesRejectsMalformedEnvRegion(t *testing.T) {
 	t.Setenv("KIRO_PROFILE_REGIONS", "evil.amazonaws.com,../../etc,eu-west-1")
 	got := kiroProfileRegionCandidates(&config.Account{AuthMethod: "external_idp"})
 	assertOrder(t, got, []string{"eu-west-1"})
+}
+
+func initKiroRegionLifecycleConfig(t *testing.T) {
+	t.Helper()
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+}
+
+func TestPersistConfirmedAPIKeyRegionRejectsStaleLifecycle(t *testing.T) {
+	initKiroRegionLifecycleConfig(t)
+
+	if err := config.AddAccount(config.Account{
+		ID:         "region-reused",
+		KiroApiKey: "ksk_phase6_old",
+		Region:     "us-east-1",
+		Enabled:    true,
+	}); err != nil {
+		t.Fatalf("add old account: %v", err)
+	}
+	old, ok := config.GetAccountByID("region-reused")
+	if !ok {
+		t.Fatal("old account missing after add")
+	}
+	if old.DispatchGeneration == 0 {
+		t.Fatal("expected dispatch generation on selected account snapshot")
+	}
+
+	if err := config.DeleteAccount("region-reused"); err != nil {
+		t.Fatalf("delete old account: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:         "region-reused",
+		KiroApiKey: "ksk_phase6_new",
+		Region:     "eu-central-1",
+		Enabled:    true,
+	}); err != nil {
+		t.Fatalf("add replacement account: %v", err)
+	}
+
+	stale := old.Clone()
+	persistConfirmedAPIKeyRegion(&stale, "ap-southeast-1")
+
+	current, ok := config.GetAccountByID("region-reused")
+	if !ok {
+		t.Fatal("replacement account missing")
+	}
+	if got, want := current.Region, "eu-central-1"; got != want {
+		t.Fatalf("stale lifecycle changed replacement region: got %q want %q", got, want)
+	}
+}
+
+func TestPersistConfirmedAPIKeyRegionUpdatesCurrentLifecycle(t *testing.T) {
+	initKiroRegionLifecycleConfig(t)
+
+	if err := config.AddAccount(config.Account{
+		ID:         "region-current",
+		KiroApiKey: "ksk_phase6_current",
+		Region:     "us-east-1",
+		Enabled:    true,
+	}); err != nil {
+		t.Fatalf("add current account: %v", err)
+	}
+	current, ok := config.GetAccountByID("region-current")
+	if !ok {
+		t.Fatal("current account missing after add")
+	}
+
+	snapshot := current.Clone()
+	persistConfirmedAPIKeyRegion(&snapshot, "eu-west-1")
+
+	updated, ok := config.GetAccountByID("region-current")
+	if !ok {
+		t.Fatal("current account missing after persist")
+	}
+	if got, want := updated.Region, "eu-west-1"; got != want {
+		t.Fatalf("confirmed region not persisted: got %q want %q", got, want)
+	}
+	if updated.DispatchGeneration == current.DispatchGeneration {
+		t.Fatal("region change must advance lifecycle generation for future dispatches")
+	}
 }
 
 func assertOrder(t *testing.T, got, want []string) {

@@ -68,14 +68,29 @@ func (h *Handler) startImportWatcher() {
 	}
 	dir := importWatchDir()
 	logger.Infof("[Import] auto-ingest watcher enabled, watching %s every %s", dir, importWatchInterval)
-	go h.importWatchLoop(dir)
+
+	// The watcher is Handler-owned background work. Register it before launching
+	// so Shutdown's backgroundWG.Wait cannot race a late Add.
+	h.backgroundWG.Add(1)
+	go func() {
+		defer h.backgroundWG.Done()
+		h.importWatchLoop(dir)
+	}()
 }
 
-// importWatchLoop scans once at startup, then on a fixed interval until stopRefresh.
+// importWatchLoop scans once after an interruptible startup settle delay, then
+// on a fixed interval until stopRefresh.
 func (h *Handler) importWatchLoop(dir string) {
-	// Initial settle delay so a freshly-started container that mounts the folder
-	// doesn't race a half-finished copy.
-	time.Sleep(3 * time.Second)
+	// A freshly-started container may mount a file while it is still being copied.
+	// Unlike time.Sleep, this timer lets Handler.Shutdown stop the watcher without
+	// waiting for the full settle delay.
+	startup := time.NewTimer(3 * time.Second)
+	defer startup.Stop()
+	select {
+	case <-startup.C:
+	case <-h.stopRefresh:
+		return
+	}
 	h.scanImportDir(dir)
 
 	ticker := time.NewTicker(importWatchInterval)

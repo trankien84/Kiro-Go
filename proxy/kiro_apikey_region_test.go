@@ -117,7 +117,7 @@ func TestCallKiroAPIRegionReprobeRetriesOnAuthFailure(t *testing.T) {
 		AuthMethod: "api_key",
 		KiroApiKey: "ksk_test",
 		Region:     "us-east-1", // wrong region
-		ProxyURL:   kiroRetryTestProxyURL,
+		ProxyURL:   kiroAPIKeyRegionTestProxyURL,
 	}
 	if err := config.AddAccount(acc); err != nil {
 		t.Fatalf("AddAccount: %v", err)
@@ -133,7 +133,7 @@ func TestCallKiroAPIRegionReprobeRetriesOnAuthFailure(t *testing.T) {
 	}
 
 	var hosts []string
-	installKiroStreamTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	installKiroAPIKeyRegionTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		hosts = append(hosts, req.URL.Host)
 		if len(hosts) == 1 {
 			return &http.Response{
@@ -142,13 +142,16 @@ func TestCallKiroAPIRegionReprobeRetriesOnAuthFailure(t *testing.T) {
 				Header:     make(http.Header),
 			}, nil
 		}
-		return kiroStreamTestResponse(bytes.NewReader(awsEventStreamFrame(t,
-			"assistantResponseEvent", map[string]interface{}{"content": "recovered"}))), nil
+		stream := append(
+			awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "recovered"}),
+			awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{"stopReason": "END_TURN"})...,
+		)
+		return kiroAPIKeyRegionTestResponse(bytes.NewReader(stream)), nil
 	}))
 
 	account := acc // local copy, mirrors how a caller holds *config.Account
 	var text string
-	err := CallKiroAPI(&account, newKiroRetryTestPayload(), &KiroStreamCallback{
+	err := CallKiroAPI(&account, newKiroAPIKeyRegionTestPayload(), &KiroStreamCallback{
 		OnText: func(chunk string, _ bool) { text += chunk },
 	})
 	if err != nil {
@@ -190,7 +193,7 @@ func TestCallKiroAPIRegionReprobeSurfacesOriginalAuthErrorWhenKeyIsDead(t *testi
 		AuthMethod: "api_key",
 		KiroApiKey: "ksk_dead",
 		Region:     "us-east-1",
-		ProxyURL:   kiroRetryTestProxyURL,
+		ProxyURL:   kiroAPIKeyRegionTestProxyURL,
 	}
 	if err := config.AddAccount(acc); err != nil {
 		t.Fatalf("AddAccount: %v", err)
@@ -205,7 +208,7 @@ func TestCallKiroAPIRegionReprobeSurfacesOriginalAuthErrorWhenKeyIsDead(t *testi
 	}
 
 	var upstreamCalls int
-	installKiroStreamTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	installKiroAPIKeyRegionTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		upstreamCalls++
 		return &http.Response{
 			StatusCode: http.StatusForbidden,
@@ -215,7 +218,7 @@ func TestCallKiroAPIRegionReprobeSurfacesOriginalAuthErrorWhenKeyIsDead(t *testi
 	}))
 
 	account := acc
-	err := CallKiroAPI(&account, newKiroRetryTestPayload(), &KiroStreamCallback{})
+	err := CallKiroAPI(&account, newKiroAPIKeyRegionTestPayload(), &KiroStreamCallback{})
 	if err == nil {
 		t.Fatalf("expected the original auth error to surface for a dead key")
 	}
@@ -254,7 +257,7 @@ func TestCallKiroAPIRegionReprobeDoesNotPersistWhenRuntimeRetryFails(t *testing.
 		AuthMethod: "api_key",
 		KiroApiKey: "ksk_test",
 		Region:     "us-east-1", // wrong region
-		ProxyURL:   kiroRetryTestProxyURL,
+		ProxyURL:   kiroAPIKeyRegionTestProxyURL,
 	}
 	if err := config.AddAccount(acc); err != nil {
 		t.Fatalf("AddAccount: %v", err)
@@ -273,7 +276,7 @@ func TestCallKiroAPIRegionReprobeDoesNotPersistWhenRuntimeRetryFails(t *testing.
 	// ...but the runtime plane rejects BOTH the original and the re-detected region
 	// (e.g. a transient runtime-side outage independent of the REST plane).
 	var hosts []string
-	installKiroStreamTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	installKiroAPIKeyRegionTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		hosts = append(hosts, req.URL.Host)
 		return &http.Response{
 			StatusCode: http.StatusForbidden,
@@ -283,7 +286,7 @@ func TestCallKiroAPIRegionReprobeDoesNotPersistWhenRuntimeRetryFails(t *testing.
 	}))
 
 	account := acc
-	err := CallKiroAPI(&account, newKiroRetryTestPayload(), &KiroStreamCallback{})
+	err := CallKiroAPI(&account, newKiroAPIKeyRegionTestPayload(), &KiroStreamCallback{})
 	if err == nil {
 		t.Fatalf("expected the runtime-plane auth error to surface")
 	}
@@ -396,7 +399,7 @@ func TestCallKiroAPIRegionReprobeNeverRetriesAfterPartialEmission(t *testing.T) 
 		AuthMethod: "api_key",
 		KiroApiKey: "ksk_test",
 		Region:     "us-east-1",
-		ProxyURL:   kiroRetryTestProxyURL,
+		ProxyURL:   kiroAPIKeyRegionTestProxyURL,
 	}
 	if err := config.AddAccount(acc); err != nil {
 		t.Fatalf("AddAccount: %v", err)
@@ -411,7 +414,7 @@ func TestCallKiroAPIRegionReprobeNeverRetriesAfterPartialEmission(t *testing.T) 
 	}
 
 	var upstreamCalls int
-	installKiroStreamTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	installKiroAPIKeyRegionTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		upstreamCalls++
 		frame := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial"})
 		// The stream emits one complete frame, then the connection dies with an
@@ -419,7 +422,7 @@ func TestCallKiroAPIRegionReprobeNeverRetriesAfterPartialEmission(t *testing.T) 
 		// though this is a mid-stream transport failure, not an upstream 403
 		// response. pool.IsAuthFailure would classify this as an auth failure by
 		// text alone.
-		return kiroStreamTestResponse(&truncatedReader{
+		return kiroAPIKeyRegionTestResponse(&truncatedReader{
 			data: append(frame, 0, 0, 1),
 			err:  errTest("connection reset: upstream returned 403 mid-stream"),
 		}), nil
@@ -427,7 +430,7 @@ func TestCallKiroAPIRegionReprobeNeverRetriesAfterPartialEmission(t *testing.T) 
 
 	account := acc
 	var text string
-	err := CallKiroAPI(&account, newKiroRetryTestPayload(), &KiroStreamCallback{
+	err := CallKiroAPI(&account, newKiroAPIKeyRegionTestPayload(), &KiroStreamCallback{
 		OnText: func(chunk string, _ bool) { text += chunk },
 	})
 	if err == nil {

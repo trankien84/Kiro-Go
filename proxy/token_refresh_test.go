@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
@@ -160,6 +161,54 @@ func TestRefreshAccountTokenDoesNotPublishWhenPersistenceFails(t *testing.T) {
 		persisted[0].AccessToken != initial.AccessToken ||
 		persisted[0].RefreshToken != initial.RefreshToken {
 		t.Fatalf("in-memory config retained unpersisted tokens: %+v", persisted)
+	}
+}
+
+func TestRefreshAccountTokenRejectsStaleLifecycle(t *testing.T) {
+	h, initial, _ := newRotatingExternalIDPHandler(t)
+
+	stale, ok := config.GetAccountByID(initial.ID)
+	if !ok || stale.DispatchGeneration == 0 {
+		t.Fatalf("expected persisted lifecycle snapshot, got %+v ok=%t", stale, ok)
+	}
+	oldGeneration := stale.DispatchGeneration
+
+	if err := config.DeleteAccount(initial.ID); err != nil {
+		t.Fatalf("delete original lifecycle: %v", err)
+	}
+	recreated := initial
+	recreated.AccessToken = "replacement-access"
+	recreated.RefreshToken = "replacement-refresh"
+	recreated.DispatchGeneration = 0
+	if err := config.AddAccount(recreated); err != nil {
+		t.Fatalf("recreate account: %v", err)
+	}
+	current, ok := config.GetAccountByID(initial.ID)
+	if !ok || current.DispatchGeneration == 0 || current.DispatchGeneration == oldGeneration {
+		t.Fatalf("delete/recreate did not advance lifecycle: old=%d current=%+v ok=%t", oldGeneration, current, ok)
+	}
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: tokenRefreshRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			t.Fatal("stale lifecycle must be rejected before contacting the IdP")
+			return nil, errors.New("unreachable")
+		}),
+	}
+	previousClient := auth.SetGlobalAuthClientForTest(client)
+	t.Cleanup(func() { auth.SetGlobalAuthClientForTest(previousClient) })
+
+	refreshed, err := h.refreshAccountToken(&stale, true)
+	if !errors.Is(err, errStaleAccountSelection) {
+		t.Fatalf("refresh error=%v want errStaleAccountSelection", err)
+	}
+	if refreshed {
+		t.Fatal("stale lifecycle reported successful refresh")
+	}
+
+	current, _ = config.GetAccountByID(initial.ID)
+	if current.AccessToken != "replacement-access" || current.RefreshToken != "replacement-refresh" {
+		t.Fatalf("stale refresh contaminated recreated lifecycle: (%q, %q)", current.AccessToken, current.RefreshToken)
 	}
 }
 

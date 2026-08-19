@@ -268,7 +268,7 @@ func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 }
 
 func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
-	resp := KiroToClaudeResponse("final answer", "", true, nil, 10, 20, "claude-sonnet-4.6", "")
+	resp := KiroToClaudeResponse("final answer", "", true, nil, 10, 20, "claude-sonnet-4.6")
 
 	if len(resp.Content) != 2 {
 		t.Fatalf("expected empty thinking block plus text block, got %d blocks", len(resp.Content))
@@ -284,7 +284,7 @@ func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
 	}
 }
 
-func TestMapClaudeStopReason(t *testing.T) {
+func TestResolveClaudeHandlerStopReason(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		reason    string
@@ -295,32 +295,29 @@ func TestMapClaudeStopReason(t *testing.T) {
 		{name: "max output tokens alias", reason: "max_output_tokens", want: "max_tokens"},
 		{name: "length alias", reason: "length", want: "max_tokens"},
 		{name: "context limit", reason: "CONTEXT_WINDOW_EXCEEDED", want: "model_context_window_exceeded"},
-		{name: "model context limit alias", reason: "model_context_window_exceeded", want: "model_context_window_exceeded"},
+		{name: "context length alias", reason: "context_length_exceeded", want: "model_context_window_exceeded"},
+		{name: "model context limit", reason: "model_context_window_exceeded", want: "model_context_window_exceeded"},
 		{name: "content filter", reason: "CONTENT_FILTERED", want: "refusal"},
-		{name: "refusal alias", reason: "refusal", want: "refusal"},
+		{name: "content filter alias", reason: "content_filter", want: "refusal"},
+		{name: "refusal", reason: "refusal", want: "refusal"},
 		{name: "guardrail alias", reason: "guardrail_intervened", want: "refusal"},
 		{name: "stop sequence", reason: "STOP_SEQUENCE", want: "stop_sequence"},
 		{name: "pause", reason: "PAUSE_TURN", want: "pause_turn"},
-		// END_TURN is the only stopReason literal the Kiro IDE bundle compares
-		// against, so it is the realistic "finished normally" input.
 		{name: "end turn", reason: "END_TURN", want: "end_turn"},
-		// Absent metadataEvent leaves the reason empty. Mapping it to end_turn is
-		// the deliberate fallback for clients that require a terminal reason; the
-		// truncation itself is caught by the stream integrity layer, not here.
 		{name: "empty falls back to end turn", reason: "", want: "end_turn"},
-		{name: "unknown defaults to end turn", reason: "COMPLETE", want: "end_turn"},
-		{name: "tool use takes priority", reason: "MAX_TOKENS", toolCount: 1, want: "tool_use"},
+		{name: "unknown is preserved", reason: "COMPLETE", want: "COMPLETE"},
+		{name: "explicit max tokens wins over observed tool", reason: "MAX_TOKENS", toolCount: 1, want: "max_tokens"},
 		{name: "tool use wins over empty reason", reason: "", toolCount: 2, want: "tool_use"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := mapClaudeStopReason(tc.reason, tc.toolCount); got != tc.want {
-				t.Fatalf("mapClaudeStopReason(%q, %d) = %q, want %q", tc.reason, tc.toolCount, got, tc.want)
+			if got := resolveClaudeHandlerStopReason(tc.reason, tc.toolCount); got != tc.want {
+				t.Fatalf("resolveClaudeHandlerStopReason(%q, %d) = %q, want %q", tc.reason, tc.toolCount, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestMapOpenAIFinishReason(t *testing.T) {
+func TestResolveOpenAIHandlerFinishReason(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		reason    string
@@ -331,19 +328,21 @@ func TestMapOpenAIFinishReason(t *testing.T) {
 		{name: "max output tokens alias", reason: "max_output_tokens", want: "length"},
 		{name: "length alias", reason: "length", want: "length"},
 		{name: "context limit", reason: "CONTEXT_WINDOW_EXCEEDED", want: "length"},
-		{name: "model context limit alias", reason: "model_context_window_exceeded", want: "length"},
+		{name: "model context limit", reason: "model_context_window_exceeded", want: "length"},
 		{name: "content filter", reason: "CONTENT_FILTERED", want: "content_filter"},
+		{name: "content filter alias", reason: "content_filter", want: "content_filter"},
 		{name: "refusal alias", reason: "refusal", want: "content_filter"},
 		{name: "guardrail alias", reason: "guardrail_intervened", want: "content_filter"},
 		{name: "end turn", reason: "END_TURN", want: "stop"},
 		{name: "empty falls back to stop", reason: "", want: "stop"},
-		{name: "unknown defaults to stop", reason: "COMPLETE", want: "stop"},
-		{name: "tool calls take priority", reason: "MAX_TOKENS", toolCount: 1, want: "tool_calls"},
+		{name: "pause is preserved", reason: "PAUSE_TURN", want: "PAUSE_TURN"},
+		{name: "unknown is preserved", reason: "COMPLETE", want: "COMPLETE"},
+		{name: "explicit max tokens wins over observed tool", reason: "MAX_TOKENS", toolCount: 1, want: "length"},
 		{name: "tool calls win over empty reason", reason: "", toolCount: 2, want: "tool_calls"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := mapOpenAIFinishReason(tc.reason, tc.toolCount); got != tc.want {
-				t.Fatalf("mapOpenAIFinishReason(%q, %d) = %q, want %q", tc.reason, tc.toolCount, got, tc.want)
+			if got := resolveOpenAIHandlerFinishReason(tc.reason, tc.toolCount); got != tc.want {
+				t.Fatalf("resolveOpenAIHandlerFinishReason(%q, %d) = %q, want %q", tc.reason, tc.toolCount, got, tc.want)
 			}
 		})
 	}
@@ -377,14 +376,9 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	}
 }
 
-func TestKiroToOpenAIResponseWithReasoningPreservesFinishReason(t *testing.T) {
-	response := KiroToOpenAIResponseWithReasoning("partial answer", "", nil, 10, 20, "claude-sonnet-4.5", "reasoning_content", "MAX_TOKENS")
-	choices, ok := response["choices"].([]map[string]interface{})
-	if !ok || len(choices) != 1 {
-		t.Fatalf("unexpected choices: %#v", response["choices"])
-	}
-	if got := choices[0]["finish_reason"]; got != "length" {
-		t.Fatalf("finish_reason=%#v, want length", got)
+func TestResolveOpenAIHandlerFinishReasonPreservesLength(t *testing.T) {
+	if got := resolveOpenAIHandlerFinishReason("MAX_TOKENS", 0); got != "length" {
+		t.Fatalf("finish_reason=%q, want length", got)
 	}
 }
 
@@ -592,8 +586,54 @@ func TestClaudeToolResultImageAttachedToCurrentMessage(t *testing.T) {
 	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
 		t.Fatalf("expected one tool result preserved")
 	}
-	if strings.TrimSpace(cur.UserInputMessageContext.ToolResults[0].Content[0].Text) == "" {
+	result := cur.UserInputMessageContext.ToolResults[0]
+	if result.ToolUseID != "tool_1" || result.Status != "success" {
+		t.Fatalf("expected tool result identity/status preserved, got %#v", result)
+	}
+	if strings.TrimSpace(result.Content[0].Text) == "" {
 		t.Fatalf("expected non-empty placeholder text for image-only tool result")
+	}
+	if strings.Contains(strings.ToLower(result.Content[0].Text), "attached") {
+		t.Fatalf("tool-result image marker must not promise the image survives payload truncation: %q", result.Content[0].Text)
+	}
+}
+
+func TestClaudeParallelToolResultImagesPreserveDeterministicOrderAndStatus(t *testing.T) {
+	const first = "aGVsbG8="
+	const second = "d29ybGQ="
+	req := &ClaudeRequest{
+		Model: "claude-opus-5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "capture both"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "tool_a", "name": "capture", "input": map[string]interface{}{}},
+				map[string]interface{}{"type": "tool_use", "id": "tool_b", "name": "capture", "input": map[string]interface{}{}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_a", "content": []interface{}{
+					map[string]interface{}{"type": "text", "text": "first"},
+					map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "base64", "media_type": "image/png", "data": first}},
+				}},
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_b", "is_error": true, "content": []interface{}{
+					map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "base64", "media_type": "image/png", "data": second}},
+				}},
+			}},
+		},
+	}
+	payload := ClaudeToKiro(req, false)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if len(cur.Images) != 2 || cur.Images[0].Source.Bytes != first || cur.Images[1].Source.Bytes != second {
+		t.Fatalf("image order was not deterministic: %#v", cur.Images)
+	}
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 2 {
+		t.Fatalf("tool results=%#v", cur.UserInputMessageContext)
+	}
+	results := cur.UserInputMessageContext.ToolResults
+	if results[0].ToolUseID != "tool_a" || results[0].Status != "success" || results[0].Content[0].Text != "first" {
+		t.Fatalf("first result=%#v", results[0])
+	}
+	if results[1].ToolUseID != "tool_b" || results[1].Status != "error" || results[1].Content[0].Text != toolResultImagePlaceholder {
+		t.Fatalf("second result=%#v", results[1])
 	}
 }
 

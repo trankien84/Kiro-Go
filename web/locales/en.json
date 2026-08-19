@@ -559,5 +559,16 @@
   "customApi.tags": "Tags",
   "customApi.orderIdPlaceholder": "e.g. ORD-1234 or a label for this key",
   "customApi.missingFields": "Base URL, API Key, and Order ID are all required",
-  "customApi.success": "Custom API account added"
+  "customApi.success": "Custom API account added",
+  "settings.responseLanguageSettings": "Response Language",
+  "settings.responseLanguagePolicy": "Language policy",
+  "settings.responseLanguagePreserve": "Preserve client/provider behavior",
+  "settings.responseLanguageMatchUser": "Match the latest substantive user request",
+  "settings.responseLanguageFixed": "Use a fixed language",
+  "settings.responseLanguageHint": "Applies only to requests projected to Kiro native. Explicit user/client language instructions still take precedence.",
+  "settings.responseLanguageTag": "Fixed language tag",
+  "settings.responseLanguageTagHint": "Use a language tag such as vi, en-US, pt-BR, or zh-CN.",
+  "settings.saveResponseLanguage": "Save Language Settings",
+  "settings.responseLanguageRequired": "Enter a language tag for fixed language mode.",
+  "settings.responseLanguageSaved": "Response language settings saved"
 }

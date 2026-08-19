@@ -45,6 +45,19 @@ func accountUsesConverse(account *config.Account) bool {
 	return account != nil && account.BedrockUseConverse
 }
 
+// bedrockSpecificToolChoiceSupported reports whether the resolved Bedrock path
+// can honor OpenAI's forced-function tool_choice. Native Bedrock accounts here
+// are Claude/Anthropic and preserve the specific tool choice. Converse is used
+// for non-Claude models; AWS documents forced specific tools for Nova (and
+// Claude 3), so the non-Claude Converse path is lossless only for Nova.
+func bedrockSpecificToolChoiceSupported(account *config.Account, providerModelID string) bool {
+	if !accountUsesConverse(account) {
+		return true
+	}
+	model := strings.ToLower(strings.TrimSpace(providerModelID))
+	return strings.Contains(model, "nova")
+}
+
 // bedrockConverseEndpoint builds the Converse URL for a model id and stream flag.
 func bedrockConverseEndpoint(region, modelID string, streaming bool) string {
 	verb := "converse"
@@ -262,12 +275,15 @@ func anthropicContentToConverse(raw json.RawMessage) []map[string]interface{} {
 		case "tool_result":
 			var toolUseID string
 			_ = json.Unmarshal(b["tool_use_id"], &toolUseID)
-			out = append(out, map[string]interface{}{
-				"toolResult": map[string]interface{}{
-					"toolUseId": toolUseID,
-					"content":   anthropicToolResultContentToConverse(b["content"]),
-				},
-			})
+			toolResult := map[string]interface{}{
+				"toolUseId": toolUseID,
+				"content":   anthropicToolResultContentToConverse(b["content"]),
+			}
+			var isError bool
+			if len(b["is_error"]) > 0 && json.Unmarshal(b["is_error"], &isError) == nil && isError {
+				toolResult["status"] = "error"
+			}
+			out = append(out, map[string]interface{}{"toolResult": toolResult})
 		}
 	}
 	return out
@@ -299,8 +315,9 @@ func anthropicImageToConverse(rawSource json.RawMessage) map[string]interface{} 
 	}
 }
 
-// anthropicToolResultContentToConverse converts an Anthropic tool_result content
-// (string or block array) into Converse toolResult content [{text}].
+// anthropicToolResultContentToConverse converts the lossless subset currently
+// admitted by the Converse capability gate. Nested media is also encoded here
+// so future per-model capability enablement cannot silently flatten it.
 func anthropicToolResultContentToConverse(raw json.RawMessage) []map[string]interface{} {
 	if len(raw) == 0 {
 		return []map[string]interface{}{{"text": ""}}
@@ -309,12 +326,27 @@ func anthropicToolResultContentToConverse(raw json.RawMessage) []map[string]inte
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return []map[string]interface{}{{"text": s}}
 	}
-	var blocks []map[string]interface{}
+	var blocks []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &blocks); err == nil {
 		out := make([]map[string]interface{}, 0, len(blocks))
 		for _, b := range blocks {
-			if t, ok := b["text"].(string); ok {
-				out = append(out, map[string]interface{}{"text": t})
+			var blockType string
+			_ = json.Unmarshal(b["type"], &blockType)
+			switch strings.ToLower(strings.TrimSpace(blockType)) {
+			case "text":
+				var text string
+				if json.Unmarshal(b["text"], &text) == nil {
+					out = append(out, map[string]interface{}{"text": text})
+				}
+			case "image":
+				if image := anthropicImageToConverse(b["source"]); image != nil {
+					out = append(out, image)
+				}
+			case "json":
+				var value interface{}
+				if json.Unmarshal(b["json"], &value) == nil {
+					out = append(out, map[string]interface{}{"json": value})
+				}
 			}
 		}
 		if len(out) > 0 {
@@ -667,7 +699,11 @@ func (c *converseStreamConv) finalize(emit emitFn) error {
 // hopping are delegated to invokeBedrockRegional. All returned errors occur before
 // any client bytes.
 func (h *Handler) doBedrockConverseInvoke(p forwardParams, converseBody []byte, streaming bool) (*http.Response, error) {
-	modelID, err := resolveBedrockModelID(p.account, p.model)
+	modelID := strings.TrimSpace(p.providerModelID)
+	var err error
+	if modelID == "" {
+		modelID, err = resolveBedrockModelID(p.account, p.model)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -775,7 +811,7 @@ func (h *Handler) invokeBedrockConverseAnthropicStream(w http.ResponseWriter, fl
 // Converse: OpenAI -> Anthropic -> Converse invoke -> Anthropic -> OpenAI.
 func (h *Handler) invokeBedrockConverseOpenAINonStream(w http.ResponseWriter, p forwardParams) error {
 	reqStart := time.Now()
-	anthropicReq, err := openAIToAnthropicMessages(p.body)
+	anthropicReq, err := openAIToAnthropicMessages(p.body, bedrockSpecificToolChoiceSupported(p.account, p.providerModelID))
 	if err != nil {
 		return err
 	}
@@ -813,7 +849,7 @@ func (h *Handler) invokeBedrockConverseOpenAINonStream(w http.ResponseWriter, p 
 // Converse, feeding translated Anthropic events into the OpenAI chunk converter.
 func (h *Handler) invokeBedrockConverseOpenAIStream(w http.ResponseWriter, flusher http.Flusher, p forwardParams) error {
 	reqStart := time.Now()
-	anthropicReq, err := openAIToAnthropicMessages(p.body)
+	anthropicReq, err := openAIToAnthropicMessages(p.body, bedrockSpecificToolChoiceSupported(p.account, p.providerModelID))
 	if err != nil {
 		return err
 	}

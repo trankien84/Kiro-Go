@@ -559,5 +559,16 @@
   "customApi.tags": "标签",
   "customApi.orderIdPlaceholder": "例如 ORD-1234 或该密钥的名称",
   "customApi.missingFields": "Base URL、API 密钥、订单号均为必填",
-  "customApi.success": "已添加自定义 API 账号"
+  "customApi.success": "已添加自定义 API 账号",
+  "settings.responseLanguageSettings": "响应语言",
+  "settings.responseLanguagePolicy": "语言策略",
+  "settings.responseLanguagePreserve": "保持客户端/提供商原有行为",
+  "settings.responseLanguageMatchUser": "匹配最近一次实质性用户请求的语言",
+  "settings.responseLanguageFixed": "使用固定语言",
+  "settings.responseLanguageHint": "仅应用于投影到 Kiro 原生传输的请求。用户或客户端明确指定的语言仍具有更高优先级。",
+  "settings.responseLanguageTag": "固定语言标签",
+  "settings.responseLanguageTagHint": "使用 vi、en-US、pt-BR 或 zh-CN 等语言标签。",
+  "settings.saveResponseLanguage": "保存语言设置",
+  "settings.responseLanguageRequired": "固定语言模式需要填写语言标签。",
+  "settings.responseLanguageSaved": "响应语言设置已保存"
 }

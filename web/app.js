@@ -1698,8 +1698,36 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+    $('responseLanguagePolicy').value = d.responseLanguagePolicy || 'preserve';
+    $('responseLanguage').value = d.responseLanguage || '';
+    updateResponseLanguageVisibility();
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
+  }
+
+  function updateResponseLanguageVisibility() {
+    const fixed = $('responseLanguagePolicy').value === 'fixed';
+    $('responseLanguageFixedGroup').classList.toggle('hidden', !fixed);
+  }
+
+  async function saveResponseLanguageConfig() {
+    const policy = $('responseLanguagePolicy').value || 'preserve';
+    const language = ($('responseLanguage').value || '').trim();
+    if (policy === 'fixed' && !language) {
+      return toast(t('settings.responseLanguageRequired'), 'warning');
+    }
+    try {
+      const res = await api('/settings', {
+        method: 'POST',
+        body: JSON.stringify({ responseLanguagePolicy: policy, responseLanguage: language })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('settings.responseLanguageSaved'), 'success');
+      await loadSettings();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
   }
   async function loadThinkingConfig() {
     const res = await api('/thinking');
@@ -3749,6 +3777,8 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    $('responseLanguagePolicy').addEventListener('change', updateResponseLanguageVisibility);
+    $('saveResponseLanguageBtn').addEventListener('click', saveResponseLanguageConfig);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);

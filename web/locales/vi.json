@@ -520,5 +520,16 @@
   "errors.typeSuspended": "Tạm ngưng",
   "errors.typeOverage": "Vượt hạn",
   "errors.typeProfile": "Hồ sơ",
-  "errors.typeUnknown": "Không xác định"
+  "errors.typeUnknown": "Không xác định",
+  "settings.responseLanguageSettings": "Ngôn ngữ phản hồi",
+  "settings.responseLanguagePolicy": "Chính sách ngôn ngữ",
+  "settings.responseLanguagePreserve": "Giữ nguyên hành vi của client/provider",
+  "settings.responseLanguageMatchUser": "Theo ngôn ngữ của yêu cầu người dùng gần nhất",
+  "settings.responseLanguageFixed": "Dùng một ngôn ngữ cố định",
+  "settings.responseLanguageHint": "Chỉ áp dụng cho request được chuyển sang Kiro native. Yêu cầu ngôn ngữ tường minh từ user/client vẫn được ưu tiên.",
+  "settings.responseLanguageTag": "Mã ngôn ngữ cố định",
+  "settings.responseLanguageTagHint": "Dùng mã như vi, en-US, pt-BR hoặc zh-CN.",
+  "settings.saveResponseLanguage": "Lưu cài đặt ngôn ngữ",
+  "settings.responseLanguageRequired": "Hãy nhập mã ngôn ngữ khi dùng chế độ ngôn ngữ cố định.",
+  "settings.responseLanguageSaved": "Đã lưu cài đặt ngôn ngữ phản hồi"
 }

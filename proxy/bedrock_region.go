@@ -53,7 +53,7 @@ type bedrockRegionRoute struct {
 
 var (
 	bedrockRegionMu    sync.RWMutex
-	bedrockRegionCache = map[string]map[string]bedrockRegionRoute{} // accountID -> modelID -> route
+	bedrockRegionCache = map[accountLifecycleKey]map[string]bedrockRegionRoute{} // lifecycle -> modelID -> route
 )
 
 // candidateRegions returns the ordered, deduped region list to consider for an
@@ -91,10 +91,14 @@ func cleanRegionList(regions []string) []string {
 }
 
 // getBedrockRoute returns a fresh learned route for (account, model), if any.
-func getBedrockRoute(accountID, modelID string) (bedrockRegionRoute, bool) {
+func getBedrockRouteForAccount(account *config.Account, modelID string) (bedrockRegionRoute, bool) {
+	key := lifecycleOrLegacyKeyForAccount(account)
+	if key.accountID == "" {
+		return bedrockRegionRoute{}, false
+	}
 	bedrockRegionMu.RLock()
 	defer bedrockRegionMu.RUnlock()
-	m, ok := bedrockRegionCache[accountID]
+	m, ok := bedrockRegionCache[key]
 	if !ok {
 		return bedrockRegionRoute{}, false
 	}
@@ -108,25 +112,81 @@ func getBedrockRoute(accountID, modelID string) (bedrockRegionRoute, bool) {
 // recordBedrockRegion stores a learned verdict for (account, model). A callable
 // verdict pins the winning region; a not-callable verdict (region "") is cached
 // briefly so repeated requests fail over fast instead of re-hopping every region.
-func recordBedrockRegion(accountID, modelID, region string, callable bool) {
+func recordBedrockRegionForAccount(account *config.Account, modelID, region string, callable bool) {
 	ttl := bedrockRegionTTL
 	if !callable {
 		ttl = bedrockRegionNegativeTTL
 	}
+	key := lifecycleOrLegacyKeyForAccount(account)
+	if !lifecycleRuntimeKeyCanPublish(key) {
+		return
+	}
 	bedrockRegionMu.Lock()
 	defer bedrockRegionMu.Unlock()
-	if bedrockRegionCache[accountID] == nil {
-		bedrockRegionCache[accountID] = map[string]bedrockRegionRoute{}
+	if bedrockRegionCache[key] == nil {
+		bedrockRegionCache[key] = map[string]bedrockRegionRoute{}
 	}
-	bedrockRegionCache[accountID][modelID] = bedrockRegionRoute{region: region, callable: callable, expires: time.Now().Add(ttl)}
+	bedrockRegionCache[key][modelID] = bedrockRegionRoute{region: region, callable: callable, expires: time.Now().Add(ttl)}
+}
+
+// Legacy ID-only route helpers are retained for existing tests/admin seams. They
+// use generation 0, isolated from request-derived lifecycle-scoped state.
+func getBedrockRoute(accountID, modelID string) (bedrockRegionRoute, bool) {
+	if accountID == "" {
+		return bedrockRegionRoute{}, false
+	}
+	key := legacyBedrockLifecycleKey(accountID)
+	bedrockRegionMu.RLock()
+	defer bedrockRegionMu.RUnlock()
+	m, ok := bedrockRegionCache[key]
+	if !ok {
+		return bedrockRegionRoute{}, false
+	}
+	r, ok := m[modelID]
+	if !ok || time.Now().After(r.expires) {
+		return bedrockRegionRoute{}, false
+	}
+	return r, true
+}
+
+func recordBedrockRegion(accountID, modelID, region string, callable bool) {
+	if accountID == "" {
+		return
+	}
+	ttl := bedrockRegionTTL
+	if !callable {
+		ttl = bedrockRegionNegativeTTL
+	}
+	key := legacyBedrockLifecycleKey(accountID)
+	bedrockRegionMu.Lock()
+	if bedrockRegionCache[key] == nil {
+		bedrockRegionCache[key] = map[string]bedrockRegionRoute{}
+	}
+	bedrockRegionCache[key][modelID] = bedrockRegionRoute{region: region, callable: callable, expires: time.Now().Add(ttl)}
+	bedrockRegionMu.Unlock()
 }
 
 // clearBedrockRegionRoutes drops all learned routes for an account (used when its
 // region list or credentials change, alongside clearBedrockModelCache).
 func clearBedrockRegionRoutes(accountID string) {
 	bedrockRegionMu.Lock()
-	delete(bedrockRegionCache, accountID)
+	for key := range bedrockRegionCache {
+		if key.accountID == accountID {
+			delete(bedrockRegionCache, key)
+		}
+	}
 	bedrockRegionMu.Unlock()
+}
+
+func clearBedrockRegionRoutesForLifecycle(account *config.Account) bool {
+	if account == nil || strings.TrimSpace(account.ID) == "" || account.DispatchGeneration == 0 {
+		return false
+	}
+	key := accountLifecycleKey{accountID: account.ID, generation: account.DispatchGeneration}
+	bedrockRegionMu.Lock()
+	delete(bedrockRegionCache, key)
+	bedrockRegionMu.Unlock()
+	return true
 }
 
 // orderedBedrockRegions returns the regions to try for (account, model), learned
@@ -134,7 +194,7 @@ func clearBedrockRegionRoutes(accountID string) {
 // callable in ANY candidate region, so the caller can fail over immediately.
 func orderedBedrockRegions(account *config.Account, modelID string) (regions []string, knownDead bool) {
 	cands := candidateRegions(account)
-	if r, ok := getBedrockRoute(account.ID, modelID); ok {
+	if r, ok := getBedrockRouteForAccount(account, modelID); ok {
 		if !r.callable {
 			return nil, true
 		}
@@ -194,7 +254,7 @@ func bedrockAccessError(status int, body []byte) bool {
 func (h *Handler) invokeBedrockRegional(p forwardParams, modelID string, payload []byte, buildReq func(region string) (*http.Request, error)) (*http.Response, error) {
 	// Adaptive throttle: skip a model still in a 429 cooldown (region-independent,
 	// keyed on the resolved model id) so the caller fails over.
-	if p.account != nil && bedrockThrottle.remaining(p.account.ID, modelID) > 0 {
+	if p.account != nil && bedrockThrottle.remainingForAccount(p.account, modelID) > 0 {
 		return nil, errBedrockThrottled
 	}
 
@@ -224,12 +284,12 @@ func (h *Handler) invokeBedrockRegional(p forwardParams, modelID string, payload
 		}
 		switch resp.StatusCode {
 		case http.StatusOK:
-			recordBedrockRegion(p.account.ID, modelID, region, true)
+			recordBedrockRegionForAccount(p.account, modelID, region, true)
 			return resp, nil
 		case http.StatusTooManyRequests:
 			// Callable (just throttled): learn the region, arm the cooldown, fail over.
-			recordBedrockRegion(p.account.ID, modelID, region, true)
-			noteBedrockResponseThrottle(p.account.ID, modelID, resp)
+			recordBedrockRegionForAccount(p.account, modelID, region, true)
+			noteBedrockResponseThrottleForAccount(p.account, modelID, resp)
 			resp.Body.Close()
 			return nil, errBedrockThrottled
 		default:
@@ -255,7 +315,7 @@ func (h *Handler) invokeBedrockRegional(p forwardParams, modelID string, payload
 	// genuinely not callable anywhere for this account. Cache that (short TTL) so
 	// subsequent requests fail over fast instead of re-sweeping every region.
 	if hops == len(regions) {
-		recordBedrockRegion(p.account.ID, modelID, "", false)
+		recordBedrockRegionForAccount(p.account, modelID, "", false)
 	}
 	if lastResp != nil {
 		return lastResp, nil
@@ -310,7 +370,7 @@ func (h *Handler) prewarmBedrockRegions(account *config.Account) []BedrockRegion
 			// every attempt was a transport error, leave the cache cold so lazy routing
 			// decides from real traffic instead of pinning the model as dead.
 			if anyReached {
-				recordBedrockRegion(account.ID, modelID, winner, winner != "")
+				recordBedrockRegionForAccount(account, modelID, winner, winner != "")
 			}
 			rows[i] = BedrockRegionModel{ModelID: modelID, Region: winner}
 		}()

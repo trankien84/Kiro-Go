@@ -39,12 +39,14 @@ func TestEffortOnlyRequestDoesNotInjectThinkingIntoTextStream(t *testing.T) {
 	if err := config.UpdateThinkingConfig("-thinking", "reasoning_content", "think"); err != nil {
 		t.Fatalf("UpdateThinkingConfig: %v", err)
 	}
-	if err := config.AddAccount(config.Account{
+	account := config.Account{
 		ID:          "acct-effort-only",
+		AuthMethod:  "social",
 		Enabled:     true,
 		AccessToken: "token-effort-only",
 		ProfileArn:  "arn:aws:codewhisperer:profile/effort-only",
-	}); err != nil {
+	}
+	if err := config.AddAccount(account); err != nil {
 		t.Fatalf("add account: %v", err)
 	}
 	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
@@ -72,11 +74,15 @@ func TestEffortOnlyRequestDoesNotInjectThinkingIntoTextStream(t *testing.T) {
 	p := accountpool.GetPool()
 	p.Reload()
 	h := &Handler{pool: p, promptCache: newPromptCacheTracker(defaultPromptCacheTTL)}
+	t.Cleanup(func() {
+		h.Close()
+		p.WaitForPendingStats()
+	})
 
 	// A model schema that supports native effort (output_config path) but was
 	// never asked for a `thinking` object — the exact shape that made
 	// nativeRequested true without req.Thinking being set.
-	h.cachedModels = []ModelInfo{{
+	model := ModelInfo{
 		ModelId: "claude-sonnet-4.5",
 		AdditionalModelRequestFieldsSchema: json.RawMessage(`{
 			"type": "object",
@@ -89,7 +95,17 @@ func TestEffortOnlyRequestDoesNotInjectThinkingIntoTextStream(t *testing.T) {
 				}
 			}
 		}`),
-	}}
+	}
+	snapshot := freshProviderSnapshot([]ModelInfo{model}, nil)
+	currentAccounts := config.GetAccounts()
+	if len(currentAccounts) != 1 {
+		t.Fatalf("accounts=%d, want 1", len(currentAccounts))
+	}
+	snapshot.SourceFingerprint = accountModelSourceFingerprint(&currentAccounts[0])
+	h.accountModelSnapshots = testRuntimeSnapshots(map[string]accountModelSnapshot{
+		"acct-effort-only": snapshot,
+	})
+	h.rebuildEnabledModelUnion()
 
 	reqBody := `{"model":"claude-sonnet-4.5","stream":true,"max_tokens":100,` +
 		`"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"high"}}`

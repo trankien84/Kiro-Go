@@ -54,6 +54,15 @@ func TestWebSearchLoopBillsSumOfInputTokensAcrossRounds(t *testing.T) {
 
 	p := accountpool.GetPool()
 	p.Reload()
+	// runWebSearchLoop records account stats through the pool's asynchronous
+	// persistence worker. Flush any writes admitted by this test before testing's
+	// TempDir cleanup removes the config directory; otherwise the worker can race
+	// with RemoveAll and intermittently recreate a file while cleanup is running.
+	t.Cleanup(func() {
+		if err := p.FlushStats(context.Background()); err != nil {
+			t.Errorf("flush account stats: %v", err)
+		}
+	})
 	h := &Handler{pool: p}
 
 	// generateAssistantResponse calls (Kiro native stream) and MCP web_search

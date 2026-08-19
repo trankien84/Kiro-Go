@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"errors"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/pool"
@@ -9,80 +8,6 @@ import (
 )
 
 const maxAccountRetryAttempts = 3
-
-// maxSameAccountStreamRetries bounds same-account recovery of a truncated
-// stream. Kiro IDE caps its truncation retry at one (Dt3 = 1 in extension.js),
-// but that budget was set for a single-credential client. This proxy also
-// rotates accounts, and the two recover different failures: a same-account
-// retry helps when the upstream hiccupped, rotation helps when that account's
-// backend is unhealthy. Two is therefore not a copy of the IDE.
-//
-// Cost of the extra attempt is bounded and small. Truncation returns nil from
-// CallKiroAPIContext, so it never reaches the endpoint fallback or
-// maxStreamAttemptsPerEndpoint - those fire only on transport errors. Worst
-// case across maxAccountRetryAttempts accounts is 3*(1+budget) requests: 9 at
-// two retries versus 6 at one.
-//
-// The payoff lands mostly on the three fully buffered paths, whose canRetry is
-// nil: a non-stream client gets a 500 with nothing usable, so one more chance
-// is worth more there than on a stream that has already flushed partial text.
-const maxSameAccountStreamRetries = 2
-
-// errUpstreamTruncatedResponse is a soft failure raised when a transport-clean
-// stream carried content but never a terminal signal. It is retryable on the
-// same account and must not mark the account unhealthy.
-//
-// There is deliberately no empty-response error here. A stream that produced no
-// output at all is already caught one layer down: parseEventStreamTracked
-// returns errEmptyKiroStream when !sawOutput (proxy/kiro.go), and
-// CallKiroAPIContext retries it internally. Since sawOutput is set by exactly
-// the three signals classifyStreamIntegrity measures (content, reasoning,
-// toolUse), an all-zero measurement can never reach this layer with a nil
-// error.
-var errUpstreamTruncatedResponse = errors.New("upstream truncated response without stop reason")
-
-// classifyStreamIntegrity decides whether an upstream stream that returned no
-// transport error is actually complete. parseEventStream reports success on a
-// clean EOF, so a stream that died mid-answer is otherwise indistinguishable
-// from a finished one.
-//
-// Complete when a stopReason arrived, or when a tool call was delivered. Both
-// match Kiro IDE, whose empty and truncation predicates each require
-// toolCallCount === 0.
-//
-// Truncated when content arrived without any terminal signal.
-//
-// Reasoning-only with no answer is STRICTER THAN THE IDE, deliberately. The
-// IDE's truncation predicate ends in (contentChars > 0 || !reasoningSeen), so
-// reasoning with no answer and no stopReason is treated as complete there and
-// is never retried. That is the exact shape of the production symptom this
-// proxy exists to fix: thinking streams in full, then the turn dies before the
-// answer or the tool call. Handing a client reasoning with no answer as a
-// successful turn is what made the failure invisible, so it is classified as
-// truncated here.
-func classifyStreamIntegrity(contentChars, toolCallCount int, stopReason string, sawReasoning bool) error {
-	if strings.TrimSpace(stopReason) != "" {
-		return nil
-	}
-	if toolCallCount > 0 {
-		return nil
-	}
-	if contentChars > 0 || sawReasoning {
-		return errUpstreamTruncatedResponse
-	}
-	// No content, no reasoning, no tools: unreachable through the wired paths
-	// (errEmptyKiroStream fires first, see above). Treated as truncated rather
-	// than complete so a future caller that bypasses that guard still cannot
-	// ship an empty turn as a success.
-	return errUpstreamTruncatedResponse
-}
-
-// isStreamIntegrityError reports whether err is a soft integrity failure.
-// Callers may rotate accounts on these, but must not run them through
-// handleAccountFailure: an upstream blip should not mark an account unhealthy.
-func isStreamIntegrityError(err error) bool {
-	return errors.Is(err, errUpstreamTruncatedResponse)
-}
 
 func isQuotaErrorMessage(msg string) bool {
 	lower := strings.ToLower(msg)
@@ -112,11 +37,9 @@ func isProfileUnavailableErrorMessage(msg string) bool {
 	return strings.Contains(msg, "no available kiro profile")
 }
 
-// isAuthErrorMessage reports whether an upstream error message looks like an
-// authentication failure. The web_search paths (websearch.go / websearch_loop.go)
-// use it to decide whether a failed MCP call should count against the account
-// rather than the request. It is a substring matcher on purpose: these messages
-// are upstream prose, not structured codes.
+// isAuthErrorMessage reports whether upstream prose looks like an authentication
+// failure. Native web-search paths use it for request/account classification;
+// structured request paths still prefer pool.IsAuthFailure.
 func isAuthErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "http 401") ||
@@ -148,13 +71,31 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 	if account == nil {
 		return
 	}
-
 	if !account.Enabled && account.BanStatus == banStatus && account.BanReason == banReason {
 		return
 	}
 
-	if err := config.SetAccountBanStatus(account.ID, banStatus, banReason); err != nil {
+	var (
+		applied bool
+		err     error
+	)
+	if account.DispatchGeneration != 0 {
+		applied, err = config.SetAccountBanStatusIfLifecycle(
+			account.ID,
+			account.DispatchGeneration,
+			banStatus,
+			banReason,
+		)
+	} else {
+		err = config.SetAccountBanStatus(account.ID, banStatus, banReason)
+		applied = err == nil
+	}
+	if err != nil {
 		logger.Warnf("[AccountFailover] Failed to disable %s: %v", account.Email, err)
+		return
+	}
+	if !applied {
+		logger.Warnf("[AccountFailover] Ignored stale disable for account=%s generation=%d", account.ID, account.DispatchGeneration)
 		return
 	}
 
@@ -185,6 +126,17 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	if account == nil || err == nil {
 		return
 	}
+	if isStreamIntegrityError(err) || isKiroTransientTransportFailure(err) {
+		logger.Warnf("[AccountFailover] Transport-scoped Kiro failure not applied to account health account=%s: %v", account.ID, err)
+		return
+	}
+	if account.DispatchGeneration != 0 {
+		h.handleAccountFailureForSelection(pool.AccountSelection{
+			Account:             account.Clone(),
+			LifecycleGeneration: account.DispatchGeneration,
+		}, err)
+		return
+	}
 
 	errMsg := err.Error()
 	switch {
@@ -204,5 +156,100 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
 	default:
 		h.pool.RecordError(account.ID, false)
+	}
+}
+
+// disableAccountForSelection persists a request-derived terminal state only
+// while the selected lifecycle is still current. A late response from lifecycle
+// N must not disable a recreated account N+1 that reuses the same textual ID.
+func (h *Handler) disableAccountForSelection(selection pool.AccountSelection, banStatus, banReason string) bool {
+	applied, err := config.SetAccountBanStatusIfLifecycle(
+		selection.Account.ID,
+		selection.LifecycleGeneration,
+		banStatus,
+		banReason,
+	)
+	if err != nil {
+		logger.Warnf("[AccountFailover] Failed to disable %s: %v", selection.Account.Email, err)
+		return false
+	}
+	if !applied {
+		logger.Warnf("[AccountFailover] Ignored stale disable for account=%s generation=%d", selection.Account.ID, selection.LifecycleGeneration)
+		return false
+	}
+	logger.Warnf("[AccountFailover] Disabled %s: %s", selection.Account.Email, banReason)
+	h.pool.Reload()
+	return true
+}
+
+// disableAccountOverageForSelection refreshes and publishes overage state only
+// for the lifecycle that produced the upstream 402.
+func (h *Handler) disableAccountOverageForSelection(selection pool.AccountSelection) bool {
+	account := &selection.Account
+	snap, fetchErr := FetchOverageStatus(account)
+	if fetchErr != nil {
+		logger.Warnf("[AccountFailover] Failed to refresh overage status for %s: %v", account.Email, fetchErr)
+		return false
+	}
+	applied, persistErr := config.UpdateAccountOverageStatusIfLifecycle(
+		account.ID,
+		selection.LifecycleGeneration,
+		snap.Status,
+		snap.Capability,
+		snap.OverageCap,
+		snap.OverageRate,
+		snap.CurrentOverages,
+		snap.CheckedAt,
+	)
+	if persistErr != nil {
+		logger.Warnf("[AccountFailover] Failed to persist overage snapshot for %s: %v", account.Email, persistErr)
+		return false
+	}
+	if !applied {
+		logger.Warnf("[AccountFailover] Ignored stale overage snapshot for account=%s generation=%d", account.ID, selection.LifecycleGeneration)
+		return false
+	}
+	logger.Warnf("[AccountFailover] Refreshed overage status for %s after upstream overage limit error: %s", account.Email, snap.Status)
+	h.pool.Reload()
+	return true
+}
+
+// handleAccountFailureForSelection fences every request-derived health/ban
+// mutation with the immutable dispatch lease. The legacy ID-only helper remains
+// for admin/background paths that intentionally target the current account.
+func (h *Handler) handleAccountFailureForSelection(selection pool.AccountSelection, err error) {
+	if err == nil {
+		return
+	}
+	if !h.pool.IsSelectionCurrent(selection) {
+		logger.Warnf("[AccountFailover] Ignored stale failure account=%s generation=%d: %v", selection.Account.ID, selection.LifecycleGeneration, err)
+		return
+	}
+	if isStreamIntegrityError(err) || isKiroTransientTransportFailure(err) {
+		// A transient Kiro socket/stream failure is endpoint/transport health, not
+		// credential health. The Kiro transport has already exhausted its bounded
+		// same-account retry budget before this error reaches account failover.
+		logger.Warnf("[AccountFailover] Transport-scoped Kiro failure not applied to account health account=%s generation=%d: %v", selection.Account.ID, selection.LifecycleGeneration, err)
+		return
+	}
+
+	errMsg := err.Error()
+	switch {
+	case isOverageErrorMessage(errMsg):
+		if h.disableAccountOverageForSelection(selection) {
+			// The lifecycle can remain current after an overage refresh; record the
+			// request error only when the same lease still owns runtime state.
+			h.pool.RecordErrorForSelection(selection, false)
+		}
+	case isQuotaErrorMessage(errMsg):
+		h.pool.RecordErrorForSelection(selection, true)
+	case isSuspensionErrorMessage(errMsg):
+		h.disableAccountForSelection(selection, "BANNED", "AWS temporarily suspended - unusual user activity detected")
+	case isProfileUnavailableErrorMessage(errMsg):
+		h.pool.RecordErrorForSelection(selection, false)
+	case pool.IsAuthFailure(err):
+		h.disableAccountForSelection(selection, "BANNED", "Authentication failed - token invalid or expired")
+	default:
+		h.pool.RecordErrorForSelection(selection, false)
 	}
 }

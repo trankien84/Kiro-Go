@@ -12,23 +12,14 @@ package config
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-)
-
-var (
-	ErrAccountNotFound       = errors.New("account not found")
-	ErrDuplicateAccountID    = errors.New("account ID already exists")
-	ErrDuplicateRefreshToken = errors.New("account refresh token already exists")
-	ErrDuplicateAPIKey       = errors.New("account API key already exists")
-	ErrEmptyAPIKey           = errors.New("kiroApiKey is empty")
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -46,10 +37,14 @@ func GenerateMachineId() string {
 // Account represents a Kiro API account with authentication credentials and usage statistics.
 type Account struct {
 	// Basic identification
-	ID       string `json:"id"`                 // Unique account identifier (UUID)
-	Email    string `json:"email,omitempty"`    // User email address
-	UserId   string `json:"userId,omitempty"`   // Kiro user ID
-	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
+	ID string `json:"id"` // Unique account identifier (UUID)
+	// DispatchGeneration is a process-local lifecycle fence copied into request
+	// snapshots. It is never persisted and prevents state keyed by a reused textual
+	// ID from leaking across delete/recreate or source replacement.
+	DispatchGeneration uint64 `json:"-"`
+	Email              string `json:"email,omitempty"`    // User email address
+	UserId             string `json:"userId,omitempty"`   // Kiro user ID
+	Nickname           string `json:"nickname,omitempty"` // Display name for admin panel
 
 	// Custom API (pool-linking) fields. Present only when AuthMethod == "custom_api":
 	// the account is a transparent proxy to ANOTHER Kiro-Go pool rather than a direct
@@ -66,34 +61,21 @@ type Account struct {
 	// originally created this account. It prevents a previously imported token
 	// from being imported again after the provider rotates it.
 	RefreshTokenFingerprint string `json:"refreshTokenFingerprint,omitempty"`
-	// KiroApiKey is a headless Kiro API key (typically ksk_...). When set,
-	// AuthMethod is "api_key" and the key is used directly as the Bearer token
-	// without OAuth refresh. AccessToken is kept in sync for the shared request path.
-	KiroApiKey   string `json:"kiroApiKey,omitempty"`
-	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
-	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), "external_idp" (enterprise SSO, e.g. Azure AD), "api_key" (headless Kiro API key), "bedrock" (native Amazon Bedrock), or "custom_api" (transparent forwarder)
-	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
-	// Region is the AWS *authentication* region: it selects the OIDC refresh
-	// endpoint and the API-key data plane. It is deliberately NOT the Kiro
-	// generation-plane region — Kiro data-plane calls derive their region from
-	// ProfileArn (see kiro_api.go), so an account authenticated in one region can
-	// still be served by a profile in another. Bedrock accounts additionally
-	// reuse this field as their primary Bedrock invoke region (see BedrockRegions).
-	Region     string `json:"region"`
-	StartUrl   string `json:"startUrl,omitempty"`   // AWS SSO start URL
-	ExpiresAt  int64  `json:"expiresAt,omitempty"`  // Token expiration timestamp (Unix seconds); unused for API Key
-	MachineId  string `json:"machineId,omitempty"`  // UUID machine identifier for request tracking
-	ProfileArn string `json:"profileArn,omitempty"` // CodeWhisperer/Kiro profile ARN for generation requests
+	ClientID                string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
+	ClientSecret            string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
+	KiroApiKey              string `json:"kiroApiKey,omitempty"`   // Kiro API key credential (ksk_...); used directly as the upstream bearer token for headless "api_key" auth. Never refreshed.
+	AuthMethod              string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), "external_idp" (enterprise SSO, e.g. Azure AD), or "api_key" (headless Kiro API key)
+	Provider                string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
+	Region                  string `json:"region"`                 // AWS region for OIDC endpoints
+	StartUrl                string `json:"startUrl,omitempty"`     // AWS SSO start URL
+	ExpiresAt               int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
+	MachineId               string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
+	ProfileArn              string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
 
 	// External IdP (enterprise SSO, e.g. Microsoft 365 / Entra ID / Azure AD) refresh material.
 	// When AuthMethod == "external_idp" the credential is an IdP-issued OAuth token refreshed
 	// against TokenEndpoint using ClientID and Scopes (refresh_token grant), NOT the AWS SSO
-	// OIDC endpoint. IssuerURL is the OIDC issuer the endpoints were discovered from and is
-	// what binds TokenEndpoint to a single tenant before the refresh token is sent.
-	// These are deliberately separate from the AWS IdC ClientSecret/Region pair: Region stays
-	// the AWS *authentication* region, while Kiro data-plane routing treats ProfileArn as
-	// authoritative whenever it is available.
+	// OIDC endpoint. IssuerURL is the OIDC issuer the endpoints were discovered from.
 	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // External IdP OAuth2 token endpoint (refresh)
 	IssuerURL     string `json:"issuerUrl,omitempty"`     // External IdP OIDC issuer URL
 	Scopes        string `json:"scopes,omitempty"`        // Space-separated scopes granted by the external IdP
@@ -151,7 +133,7 @@ type Account struct {
 
 	// Account status
 	Enabled   bool   `json:"enabled"`             // Whether account is active in the pool
-	BanStatus string `json:"banStatus,omitempty"` // Ban status: "ACTIVE", "BANNED", "SUSPENDED"
+	BanStatus string `json:"banStatus,omitempty"` // Runtime state: "ACTIVE", "BANNED", "BILLING_BLOCKED", "SUSPENDED", or "DISABLED"
 	BanReason string `json:"banReason,omitempty"` // Reason for ban/suspension
 	BanTime   int64  `json:"banTime,omitempty"`   // Timestamp when ban was detected
 
@@ -182,33 +164,125 @@ type Account struct {
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
 }
 
+// AccountKind is the normalized runtime category for an account credential.
+// Unknown values deliberately fail closed instead of inheriting Kiro OAuth/AWS
+// lifecycle behavior.
+type AccountKind uint8
+
+const (
+	AccountKindUnknown AccountKind = iota
+	AccountKindKiroOAuth
+	AccountKindKiroAPIKey
+	AccountKindCustomRelay
+	AccountKindBedrock
+	AccountKindDirectAnthropic
+)
+
+func (k AccountKind) String() string {
+	switch k {
+	case AccountKindKiroOAuth:
+		return "kiro_oauth"
+	case AccountKindKiroAPIKey:
+		return "kiro_api_key"
+	case AccountKindCustomRelay:
+		return "custom_relay"
+	case AccountKindBedrock:
+		return "bedrock"
+	case AccountKindDirectAnthropic:
+		return "direct_anthropic"
+	default:
+		return "unknown"
+	}
+}
+
+// Kind returns the explicit account kind. New/unknown auth methods never fall
+// through to Kiro token refresh, account-info, or overage APIs.
+func (a *Account) Kind() AccountKind {
+	if a == nil {
+		return AccountKindUnknown
+	}
+	switch strings.ToLower(strings.TrimSpace(a.AuthMethod)) {
+	case "idc", "social", "external_idp":
+		return AccountKindKiroOAuth
+	case "api_key":
+		return AccountKindKiroAPIKey
+	case "custom_api":
+		return AccountKindCustomRelay
+	case "bedrock":
+		return AccountKindBedrock
+	case "anthropic_api":
+		return AccountKindDirectAnthropic
+	default:
+		return AccountKindUnknown
+	}
+}
+
+func (a *Account) HasKnownKind() bool { return a != nil && a.Kind() != AccountKindUnknown }
+
+// UsesKiroRuntime reports whether this credential ultimately uses the Kiro
+// inference runtime. Authentication lifecycle is intentionally separate: Kiro
+// OAuth identities and Kiro API keys share inference capabilities even though
+// only OAuth identities are refreshable.
+func (a *Account) UsesKiroRuntime() bool {
+	if a == nil {
+		return false
+	}
+	switch a.Kind() {
+	case AccountKindKiroOAuth, AccountKindKiroAPIKey:
+		return true
+	default:
+		return false
+	}
+}
+
 // IsApiKeyCredential reports whether the account authenticates with a Kiro API
-// key (ksk_...) rather than an OAuth token. Such accounts use KiroApiKey directly
-// as the upstream bearer token, carry a "tokentype: API_KEY" header, and are never
-// token-refreshed (ExpiresAt stays 0).
-func (a *Account) IsApiKeyCredential() bool {
-	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "api_key")
+// key (ksk_...) rather than an OAuth token.
+func (a *Account) IsApiKeyCredential() bool { return a != nil && a.Kind() == AccountKindKiroAPIKey }
+
+// IsCustomApi reports whether the account is a linked Kiro-Go relay.
+func (a *Account) IsCustomApi() bool { return a != nil && a.Kind() == AccountKindCustomRelay }
+
+// IsBedrock reports whether the account directly uses Amazon Bedrock.
+func (a *Account) IsBedrock() bool { return a != nil && a.Kind() == AccountKindBedrock }
+
+// IsDirectAnthropic reports whether the account is a terminal Anthropic
+// Messages API credential.
+func (a *Account) IsDirectAnthropic() bool { return a != nil && a.Kind() == AccountKindDirectAnthropic }
+
+// IsStaticProviderCredential reports whether the account authenticates with a
+// long-lived provider credential rather than a refreshable Kiro OAuth token.
+func (a *Account) IsStaticProviderCredential() bool {
+	if a == nil {
+		return false
+	}
+	switch a.Kind() {
+	case AccountKindKiroAPIKey, AccountKindCustomRelay, AccountKindBedrock, AccountKindDirectAnthropic:
+		return true
+	default:
+		return false
+	}
 }
 
-// IsCustomApi reports whether the account is a "Custom API" pool-linking account:
-// a transparent proxy to ANOTHER Kiro-Go pool (BaseURL + a key it issued us), not a
-// direct Kiro credential. Such accounts must be excluded from every Kiro/AWS-facing
-// path (token refresh, usage-limit probes, model-list probes, ban classifiers) —
-// their AccessToken mirrors a non-Kiro upstream key, so a Kiro API call would fail
-// and the failure would wrongly auto-ban a healthy account.
-func (a *Account) IsCustomApi() bool {
-	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "custom_api")
+// SupportsKiroTokenRefresh reports whether auth.RefreshToken is valid.
+func (a *Account) SupportsKiroTokenRefresh() bool {
+	return a != nil && a.Kind() == AccountKindKiroOAuth
 }
 
-// IsBedrock reports whether the account is a native Amazon Bedrock account:
-// a static IAM access key + region that calls the Bedrock Runtime invoke endpoints
-// directly (SigV4). Like custom_api, such accounts must be excluded from every
-// Kiro/AWS-SSO-facing path (OAuth token refresh, Kiro usage/model probes, ban
-// classifiers) — they have no Kiro credential to refresh and a Kiro API call on
-// their behalf would fail and wrongly ban a healthy account.
-func (a *Account) IsBedrock() bool {
-	return strings.EqualFold(strings.TrimSpace(a.AuthMethod), "bedrock")
+// SupportsKiroAccountInfo reports whether Kiro/AWS account-info APIs apply.
+func (a *Account) SupportsKiroAccountInfo() bool {
+	if a == nil {
+		return false
+	}
+	switch a.Kind() {
+	case AccountKindKiroOAuth, AccountKindKiroAPIKey:
+		return true
+	default:
+		return false
+	}
 }
+
+// SupportsOverageAPI reports whether AWS Q overage endpoints apply.
+func (a *Account) SupportsOverageAPI() bool { return a != nil && a.SupportsKiroAccountInfo() }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
 // Type can be: "regex" (regexp find/replace within prompt) or
@@ -286,15 +360,19 @@ type Config struct {
 
 	// AgentToolSteering injects extra instructions (a system-prompt addendum
 	// plus a per-turn reminder, see proxy/translator.go's
-	// agentToolExecutionPrompt/agentToolTurnReminder) into every tool-bearing
-	// Claude request, pushing the model to actually invoke tools instead of
-	// just narrating them. Default false: this proxy is sold as a transparent
-	// Claude passthrough for a metered-key resale business, and unconditionally
-	// appending undisclosed instructions to a customer's own system prompt and
-	// user turn breaks that contract. Operators who want steering back (e.g.
-	// for a coding-agent deployment where tool-use reliability matters more
-	// than byte-for-byte passthrough) opt in explicitly.
+	// agentToolExecutionPrompt/agentToolTurnReminder) into tool-bearing Claude
+	// requests. Default false: transparent proxy behavior must not silently
+	// modify a customer's own system prompt/user turn. Operators that prefer
+	// stronger tool-use steering can opt in explicitly.
 	AgentToolSteering bool `json:"agentToolSteering,omitempty"`
+
+	// ResponseLanguagePolicy controls optional Kiro-native language steering.
+	// Values: "preserve" (default/no injection), "match-user", or "fixed".
+	// ResponseLanguage carries the BCP47-like language tag used by fixed mode.
+	// The setting affects only requests translated to Kiro native; transparent
+	// relay and other native provider transports keep the original request.
+	ResponseLanguagePolicy string `json:"responseLanguagePolicy,omitempty"`
+	ResponseLanguage       string `json:"responseLanguage,omitempty"`
 
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
@@ -385,104 +463,129 @@ var (
 )
 
 // Init initializes the configuration system with the specified file path.
-// If the file doesn't exist, a default configuration is created.
+// If the file doesn't exist, a default configuration is created. The loaded
+// image and its path are published together only after any required migration
+// write has made the new image visible.
 func Init(path string) error {
-	cfgPath = path
-	return Load()
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	return loadPathLocked(path)
 }
 
 func Load() error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	return loadPathLocked(cfgPath)
+}
 
-	data, err := os.ReadFile(cfgPath)
+func loadPathLocked(path string) error {
+	if path == "" {
+		return fmt.Errorf("configuration path is empty")
+	}
+	if err := ensureConfigOwnerPrivate(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("secure configuration file: %w", err)
+	}
+	previous := cfg
+	data, err := os.ReadFile(path)
+	needsPersist := false
+	var next *Config
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Create default configuration.
-			// Binds to 0.0.0.0 by default for Docker/container compatibility.
-			cfg = &Config{
-				Password:      "changeme",
-				Port:          8080,
-				Host:          "0.0.0.0",
-				RequireApiKey: false,
-				Accounts:      []Account{},
-			}
-			return saveLocked()
-		}
-		return err
-	}
-
-	var c Config
-	if err := json.Unmarshal(data, &c); err != nil {
-		return err
-	}
-	cfg = &c
-
-	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
-	// promote it into the new structure. The migrated entry inherits the legacy
-	// RequireApiKey state — if the legacy deployment was public (RequireApiKey=false),
-	// we mark the entry disabled so it doesn't accidentally start enforcing auth.
-	// Operators can flip it on later from the admin UI. The legacy field is kept
-	// for backward compatibility when reading older config files.
-	if cfg.ApiKey != "" && len(cfg.ApiKeys) == 0 {
-		cfg.ApiKeys = append(cfg.ApiKeys, ApiKeyEntry{
-			ID:        newUUID(),
-			Name:      "legacy",
-			Key:       cfg.ApiKey,
-			Enabled:   cfg.RequireApiKey,
-			Migrated:  true,
-			CreatedAt: time.Now().Unix(),
-		})
-		if err := saveLocked(); err != nil {
+		if !os.IsNotExist(err) {
 			return err
 		}
-	}
-
-	// Migration: per-account AllowOverage → OverageStatus.
-	// Pre-Overages-switch deployments stored `allowOverage: true` to mean "keep
-	// dispatching when quota is exhausted". The new model reads OverageStatus
-	// from the upstream AWS Q switch instead. To avoid silently disabling
-	// previously-allowed accounts on first launch, treat allowOverage=true as
-	// OverageStatus="ENABLED" (operators can refresh from AWS later). The
-	// legacy field is then cleared so future saves don't re-emit it.
-	overageMigrated := false
-	for i := range cfg.Accounts {
-		if cfg.Accounts[i].LegacyAllowOverage {
-			if cfg.Accounts[i].OverageStatus == "" {
-				cfg.Accounts[i].OverageStatus = "ENABLED"
-			}
-			cfg.Accounts[i].LegacyAllowOverage = false
-			overageMigrated = true
-		}
-	}
-	if overageMigrated {
-		if err := saveLocked(); err != nil {
+		next = &Config{Password: "changeme", Port: 8080, Host: "0.0.0.0", RequireApiKey: false, Accounts: []Account{}}
+		needsPersist = true
+	} else {
+		var decoded Config
+		if err := json.Unmarshal(data, &decoded); err != nil {
 			return err
 		}
+		next = &decoded
+	}
+
+	if next.ApiKey != "" && len(next.ApiKeys) == 0 {
+		next.ApiKeys = append(next.ApiKeys, ApiKeyEntry{ID: newUUID(), Name: "legacy", Key: next.ApiKey, Enabled: next.RequireApiKey, Migrated: true, CreatedAt: time.Now().Unix()})
+		needsPersist = true
+	}
+	for i := range next.Accounts {
+		if next.Accounts[i].Kind() == AccountKindDirectAnthropic && next.Accounts[i].AccessToken != "" {
+			// Legacy admin paths mirrored the static Anthropic x-api-key into the
+			// generic bearer-token field. Preserve an older bearer-only configuration
+			// by promoting it into the provider-specific slot first, then clear the
+			// duplicate bearer representation so all configurations converge to the
+			// direct-Anthropic trust boundary.
+			if strings.TrimSpace(next.Accounts[i].KiroApiKey) == "" {
+				next.Accounts[i].KiroApiKey = strings.TrimSpace(next.Accounts[i].AccessToken)
+			}
+			next.Accounts[i].AccessToken = ""
+			next.Accounts[i].ExpiresAt = 0
+			needsPersist = true
+		}
+	}
+	for i := range next.Accounts {
+		if !next.Accounts[i].LegacyAllowOverage {
+			continue
+		}
+		if next.Accounts[i].OverageStatus == "" {
+			next.Accounts[i].OverageStatus = "ENABLED"
+		}
+		next.Accounts[i].LegacyAllowOverage = false
+		needsPersist = true
+	}
+
+	if needsPersist {
+		serialized, marshalErr := json.MarshalIndent(next, "", "  ")
+		if marshalErr != nil {
+			return marshalErr
+		}
+		published, writeErr := writeConfigBytes(path, serialized, 0600)
+		if !published {
+			return writeErr
+		}
+		cfgPath = path
+		cfg = next
+		if previous != nil {
+			reconcileAccountStatsGenerationsLocked(previous.Accounts, next.Accounts)
+			reconcileAccountLifecycleGenerationsLocked(previous.Accounts, next.Accounts)
+		} else {
+			reconcileAccountStatsGenerationsLocked(nil, next.Accounts)
+			reconcileAccountLifecycleGenerationsLocked(nil, next.Accounts)
+		}
+		return writeErr
+	}
+
+	cfgPath = path
+	cfg = next
+	if previous != nil {
+		reconcileAccountStatsGenerationsLocked(previous.Accounts, next.Accounts)
+		reconcileAccountLifecycleGenerationsLocked(previous.Accounts, next.Accounts)
+	} else {
+		reconcileAccountStatsGenerationsLocked(nil, next.Accounts)
+		reconcileAccountLifecycleGenerationsLocked(nil, next.Accounts)
 	}
 	return nil
 }
 
-// saveLocked persists cfg to disk. Caller MUST already hold cfgLock.
-// This is identical to Save() (which does not take the lock either) but is named
-// distinctly so call sites that already hold cfgLock are explicit about it.
+// saveLocked persists the already-published live image. New mutators should use
+// publishConfigTransactionLocked so pre-publication failures cannot leave memory
+// ahead of disk. Caller MUST hold cfgLock.
 func saveLocked() error {
-	return Save()
+	_, err := persistConfigImageLocked(cfg)
+	return err
 }
 
-// newUUID returns a UUID v4 string. Defined here to avoid pulling extra deps in this file.
-func newUUID() string {
-	return GenerateMachineId()
-}
+func newUUID() string { return GenerateMachineId() }
 
-// Save persists the current configuration to the JSON file.
-// Uses indented formatting for human readability.
+// Save persists the current image while holding cfgLock so a detached snapshot
+// cannot be published after a newer transaction and overwrite it on disk.
 func Save() error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("configuration is not initialized")
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+	_, err := persistConfigImageLocked(cfg)
+	return err
 }
 
 // SetPassword updates the admin password.
@@ -491,23 +594,6 @@ func SetPassword(password string) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.Password = password
-}
-
-// SetPort overrides the HTTP listen port in memory (does not persist). Used by
-// the -port CLI flag / PORT env override so an operator can run on a port other
-// than the configured one without editing config.json.
-func SetPort(port int) {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.Port = port
-}
-
-// SetHost overrides the HTTP bind host in memory (does not persist). Used by the
-// -host CLI flag / HOST env override.
-func SetHost(host string) {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.Host = host
 }
 
 // GetConfigDir returns the directory containing the config JSON file.
@@ -531,7 +617,10 @@ func GetConfigDir() string {
 func Get() *Config {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	return cfg
+	if cfg == nil {
+		return nil
+	}
+	return cfg.Clone()
 }
 
 func GetPassword() string {
@@ -562,7 +651,9 @@ func GetAccounts() []Account {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	accounts := make([]Account, len(cfg.Accounts))
-	copy(accounts, cfg.Accounts)
+	for i := range cfg.Accounts {
+		accounts[i] = cloneAccountWithLifecycleLocked(cfg.Accounts[i])
+	}
 	return accounts
 }
 
@@ -574,7 +665,7 @@ func GetAccountByID(id string) (Account, bool) {
 	defer cfgLock.RUnlock()
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].ID == id {
-			return cfg.Accounts[i], true
+			return cloneAccountWithLifecycleLocked(cfg.Accounts[i]), true
 		}
 	}
 	return Account{}, false
@@ -603,569 +694,133 @@ func GetEnabledAccounts() []Account {
 	var accounts []Account
 	for _, a := range cfg.Accounts {
 		if a.Enabled {
-			accounts = append(accounts, a)
+			accounts = append(accounts, cloneAccountWithLifecycleLocked(a))
 		}
 	}
 	return accounts
 }
 
-// RefreshTokenFingerprint returns a stable, non-reversible identifier for an
-// opaque refresh token. Empty tokens do not receive a fingerprint.
-func RefreshTokenFingerprint(refreshToken string) string {
-	if refreshToken == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(refreshToken))
-	return fmt.Sprintf("%x", sum[:])
-}
-
-// APIKeyFingerprint returns a stable, non-reversible identifier for a Kiro API key.
-func APIKeyFingerprint(apiKey string) string {
-	if apiKey == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(apiKey))
-	return fmt.Sprintf("%x", sum[:])
-}
-
-// normalizedKiroRegion canonicalizes an account region for equality tests. An
-// empty region means "us-east-1" (the default NormalizeAPIKeyAccount applies), so
-// records persisted before the region field existed must compare equal to an
-// explicit us-east-1 rather than forming a second, phantom pool slot.
-func normalizedKiroRegion(region string) string {
-	region = strings.ToLower(strings.TrimSpace(region))
-	if region == "" {
-		return "us-east-1"
-	}
-	return region
-}
-
-// IsAPIKeyAccount reports whether the account authenticates against KIRO with a
-// Kiro API key. Broader than Account.IsApiKeyCredential: it also accepts the
-// "apikey" spelling and treats a bare KiroApiKey with no AuthMethod as an API-key
-// credential, which is what the import path relies on.
-//
-// custom_api and bedrock are excluded FIRST and deliberately. custom_api accounts
-// reuse KiroApiKey to hold the bearer for the upstream Kiro-Go pool they forward
-// to (see the Custom API field block on Account), so the bare-KiroApiKey test
-// above would otherwise classify them as Kiro API-key accounts. That is not
-// cosmetic: AddAccount runs NormalizeAPIKeyAccount on anything this returns true
-// for, which rewrites AuthMethod to "api_key" and would silently convert every
-// newly added custom_api account into a Kiro API-key account, routing it at the
-// Kiro CLI runtime instead of the custom_api forwarder. Bedrock keeps its bearer
-// in BedrockAPIKey and never populates KiroApiKey, but is excluded here too so the
-// invariant "non-Kiro providers are never treated as Kiro credentials" holds by
-// construction rather than by accident.
-func IsAPIKeyAccount(account *Account) bool {
-	if account == nil {
-		return false
-	}
-	if account.IsCustomApi() || account.IsBedrock() {
-		return false
-	}
-	if strings.TrimSpace(account.KiroApiKey) != "" {
-		return true
-	}
-	method := strings.ToLower(strings.TrimSpace(account.AuthMethod))
-	return method == "api_key" || method == "apikey"
-}
-
-// SplitKiroAPIKeyAndRegion parses the convenience form "key|region".
-// The key itself is not restricted to a fixed prefix so future formats remain compatible.
-func SplitKiroAPIKeyAndRegion(raw string) (key, region string, err error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return "", "", ErrEmptyAPIKey
-	}
-	parts := strings.Split(trimmed, "|")
-	if len(parts) > 2 {
-		return "", "", errors.New("multiple pipe separators are not allowed")
-	}
-	key = strings.TrimSpace(parts[0])
-	if key == "" {
-		return "", "", errors.New("key before pipe is empty")
-	}
-	if len(parts) == 2 {
-		region = strings.TrimSpace(parts[1])
-		if region == "" {
-			return "", "", errors.New("region after pipe is empty")
-		}
-		if err := validateKiroRegionHostLabel(region); err != nil {
-			return "", "", err
-		}
-	}
-	return key, region, nil
-}
-
-func validateKiroRegionHostLabel(region string) error {
-	region = strings.TrimSpace(region)
-	if region == "" {
-		return errors.New("region is empty")
-	}
-	for _, r := range region {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
-			continue
-		}
-		return errors.New("region contains host-unsafe characters")
-	}
-	if strings.Contains(region, " ") || strings.ContainsAny(region, "\n\r\t./") {
-		return errors.New("region contains host-unsafe characters")
-	}
-	return nil
-}
-
-// MachineIdFromAPIKey derives the machine id used by Kiro CLI/API-key clients:
-// sha256 hex of "KiroAPIKey/<api_key>".
-func MachineIdFromAPIKey(apiKey string) string {
-	sum := sha256.Sum256([]byte("KiroAPIKey/" + apiKey))
-	return fmt.Sprintf("%x", sum[:])
-}
-
-// NormalizeAPIKeyAccount fills API-key credential defaults in place.
-// It accepts "ksk_xxx|region", sets AuthMethod=api_key, copies the key into
-// AccessToken for the shared Bearer path, clears OAuth-only fields, and
-// derives MachineId when missing.
-func NormalizeAPIKeyAccount(account *Account) error {
-	if account == nil {
-		return errors.New("account is nil")
-	}
-	raw := strings.TrimSpace(account.KiroApiKey)
-	if raw == "" {
-		raw = strings.TrimSpace(account.AccessToken)
-	}
-	key, region, err := SplitKiroAPIKeyAndRegion(raw)
-	if err != nil {
-		return err
-	}
-	account.KiroApiKey = key
-	account.AccessToken = key
-	account.AuthMethod = "api_key"
-	account.RefreshToken = ""
-	account.RefreshTokenFingerprint = ""
-	account.ClientID = ""
-	account.ClientSecret = ""
-	account.TokenEndpoint = ""
-	account.IssuerURL = ""
-	account.Scopes = ""
-	account.ProfileArn = ""
-	account.ExpiresAt = 0
-	if region != "" {
-		if strings.TrimSpace(account.Region) == "" {
-			account.Region = region
-		}
-	}
-	if strings.TrimSpace(account.Region) == "" {
-		account.Region = "us-east-1"
-	}
-	if err := validateKiroRegionHostLabel(account.Region); err != nil {
-		return err
-	}
-	if strings.TrimSpace(account.MachineId) == "" {
-		account.MachineId = MachineIdFromAPIKey(key)
-	}
-	if strings.TrimSpace(account.Provider) == "" {
-		account.Provider = "APIKey"
-	}
-	if strings.TrimSpace(account.Email) == "" {
-		// Stable display label without leaking the full secret.
-		fp := APIKeyFingerprint(key)
-		if len(fp) > 12 {
-			fp = fp[:12]
-		}
-		account.Email = "api-key-" + fp
-	}
-	return nil
-}
-
-// AccountCredentialExists checks both the current refresh token and the
-// original credential fingerprint while holding the configuration read lock.
-func AccountCredentialExists(refreshToken string) bool {
-	if refreshToken == "" {
-		return false
-	}
-	fingerprint := RefreshTokenFingerprint(refreshToken)
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	for _, account := range cfg.Accounts {
-		if account.RefreshToken == refreshToken ||
-			(fingerprint != "" && account.RefreshTokenFingerprint == fingerprint) {
-			return true
-		}
-	}
-	return false
-}
-
-// AccountAPIKeyExists reports whether a Kiro API key is already persisted.
-func AccountAPIKeyExists(apiKey string) bool {
-	apiKey = strings.TrimSpace(apiKey)
-	if apiKey == "" {
-		return false
-	}
-	fingerprint := APIKeyFingerprint(apiKey)
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	for _, account := range cfg.Accounts {
-		existing := strings.TrimSpace(account.KiroApiKey)
-		if existing == "" {
-			continue
-		}
-		if existing == apiKey || APIKeyFingerprint(existing) == fingerprint {
-			return true
-		}
-	}
-	return false
-}
-
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	// API-key accounts carry no refresh token, so they are canonicalized (key
-	// trimmed, AuthMethod/AccessToken synced) instead of fingerprinted. Every other
-	// credential gets a refresh-token fingerprint so a re-import of the same
-	// credential is rejected even after the provider rotated the raw token.
-	if IsAPIKeyAccount(&account) {
-		if err := NormalizeAPIKeyAccount(&account); err != nil {
-			return err
-		}
-	} else if account.RefreshTokenFingerprint == "" {
-		account.RefreshTokenFingerprint = RefreshTokenFingerprint(account.RefreshToken)
-	}
-	// All duplicate checks run under the write lock held above. The import path
-	// pre-checks with AccountIDExists (RLock) and mints a fresh id on collision,
-	// but that check and this append are not atomic; two concurrent imports of the
-	// same pasted id could both pass the pre-check. Re-checking here makes
-	// "add only if absent" the atomic invariant. Credential-less accounts
-	// (bedrock / custom_api) have empty RefreshToken and empty fingerprint, so
-	// they never collide with each other here.
-	for _, existing := range cfg.Accounts {
-		if account.ID != "" && existing.ID == account.ID {
-			return ErrDuplicateAccountID
-		}
-		if account.RefreshToken != "" && existing.RefreshToken == account.RefreshToken {
-			return ErrDuplicateRefreshToken
-		}
-		existingFingerprint := existing.RefreshTokenFingerprint
-		if existingFingerprint == "" {
-			existingFingerprint = RefreshTokenFingerprint(existing.RefreshToken)
-		}
-		if account.RefreshTokenFingerprint != "" &&
-			existingFingerprint == account.RefreshTokenFingerprint {
-			return ErrDuplicateRefreshToken
-		}
-		// Scoped to genuine Kiro API-key accounts on BOTH sides. custom_api accounts
-		// also store a bearer in KiroApiKey (for the upstream pool they forward to),
-		// and the same operator key can legitimately be reused across two different
-		// BaseURLs — an unscoped comparison would reject that as a duplicate. The
-		// custom_api add path does its own (BaseURL, key) pair check instead.
-		//
-		// Scoped to the region as well: one Kiro API key is valid in several regions
-		// and each region is a SEPARATE pool slot with its own quota, so "same key,
-		// new region" is a legitimate add. Only re-importing the same key into the
-		// same region is a duplicate.
-		if IsAPIKeyAccount(&account) && IsAPIKeyAccount(&existing) &&
-			normalizedKiroRegion(existing.Region) == normalizedKiroRegion(account.Region) {
-			existingKey := strings.TrimSpace(existing.KiroApiKey)
-			if existingKey != "" && (existingKey == account.KiroApiKey ||
-				APIKeyFingerprint(existingKey) == APIKeyFingerprint(account.KiroApiKey)) {
-				return ErrDuplicateAPIKey
-			}
-		}
-	}
-	cfg.Accounts = append(cfg.Accounts, account)
-	if err := Save(); err != nil {
-		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-1]
+	account = account.Clone()
+	if err := prepareAccountForAdd(&account); err != nil {
 		return err
 	}
-	return nil
-}
-
-// UpdateAccountCredentials replaces an account record INCLUDING its credential
-// material, and is the deliberate counterpart to UpdateAccount (which preserves
-// it). Use it only where the caller has just proven the incoming credential is
-// live and newer than what the slot holds — the admin "re-upload a re-login"
-// adopt/repair path is the motivating case: an OAuth refresh token expires
-// (~90d for Entra), the slot goes dead but stays in the pool, and re-running the
-// login and re-uploading is the operator's repair. Routing that through
-// UpdateAccount would silently discard the fresh tokens and report success while
-// the slot stayed dead.
-//
-// The refresh-token fingerprint is recomputed from the INCOMING token, not
-// carried over: it identifies the credential now in the slot, and a stale
-// fingerprint would make a later re-import of this same credential compare
-// against a token the account no longer holds.
-func UpdateAccountCredentials(id string, account Account) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID != id {
-			continue
-		}
-		account.ID = a.ID
-		account.RefreshTokenFingerprint = RefreshTokenFingerprint(account.RefreshToken)
-		previous := cfg.Accounts[i]
-		cfg.Accounts[i] = account
-		if err := Save(); err != nil {
-			cfg.Accounts[i] = previous
+	_, err := publishConfigAccountsLocked(func(next *Config) error {
+		if err := rejectDuplicateAccount(next, &account); err != nil {
 			return err
 		}
+		next.Accounts = append(next.Accounts, account.Clone())
 		return nil
-	}
-	return ErrAccountNotFound
+	})
+	return err
 }
 
 func UpdateAccount(id string, account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			// Callers of UpdateAccount use it for administrative/status fields only.
-			// Preserve the authoritative credential state so a stale account
-			// snapshot cannot overwrite a refresh-token rotation that completed
-			// while an upstream status request was in flight. A caller that
-			// intends to replace the credential must say so explicitly via
-			// UpdateAccountCredentials.
-			account.AccessToken = a.AccessToken
-			account.RefreshToken = a.RefreshToken
-			account.RefreshTokenFingerprint = a.RefreshTokenFingerprint
-			account.KiroApiKey = a.KiroApiKey
-			account.ClientID = a.ClientID
-			account.ClientSecret = a.ClientSecret
-			account.AuthMethod = a.AuthMethod
-			account.Provider = a.Provider
-			// Region is force-restored from storage for every OTHER field on this
-			// preserve-list (credentials/endpoints), but Region itself is legitimately
-			// editable — proxy/handler.go's apiUpdateAccount lets a Bedrock account's
-			// region change (fork commits 32db685/dae4aa8). Reverting a caller-supplied
-			// non-empty Region here made that save silently no-op: the handler set
-			// existing.Region to the new value, then this line reverted it to the old
-			// one on the very next line, and clearBedrockModelCache/RegionRoutes had
-			// already flushed — so the account re-probed and re-learned the OLD region
-			// while the API returned 200 and the UI toasted success. Only fall back to
-			// the stored value when the caller left Region blank (an update that never
-			// touched it), so an explicit new region is honored.
-			if account.Region == "" {
-				account.Region = a.Region
-			}
-			account.StartUrl = a.StartUrl
-			account.ExpiresAt = a.ExpiresAt
-			account.ProfileArn = a.ProfileArn
-			account.TokenEndpoint = a.TokenEndpoint
-			account.IssuerURL = a.IssuerURL
-			account.Scopes = a.Scopes
-			if account.RefreshTokenFingerprint == "" {
-				account.RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
-			}
-			previous := cfg.Accounts[i]
-			cfg.Accounts[i] = account
-			if err := Save(); err != nil {
-				cfg.Accounts[i] = previous
-				return err
-			}
-			return nil
-		}
+	account = account.Clone()
+	found, _, err := publishAccountByIDLocked(id, true, func(current *Account) error {
+		preserveAuthoritativeCredentialState(current.Clone(), &account)
+		*current = account.Clone()
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !found {
+		// Preserve the historical UpdateAccount contract: a missing account is a no-op.
+		return nil
 	}
 	return nil
 }
 
-// UpdateAccountOverageStatus persists the cached upstream overage status fields.
-// Called after a successful setUserPreference or getUsageLimits round-trip.
 func UpdateAccountOverageStatus(id, status, capability string, cap, rate, current float64, checkedAt int64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			if status != "" {
-				cfg.Accounts[i].OverageStatus = status
-			}
-			if capability != "" {
-				cfg.Accounts[i].OverageCapability = capability
-			}
-			cfg.Accounts[i].OverageCap = cap
-			cfg.Accounts[i].OverageRate = rate
-			cfg.Accounts[i].CurrentOverages = current
-			if checkedAt > 0 {
-				cfg.Accounts[i].OverageCheckedAt = checkedAt
-			}
-			return Save()
+	_, _, err := publishAccountByIDLocked(id, false, func(account *Account) error {
+		if status != "" {
+			account.OverageStatus = status
 		}
-	}
-	return nil
+		if capability != "" {
+			account.OverageCapability = capability
+		}
+		account.OverageCap = cap
+		account.OverageRate = rate
+		account.CurrentOverages = current
+		if checkedAt > 0 {
+			account.OverageCheckedAt = checkedAt
+		}
+		return nil
+	})
+	return err
 }
 
-// SetAccountEnabled toggles the enabled state of an account and persists the change.
-// Used to disable accounts whose refresh token has been revoked (401 Bad credentials)
-// so subsequent requests skip them automatically.
 func SetAccountEnabled(id string, enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			previous := cfg.Accounts[i]
-			cfg.Accounts[i].Enabled = enabled
-			if !enabled {
-				cfg.Accounts[i].BanStatus = "DISABLED"
-				cfg.Accounts[i].BanTime = time.Now().Unix()
-			}
-			if err := Save(); err != nil {
-				cfg.Accounts[i] = previous
-				return err
-			}
-			return nil
+	_, _, err := publishAccountByIDLocked(id, false, func(account *Account) error {
+		account.Enabled = enabled
+		if !enabled {
+			account.BanStatus = "DISABLED"
+			account.BanTime = time.Now().Unix()
 		}
-	}
-	return nil
+		return nil
+	})
+	return err
 }
 
-// SetAccountBanStatus marks an account as banned/disabled with a reason.
-// Reason is recorded so operators can see why the account was auto-disabled.
 func SetAccountBanStatus(id, status, reason string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			previous := cfg.Accounts[i]
-			cfg.Accounts[i].BanStatus = status
-			cfg.Accounts[i].BanReason = reason
-			cfg.Accounts[i].BanTime = time.Now().Unix()
-			if status == "BANNED" || status == "DISABLED" {
-				cfg.Accounts[i].Enabled = false
-			}
-			if err := Save(); err != nil {
-				cfg.Accounts[i] = previous
-				return err
-			}
-			return nil
+	_, _, err := publishAccountByIDLocked(id, false, func(account *Account) error {
+		account.BanStatus = status
+		account.BanReason = reason
+		account.BanTime = time.Now().Unix()
+		if status == "BANNED" || status == "DISABLED" || status == "BILLING_BLOCKED" {
+			account.Enabled = false
 		}
-	}
-	return nil
+		return nil
+	})
+	return err
 }
 
-// ClearAccountBanStatus marks an account active without replacing any
-// credential fields from a potentially stale caller snapshot.
-func ClearAccountBanStatus(id string) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	for i, account := range cfg.Accounts {
-		if account.ID == id {
-			previous := cfg.Accounts[i]
-			cfg.Accounts[i].BanStatus = "ACTIVE"
-			cfg.Accounts[i].BanReason = ""
-			cfg.Accounts[i].BanTime = 0
-			if err := Save(); err != nil {
-				cfg.Accounts[i] = previous
-				return err
-			}
-			return nil
-		}
-	}
-	return nil
-}
-
-// UpdateAccountProfileArn pins an account's profile ARN and persists it. A
-// missing id is an error (the account may have been deleted concurrently) so
-// callers cannot mistake a no-op for a successful write.
 func UpdateAccountProfileArn(id, profileArn string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			previous := cfg.Accounts[i].ProfileArn
-			cfg.Accounts[i].ProfileArn = profileArn
-			if err := Save(); err != nil {
-				cfg.Accounts[i].ProfileArn = previous
-				return err
-			}
-			return nil
-		}
+	found, _, err := publishAccountByIDLocked(id, false, func(account *Account) error { account.ProfileArn = profileArn; return nil })
+	if !found {
+		return fmt.Errorf("account not found: %s", id)
 	}
-	return fmt.Errorf("account not found: %s", id)
-}
-
-// UpdateAccountRegion persists a re-detected data-plane region for an account.
-// Used by the api_key region auto-detection path (proxy.CallKiroAPIContext, after
-// proxy.reprobeApiKeyRegion's candidate is confirmed on the runtime plane): a ksk_
-// key is bound to the region it was minted in, so when a call is rejected as an
-// invalid bearer token in the stored region the caller probes other regions and
-// persists the one that works here, so future calls target it directly. A missing
-// id is an error so callers cannot mistake a no-op for a successful write; a Save
-// failure rolls the in-memory field back so it cannot drift from the on-disk value.
-//
-// This is an exported, standalone write path (unlike NormalizeAPIKeyAccount, which
-// every account-creation route funnels through), so it re-validates the region as a
-// safe DNS host label itself rather than trusting the caller — a malformed or
-// hostile region string must never reach config, since cliRuntimeURL interpolates
-// Account.Region directly into an outbound https://runtime.%s.kiro.dev/ URL.
-func UpdateAccountRegion(id, region string) error {
-	if err := validateKiroRegionHostLabel(region); err != nil {
-		return fmt.Errorf("invalid region %q: %w", region, err)
-	}
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			previous := cfg.Accounts[i].Region
-			cfg.Accounts[i].Region = region
-			if err := Save(); err != nil {
-				cfg.Accounts[i].Region = previous
-				return err
-			}
-			return nil
-		}
-	}
-	return fmt.Errorf("account not found: %s", id)
+	return err
 }
 
 func DeleteAccount(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			cfg.Accounts = append(cfg.Accounts[:i], cfg.Accounts[i+1:]...)
-			return Save()
+	if cfg == nil {
+		return fmt.Errorf("configuration is not initialized")
+	}
+	index := -1
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			index = i
+			break
 		}
 	}
-	return nil
+	if index < 0 {
+		return nil
+	}
+	_, err := publishConfigAccountsLocked(func(next *Config) error {
+		next.Accounts = append(next.Accounts[:index], next.Accounts[index+1:]...)
+		return nil
+	})
+	return err
 }
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
 	return UpdateAccountCredentialState(id, accessToken, refreshToken, expiresAt, "")
-}
-
-// UpdateAccountCredentialState atomically updates all fields produced by one
-// refresh-token exchange. If persistence fails, the in-memory configuration is
-// restored so a rotated token is never published from a state that cannot
-// survive restart.
-func UpdateAccountCredentialState(
-	id string,
-	accessToken string,
-	refreshToken string,
-	expiresAt int64,
-	profileArn string,
-) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			previous := cfg.Accounts[i]
-			if cfg.Accounts[i].RefreshTokenFingerprint == "" {
-				cfg.Accounts[i].RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
-			}
-			cfg.Accounts[i].AccessToken = accessToken
-			if refreshToken != "" {
-				cfg.Accounts[i].RefreshToken = refreshToken
-			}
-			cfg.Accounts[i].ExpiresAt = expiresAt
-			if profileArn != "" {
-				cfg.Accounts[i].ProfileArn = profileArn
-			}
-			if err := Save(); err != nil {
-				cfg.Accounts[i] = previous
-				return err
-			}
-			return nil
-		}
-	}
-	return ErrAccountNotFound
 }
 
 func GetApiKey() string {
@@ -1183,38 +838,47 @@ func IsApiKeyRequired() bool {
 func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.ApiKey = apiKey
-	cfg.RequireApiKey = requireApiKey
-	if password != "" {
-		cfg.Password = password
-	}
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		next.ApiKey = apiKey
+		next.RequireApiKey = requireApiKey
+		if password != "" {
+			next.Password = password
+		}
+		return nil
+	})
+	return err
 }
 
 func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	if apiKey != nil {
-		cfg.ApiKey = *apiKey
-	}
-	if requireApiKey != nil {
-		cfg.RequireApiKey = *requireApiKey
-	}
-	if password != "" {
-		cfg.Password = password
-	}
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		if apiKey != nil {
+			next.ApiKey = *apiKey
+		}
+		if requireApiKey != nil {
+			next.RequireApiKey = *requireApiKey
+		}
+		if password != "" {
+			next.Password = password
+		}
+		return nil
+	})
+	return err
 }
 
 func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.TotalRequests = totalReq
-	cfg.SuccessRequests = successReq
-	cfg.FailedRequests = failedReq
-	cfg.TotalTokens = totalTokens
-	cfg.TotalCredits = totalCredits
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		next.TotalRequests = totalReq
+		next.SuccessRequests = successReq
+		next.FailedRequests = failedReq
+		next.TotalTokens = totalTokens
+		next.TotalCredits = totalCredits
+		return nil
+	})
+	return err
 }
 
 func GetStats() (int, int, int, int, float64) {
@@ -1226,53 +890,27 @@ func GetStats() (int, int, int, int, float64) {
 func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			cfg.Accounts[i].RequestCount = requestCount
-			cfg.Accounts[i].ErrorCount = errorCount
-			cfg.Accounts[i].TotalTokens = totalTokens
-			cfg.Accounts[i].TotalCredits = totalCredits
-			cfg.Accounts[i].LastUsed = lastUsed
-			return Save()
-		}
-	}
-	return nil
+	// A caller may use this legacy setter to reset cumulative counters. Reconcile
+	// the account stats generation so an in-flight request holding the pre-reset
+	// lease cannot resurrect those counters after the reset is published.
+	_, _, err := publishAccountByIDLocked(id, true, func(account *Account) error {
+		account.RequestCount = requestCount
+		account.ErrorCount = errorCount
+		account.TotalTokens = totalTokens
+		account.TotalCredits = totalCredits
+		account.LastUsed = lastUsed
+		return nil
+	})
+	return err
 }
 
-// UpdateAccountInfo updates an account's subscription and usage information.
-// Called after refreshing account data from Kiro API.
 func UpdateAccountInfo(id string, info AccountInfo) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			if info.Email != "" {
-				cfg.Accounts[i].Email = info.Email
-			}
-			if info.UserId != "" {
-				cfg.Accounts[i].UserId = info.UserId
-			}
-			cfg.Accounts[i].SubscriptionType = info.SubscriptionType
-			cfg.Accounts[i].SubscriptionTitle = info.SubscriptionTitle
-			cfg.Accounts[i].DaysRemaining = info.DaysRemaining
-			cfg.Accounts[i].UsageCurrent = info.UsageCurrent
-			cfg.Accounts[i].UsageLimit = info.UsageLimit
-			cfg.Accounts[i].UsagePercent = info.UsagePercent
-			cfg.Accounts[i].NextResetDate = info.NextResetDate
-			cfg.Accounts[i].LastRefresh = info.LastRefresh
-			cfg.Accounts[i].TrialUsageCurrent = info.TrialUsageCurrent
-			cfg.Accounts[i].TrialUsageLimit = info.TrialUsageLimit
-			cfg.Accounts[i].TrialUsagePercent = info.TrialUsagePercent
-			cfg.Accounts[i].TrialStatus = info.TrialStatus
-			cfg.Accounts[i].TrialExpiresAt = info.TrialExpiresAt
-			return Save()
-		}
-	}
-	return nil
+	_, _, err := publishAccountByIDLocked(id, false, func(account *Account) error { applyAccountInfo(account, info); return nil })
+	return err
 }
 
-// GetFilterClaudeCode returns whether Claude Code system prompt detection is enabled.
-// Also checks the legacy SanitizeClaudeCodePrompt flag for backward compatibility.
 func GetFilterClaudeCode() bool {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1331,18 +969,19 @@ func GetPromptFilterConfig() PromptFilterConfig {
 func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries bool, rules []PromptFilterRule) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.FilterClaudeCode = filterClaudeCode
-	cfg.FilterEnvNoise = filterEnvNoise
-	cfg.FilterStripBoundaries = filterStripBoundaries
-	// Clear legacy flag to avoid double-applying after first save
-	cfg.SanitizeClaudeCodePrompt = false
-	if rules != nil {
-		cfg.PromptFilterRules = rules
-	}
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		next.FilterClaudeCode = filterClaudeCode
+		next.FilterEnvNoise = filterEnvNoise
+		next.FilterStripBoundaries = filterStripBoundaries
+		next.SanitizeClaudeCodePrompt = false
+		if rules != nil {
+			next.PromptFilterRules = append([]PromptFilterRule(nil), rules...)
+		}
+		return nil
+	})
+	return err
 }
 
-// GetPromptFilterRules returns the current prompt filter rules.
 func GetPromptFilterRules() []PromptFilterRule {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1391,13 +1030,15 @@ func GetThinkingConfig() ThinkingConfig {
 func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.ThinkingSuffix = suffix
-	cfg.OpenAIThinkingFormat = openaiFormat
-	cfg.ClaudeThinkingFormat = claudeFormat
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		next.ThinkingSuffix = suffix
+		next.OpenAIThinkingFormat = openaiFormat
+		next.ClaudeThinkingFormat = claudeFormat
+		return nil
+	})
+	return err
 }
 
-// GetPreferredEndpoint 获取首选端点配置
 func GetPreferredEndpoint() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1411,11 +1052,10 @@ func GetPreferredEndpoint() string {
 func UpdatePreferredEndpoint(endpoint string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.PreferredEndpoint = endpoint
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error { next.PreferredEndpoint = endpoint; return nil })
+	return err
 }
 
-// GetEndpointFallback returns whether endpoint fallback is enabled. Defaults to true.
 func GetEndpointFallback() bool {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1429,15 +1069,13 @@ func GetEndpointFallback() bool {
 func UpdateEndpointFallback(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.EndpointFallback = &enabled
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error { value := enabled; next.EndpointFallback = &value; return nil })
+	return err
 }
 
-// DefaultProxyRotateMinutes is the round-robin interval used when a proxy pool is
-// configured without an explicit (or with a non-positive) ProxyRotateMinutes.
+// DefaultProxyRotateMinutes is the round-robin interval used when a proxy pool is configured without an explicit interval.
 const DefaultProxyRotateMinutes = 10
 
-// GetProxyURL 获取出站代理地址
 func GetProxyURL() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1468,13 +1106,15 @@ func GetProxyRotateMinutes() int {
 func UpdateProxySettings(proxyURL string, proxyURLs []string, rotateMinutes int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.ProxyURL = proxyURL
-	cfg.ProxyURLs = proxyURLs
-	cfg.ProxyRotateMinutes = rotateMinutes
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		next.ProxyURL = proxyURL
+		next.ProxyURLs = append([]string(nil), proxyURLs...)
+		next.ProxyRotateMinutes = rotateMinutes
+		return nil
+	})
+	return err
 }
 
-// GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.
 func GetAllowOverUsage() bool {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1510,39 +1150,17 @@ func GetSessionAffinityEnabled() bool {
 func SetSessionAffinityEnabled(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.SessionAffinityEnabled = enabled
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error { next.SessionAffinityEnabled = enabled; return nil })
+	return err
 }
 
-// UpdateAllowOverUsage sets the over-usage setting and persists the change.
 func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.AllowOverUsage = allow
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error { next.AllowOverUsage = allow; return nil })
+	return err
 }
 
-// GetAgentToolSteering returns whether agent tool-execution steering prompts
-// are injected into tool-bearing Claude requests. Defaults to false (see the
-// AgentToolSteering field comment).
-func GetAgentToolSteering() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return false
-	}
-	return cfg.AgentToolSteering
-}
-
-// UpdateAgentToolSteering sets the agent tool-steering flag and persists it.
-func UpdateAgentToolSteering(enabled bool) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.AgentToolSteering = enabled
-	return Save()
-}
-
-// GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".
 func GetLogLevel() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1566,18 +1184,13 @@ func GetPromptCacheMaxRatio() float64 {
 func UpdatePromptCacheMaxRatio(ratio float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.PromptCacheMaxRatio = ratio
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error { next.PromptCacheMaxRatio = ratio; return nil })
+	return err
 }
 
 const defaultPromptCacheMaxEntries = 131072
 const minPromptCacheEntries = 256
 
-// GetPromptCacheMaxEntries returns the prompt-cache LRU bound. Defaults to
-// 131072 when unset (≤ 0); an explicit small value is clamped up to
-// minPromptCacheEntries (256) so a misconfigured tiny value cannot make the
-// cache useless. This is the production safety floor — the tracker constructor
-// trusts its caller (tests may use any capacity).
 func GetPromptCacheMaxEntries() int {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1596,16 +1209,15 @@ func GetPromptCacheMaxEntries() int {
 func UpdatePromptCacheMaxEntries(n int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.PromptCacheMaxEntries = n
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error { next.PromptCacheMaxEntries = n; return nil })
+	return err
 }
 
-// UpdateLogLevel updates the log level setting and persists the change.
 func UpdateLogLevel(level string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.LogLevel = level
-	return Save()
+	_, err := publishConfigFieldsLocked(func(next *Config) error { next.LogLevel = level; return nil })
+	return err
 }
 
 type KiroClientConfig struct {
@@ -1652,4 +1264,21 @@ func defaultSystemVersion() string {
 	default:
 		return "linux#6.6.87"
 	}
+}
+
+const defaultMaxRequestBodyBytes int64 = 64 * 1024 * 1024
+
+// GetMaxRequestBodyBytes returns the maximum accepted body size for public LLM
+// JSON endpoints. A non-positive or invalid environment value falls back to the
+// bounded default rather than disabling the guard accidentally.
+func GetMaxRequestBodyBytes() int64 {
+	raw := strings.TrimSpace(os.Getenv("KIRO_MAX_REQUEST_BODY_BYTES"))
+	if raw == "" {
+		return defaultMaxRequestBodyBytes
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return defaultMaxRequestBodyBytes
+	}
+	return value
 }

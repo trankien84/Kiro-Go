@@ -38,3 +38,6 @@ debug_*.txt
 kiro_sso_auto.py
 test_proofup_next.py
 guaranteed
+
+# Temporary files
+tmp/

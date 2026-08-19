@@ -100,7 +100,7 @@ func TestDiscoveredBedrockModelFor(t *testing.T) {
 	})
 	defer func() {
 		bedrockDiscoveryMu.Lock()
-		delete(bedrockDiscoveryCache, acct)
+		delete(bedrockDiscoveryCache, legacyBedrockLifecycleKey(acct))
 		bedrockDiscoveryMu.Unlock()
 	}()
 
@@ -143,7 +143,7 @@ func TestDiscoveredBedrockModelForNoPrefixShadow(t *testing.T) {
 	setCachedBedrockModels(acct, []string{"anthropic.claude-sonnet-4-5-20250929-v1:0"})
 	defer func() {
 		bedrockDiscoveryMu.Lock()
-		delete(bedrockDiscoveryCache, acct)
+		delete(bedrockDiscoveryCache, legacyBedrockLifecycleKey(acct))
 		bedrockDiscoveryMu.Unlock()
 	}()
 	// "claude-sonnet-4" is a substring of the 4-5 id but a different model core.
@@ -164,7 +164,7 @@ func TestDiscoveredBedrockModelForAmbiguous(t *testing.T) {
 	})
 	defer func() {
 		bedrockDiscoveryMu.Lock()
-		delete(bedrockDiscoveryCache, acct)
+		delete(bedrockDiscoveryCache, legacyBedrockLifecycleKey(acct))
 		bedrockDiscoveryMu.Unlock()
 	}()
 	// "nova-lite" is a substring of both -> ambiguous -> no match (avoid guessing).
@@ -182,7 +182,7 @@ func TestResolveBedrockModelIDUsesDiscovered(t *testing.T) {
 	setCachedBedrockModels(acct.ID, []string{"anthropic.claude-haiku-4-5-20251001-v1:0"})
 	defer func() {
 		bedrockDiscoveryMu.Lock()
-		delete(bedrockDiscoveryCache, acct.ID)
+		delete(bedrockDiscoveryCache, legacyBedrockLifecycleKey(acct.ID))
 		bedrockDiscoveryMu.Unlock()
 	}()
 	// An alias not in the static default map resolves via discovery.
@@ -198,11 +198,11 @@ func TestResolveBedrockModelIDUsesDiscovered(t *testing.T) {
 func TestBedrockDiscoveryCacheExpiry(t *testing.T) {
 	acct := "acct-ttl"
 	bedrockDiscoveryMu.Lock()
-	bedrockDiscoveryCache[acct] = bedrockDiscoveryEntry{models: []string{"x"}, expires: time.Now().Add(-time.Minute)}
+	bedrockDiscoveryCache[legacyBedrockLifecycleKey(acct)] = bedrockDiscoveryEntry{models: []string{"x"}, expires: time.Now().Add(-time.Minute)}
 	bedrockDiscoveryMu.Unlock()
 	defer func() {
 		bedrockDiscoveryMu.Lock()
-		delete(bedrockDiscoveryCache, acct)
+		delete(bedrockDiscoveryCache, legacyBedrockLifecycleKey(acct))
 		bedrockDiscoveryMu.Unlock()
 	}()
 	if _, ok := getCachedBedrockModels(acct); ok {

@@ -12,9 +12,10 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 	"net/http"
 	"strings"
 	"time"
@@ -40,7 +41,7 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 	working.Messages = append([]ClaudeMessage(nil), req.Messages...)
 
 	presentation := make([]map[string]interface{}, 0)
-	var lastAccountID string
+	var lastSelection *pool.AccountSelection
 	var totalCredits float64
 	// Every round (search or terminal) is a REAL upstream call that resends the
 	// growing conversation, so its input-token cost is real and must be billed —
@@ -61,12 +62,12 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 		if ctx.Err() != nil {
 			return
 		}
-		round, account, err := h.callUpstreamForWebSearch(ctx, &working, thinking, fallbackInput, apiKeyID)
+		round, selection, err := h.callUpstreamForWebSearch(ctx, &working, thinking, fallbackInput, apiKeyID)
 		if err != nil {
 			logger.Warnf("[WebSearchLoop] upstream round %d failed: %v", roundIdx, err)
 			accountID := ""
-			if account != nil {
-				accountID = account.ID
+			if selection != nil {
+				accountID = selection.Account.ID
 			}
 			h.recordFailureWithDetails("claude", req.Model, accountID, apiKeyID, err)
 			status := 502
@@ -81,8 +82,9 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 			h.sendClaudeError(w, status, errType, err.Error())
 			return
 		}
-		if account != nil {
-			lastAccountID = account.ID
+		if selection != nil {
+			selectionCopy := *selection
+			lastSelection = &selectionCopy
 		}
 		totalCredits += round.credits
 		// Bug (F5, inherited from upstream): this round's real input-token cost
@@ -99,10 +101,14 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 		// this round's searches fit under max_uses.
 		roundSearchN := countWebSearchToolUses(round.toolUses)
 		if shouldSearchRound(roundIdx, round.toolUses, maxUses) && searchCount+roundSearchN <= maxUses {
-			searched, searchErr := h.searchAllWebUses(req.Model, round.toolUses, apiKeyID)
+			searched, searchErr := h.searchAllWebUses(ctx, req.Model, round.toolUses, apiKeyID)
 			if searchErr != nil {
 				logger.Warnf("[WebSearchLoop] MCP search failed: %v", searchErr)
-				h.recordFailureWithDetails("claude", req.Model, lastAccountID, apiKeyID, searchErr)
+				accountID := ""
+				if lastSelection != nil {
+					accountID = lastSelection.Account.ID
+				}
+				h.recordFailureWithDetails("claude", req.Model, accountID, apiKeyID, searchErr)
 				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+searchErr.Error())
 				return
 			}
@@ -123,10 +129,14 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 				logger.Warnf("[WebSearchLoop] max_uses=%d reached; skipping further web_search", maxUses)
 				break
 			}
-			results, _, _, sErr := h.performWebSearch(req.Model, toolUseQuery(tu.Input), apiKeyID)
+			results, _, _, sErr := h.performWebSearchContext(ctx, req.Model, toolUseQuery(tu.Input), apiKeyID)
 			if sErr != nil {
 				logger.Warnf("[WebSearchLoop] final-round MCP search failed: %v", sErr)
-				h.recordFailureWithDetails("claude", req.Model, lastAccountID, apiKeyID, sErr)
+				accountID := ""
+				if lastSelection != nil {
+					accountID = lastSelection.Account.ID
+				}
+				h.recordFailureWithDetails("claude", req.Model, accountID, apiKeyID, sErr)
 				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+sErr.Error())
 				return
 			}
@@ -141,9 +151,11 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 		// the running sum across every round, not just this round's figure.
 		inputTokens := totalInputTokens
 
-		if lastAccountID != "" {
-			h.pool.RecordSuccess(lastAccountID)
-			h.pool.UpdateStats(lastAccountID, inputTokens+outputTokens, totalCredits)
+		lastAccountID := ""
+		if lastSelection != nil {
+			lastAccountID = lastSelection.Account.ID
+			h.pool.RecordSuccessForSelection(*lastSelection)
+			h.pool.UpdateStatsForSelection(*lastSelection, inputTokens+outputTokens, totalCredits)
 		}
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, totalCredits)
 		h.recordSuccessLog("claude", req.Model, lastAccountID, apiKeyID, inputTokens+outputTokens, totalCredits, time.Since(reqStart).Milliseconds())
@@ -168,30 +180,34 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 // prompt-cache hit rate this fork otherwise optimizes hard for. Affinity is
 // sticky routing only (falls through to normal selection when unavailable),
 // not a tenancy boundary, so this is a cache-hit-rate fix, not a security one.
-func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeRequest, thinking bool, estimatedInputTokens int, apiKeyID string) (*webSearchRoundOutcome, *config.Account, error) {
+func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeRequest, thinking bool, estimatedInputTokens int, apiKeyID string) (*webSearchRoundOutcome, *pool.AccountSelection, error) {
 	payload := ClaudeToKiro(req, thinking)
 	excluded := make(map[string]bool)
 	var lastErr error
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(req.Model, excluded, apiKeyID)
-		if account == nil {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		selection := h.pool.GetNextSelectionForModelWithApiKey(req.Model, excluded, apiKeyID)
+		if selection == nil {
 			break
 		}
-		// This loop calls CallKiroAPIContext directly — the raw Kiro native-stream
-		// path, with no Bedrock/custom_api branch (unlike handleClaudeStream). Those
-		// account types would be sent a Kiro-shaped request they can't serve, 403,
-		// and risk auto-ban via handleAccountFailure. Skip them without spending a
-		// real retry (CLAUDE.md: every Kiro-facing loop needs this guard).
-		if account.IsBedrock() || account.IsCustomApi() {
+		account := &selection.Account
+		// This loop talks to the Kiro runtime directly. Terminal providers must not
+		// receive a Kiro-shaped payload or be penalized for being ineligible.
+		if !account.UsesKiroRuntime() {
 			excluded[account.ID] = true
 			attempt--
 			continue
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenForSelection(selection); err != nil {
 			lastErr = err
+			if errors.Is(err, errStaleAccountSelection) {
+				continue
+			}
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleTokenValidationFailureForSelection(selection, err)
 			continue
 		}
 
@@ -222,7 +238,12 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(req.Model)) / 100.0)
 				if pct >= 100.0 {
-					stopOverride = "model_context_window_exceeded"
+					stopOverride = "context_window_exceeded"
+				}
+			},
+			OnStopReason: func(reason string) {
+				if strings.TrimSpace(reason) != "" {
+					stopOverride = reason
 				}
 			},
 			OnError: func(err error) {
@@ -230,16 +251,28 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 					lastErr = err
 				}
 			},
+			CanRetry: func() bool { return true },
+			ResetForRetry: func() {
+				text = ""
+				toolUses = nil
+				inputTokens = 0
+				credits = 0
+				realInputTokens = 0
+				stopOverride = ""
+			},
 		}
 
 		err := CallKiroAPIContext(ctx, account, payload, callback)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, account, ctx.Err()
+				return nil, selection, ctx.Err()
 			}
 			lastErr = err
+			if !h.pool.IsSelectionCurrent(*selection) {
+				continue
+			}
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailureForSelection(*selection, err)
 			continue
 		}
 
@@ -249,17 +282,18 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 			inputTokens = estimatedInputTokens
 		}
 
+		selectionCopy := *selection
 		return &webSearchRoundOutcome{
 			text:               text,
 			toolUses:           toolUses,
 			inputTokens:        inputTokens,
 			credits:            credits,
 			stopReasonOverride: stopOverride,
-		}, account, nil
+		}, &selectionCopy, nil
 	}
 
 	if lastErr == nil {
-		lastErr = fmt.Errorf("no available accounts")
+		lastErr = fmt.Errorf("no available Kiro accounts")
 	}
 	return nil, nil, lastErr
 }
@@ -293,10 +327,10 @@ func countWebSearchToolUses(toolUses []KiroToolUse) int {
 
 // searchAllWebUses runs MCP for each tool_use in order (all are web_search).
 // apiKeyID passes through to performWebSearch's session-affinity selector (F5).
-func (h *Handler) searchAllWebUses(model string, toolUses []KiroToolUse, apiKeyID string) ([]*WebSearchResults, error) {
+func (h *Handler) searchAllWebUses(ctx context.Context, model string, toolUses []KiroToolUse, apiKeyID string) ([]*WebSearchResults, error) {
 	out := make([]*WebSearchResults, 0, len(toolUses))
 	for _, tu := range toolUses {
-		results, _, _, err := h.performWebSearch(model, toolUseQuery(tu.Input), apiKeyID)
+		results, _, _, err := h.performWebSearchContext(ctx, model, toolUseQuery(tu.Input), apiKeyID)
 		if err != nil {
 			return nil, err
 		}
@@ -429,7 +463,7 @@ func buildFlushContent(
 // web_search-only rounds end as end_turn; client tool_use yields tool_use.
 func resolveFlushStopReason(override string, toolUses []KiroToolUse, content []map[string]interface{}) string {
 	if override != "" {
-		return override
+		return resolveClaudeHandlerStopReason(override, len(toolUses))
 	}
 	for _, c := range content {
 		if c["type"] == "tool_use" {

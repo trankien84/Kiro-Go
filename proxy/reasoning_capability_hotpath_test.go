@@ -36,6 +36,7 @@ func TestReasoningCapabilityForModelDoesNotRefreshInline(t *testing.T) {
 	// pass even with the inline refresh restored.
 	if err := config.AddAccount(config.Account{
 		ID:          "acct-hotpath",
+		AuthMethod:  "social",
 		Enabled:     true,
 		AccessToken: "token-x",
 		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/TEST",
@@ -56,14 +57,14 @@ func TestReasoningCapabilityForModelDoesNotRefreshInline(t *testing.T) {
 			return nil, errTest("network disabled in test")
 		}),
 	})
-	t.Cleanup(func() {
-		close(release)
-		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
-	})
-
 	p := accountpool.GetPool()
 	p.Reload()
 	h := &Handler{pool: p}
+	t.Cleanup(func() {
+		close(release)
+		waitForWarmToFinish(t, h)
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
 
 	// Empty cachedModels = the cold-cache path under test.
 	done := make(chan ModelReasoningCapability, 1)
@@ -95,6 +96,7 @@ func TestWarmModelsCacheAsyncSingleFlights(t *testing.T) {
 	}
 	if err := config.AddAccount(config.Account{
 		ID:          "acct-singleflight",
+		AuthMethod:  "social",
 		Enabled:     true,
 		AccessToken: "token-x",
 		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/TEST",
@@ -114,14 +116,14 @@ func TestWarmModelsCacheAsyncSingleFlights(t *testing.T) {
 			return nil, errTest("network disabled in test")
 		}),
 	})
-	t.Cleanup(func() {
-		close(release)
-		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
-	})
-
 	p := accountpool.GetPool()
 	p.Reload()
 	h := &Handler{pool: p}
+	t.Cleanup(func() {
+		close(release)
+		waitForWarmToFinish(t, h)
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+	})
 
 	for i := 0; i < 8; i++ {
 		h.warmModelsCacheAsync()
@@ -170,6 +172,7 @@ func TestWarmModelsCacheAsyncIsRateLimited(t *testing.T) {
 	}
 	if err := config.AddAccount(config.Account{
 		ID:          "acct-ratelimit",
+		AuthMethod:  "social",
 		Enabled:     true,
 		AccessToken: "token-x",
 		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/TEST",

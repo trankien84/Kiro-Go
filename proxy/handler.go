@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,21 +31,22 @@ const (
 	microsoftCanceledSessionTTL           = 10 * time.Minute
 	microsoftMaxCanceledSessionTombstones = 128
 	microsoftProfileDiscoveryTimeout      = 30 * time.Second
+	minWarmModelsCacheInterval            = 30 * time.Second
 )
 
-// looksLikeKiroAPIKey is a lightweight heuristic for plain-text imports.
-// Official keys currently use the ksk_ prefix; future formats can still be
-// imported via explicit authMethod/kiroApiKey fields.
-func looksLikeKiroAPIKey(value string) bool {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return false
+var errStaleAccountSelection = errors.New("selected account lifecycle changed during request")
+
+func promptCacheAccountKey(account *config.Account) string {
+	if account == nil {
+		return ""
 	}
-	// Convenience form: ksk_xxx|region
-	if idx := strings.IndexByte(value, '|'); idx > 0 {
-		value = strings.TrimSpace(value[:idx])
+	generation := account.DispatchGeneration
+	if generation == 0 {
+		generation, _ = config.GetAccountLifecycleGeneration(account.ID)
 	}
-	return strings.HasPrefix(value, "ksk_")
+	// Length-prefix the exact textual ID so leading/trailing whitespace remains
+	// significant and no delimiter choice can collapse two configured identities.
+	return fmt.Sprintf("%d:%s:%d", len(account.ID), account.ID, generation)
 }
 
 // RequestLog stores details about a single API request (success or failure).
@@ -78,28 +80,37 @@ type Handler struct {
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
 	// 模型缓存
-	cachedModels    []ModelInfo
-	modelsCacheMu   sync.RWMutex
-	modelsCacheTime int64
-	// modelsWarming single-flights the background cache warm kicked off by
-	// reasoningCapabilityForModel. A burst of cold requests must trigger exactly
-	// one refresh, not one per request — refreshModelsCache fans out a live
-	// ListAvailableModels call per enabled account.
-	modelsWarming int32
-	// lastWarmAttemptNanos is the unix-nanos timestamp of the last warm attempt
-	// (successful or not), used to rate-limit warmModelsCacheAsync. Single-flight
-	// alone is not enough: refreshModelsCache only writes cachedModels when it
-	// gets at least one model back (handler.go's "if len(aggregated) > 0" guard),
-	// so a total outage (every Kiro account failing) leaves the cache empty
-	// forever — the very next request re-arms the CAS instantly and reruns the
-	// full account fan-out, hammering already-failing accounts into
-	// handleAccountFailure on every request and accelerating auto-ban. A pool
-	// with zero Kiro-capable accounts hits this on literally every request
-	// forever.
+	cachedModels         []ModelInfo
+	modelsCacheMu        sync.RWMutex
+	modelsCacheTime      int64
+	modelsWarming        int32
 	lastWarmAttemptNanos int64
-	promptCache          *promptCacheTracker
-	tokenRefreshMu       sync.Mutex
-	credentialImportMu   sync.Mutex
+
+	// Provider runtime state is kept separately from Kiro's legacy string-based
+	// account failure classifier. It owns per-account model snapshots, dynamic
+	// cooldowns, and model-scoped permission denials for terminal providers.
+	providerStateMu           sync.RWMutex
+	providerRebuildMu         sync.Mutex
+	providerRegistry          atomic.Pointer[providerRegistrySnapshot]
+	providerRegistryVersion   atomic.Uint64
+	providerExpiryMu          sync.Mutex
+	providerExpiryAt          time.Time
+	providerExpiryWake        chan struct{}
+	providerExpiryStop        chan struct{}
+	accountModelSnapshots     map[accountLifecycleKey]accountModelSnapshot
+	providerCooldownUntil     map[accountLifecycleKey]time.Time
+	providerModelDeniedUntil  map[accountLifecycleKey]map[string]time.Time
+	providerSourceGenerations map[accountLifecycleKey]uint64
+
+	backgroundWG      sync.WaitGroup
+	backgroundStartMu sync.Mutex
+	closeOnce         sync.Once
+	closed            atomic.Bool
+	shutdownDone      chan struct{}
+
+	promptCache        *promptCacheTracker
+	tokenRefreshMu     sync.Mutex
+	credentialImportMu sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
@@ -111,9 +122,7 @@ type Handler struct {
 	// timer (round-robin). Inert when no pool is configured.
 	proxyRotator *proxyRotator
 
-	// Microsoft Enterprise SSO login state: an interactive login parks the
-	// discovered profile list here between the browser callback and the user's
-	// profile pick, so the flow survives the round trip without a global.
+	// Microsoft Enterprise SSO state is Handler-owned and canceled/scrubbed on shutdown.
 	microsoftSelections   map[string]*microsoftProfileSelection
 	microsoftSelectionsMu sync.Mutex
 	microsoftFlowMu       sync.Mutex
@@ -161,42 +170,7 @@ func allowTagSource(source *thinkingStreamSource) bool {
 	return *source == thinkingSourceTagBlock
 }
 
-func validateClaudeRequestShape(req *ClaudeRequest) string {
-	if len(req.Messages) == 0 {
-		return "messages must not be empty"
-	}
-	if msg := validateClaudeThinkingConfig(req.Thinking, req.MaxTokens); msg != "" {
-		return msg
-	}
-
-	hasUserContext := false
-	lastRole := ""
-	for _, msg := range req.Messages {
-		role := strings.TrimSpace(msg.Role)
-		if role == "" {
-			continue
-		}
-		lastRole = role
-		if role != "user" {
-			continue
-		}
-
-		text, images, toolResults := extractClaudeUserContent(msg.Content)
-		if normalizeUserContent(text, len(images) > 0) != "" || len(toolResults) > 0 {
-			hasUserContext = true
-		}
-	}
-
-	if lastRole == "assistant" {
-		return "assistant-prefill final message is not supported; last message must be user"
-	}
-	if !hasUserContext {
-		return "at least one non-empty user message is required"
-	}
-	return ""
-}
-
-func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int) string {
+func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, _ int) string {
 	if thinking == nil {
 		return ""
 	}
@@ -204,25 +178,15 @@ func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int)
 	kind := strings.ToLower(strings.TrimSpace(thinking.Type))
 	switch kind {
 	case "enabled":
-		if maxTokens == 0 {
-			return "thinking.type enabled cannot be used with max_tokens=0"
+		// Model-specific budget semantics are validated by Kiro. Claude Code and
+		// older compatible clients may still send enabled+budget_tokens, while
+		// adaptive-only models need that legacy shape mapped without the budget.
+		if thinking.BudgetTokens < 0 {
+			return "thinking.budget_tokens must not be negative"
 		}
-		if thinking.BudgetTokens <= 0 {
-			return "thinking.budget_tokens is required when thinking.type is enabled"
-		}
-		if thinking.BudgetTokens < 1024 {
-			return "thinking.budget_tokens must be at least 1024"
-		}
-		if maxTokens > 0 && thinking.BudgetTokens >= maxTokens {
-			return "thinking.budget_tokens must be less than max_tokens"
-		}
-	case "adaptive":
+	case "adaptive", "disabled":
 		if thinking.BudgetTokens != 0 {
-			return "thinking.budget_tokens is not supported when thinking.type is adaptive"
-		}
-	case "disabled":
-		if thinking.BudgetTokens != 0 {
-			return "thinking.budget_tokens is not supported when thinking.type is disabled"
+			return "thinking.budget_tokens is only supported when thinking.type is enabled"
 		}
 	default:
 		return "thinking.type must be one of: enabled, adaptive, disabled"
@@ -239,21 +203,117 @@ func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int)
 	return ""
 }
 
+// validateClaudeThinkingForCapability applies manual-budget rules only when
+// the selected model directly supports thinking.type=enabled. Claude Code may
+// send the legacy enabled shape even when the effective model is adaptive-only;
+// that case is normalized to adaptive later and must not be rejected here.
+func validateClaudeThinkingForCapability(
+	thinking *ClaudeThinkingConfig,
+	maxTokens int,
+	hasTools bool,
+	interleavedThinking bool,
+	capability ModelReasoningCapability,
+) string {
+	if thinking == nil ||
+		!strings.EqualFold(strings.TrimSpace(thinking.Type), "enabled") {
+		return ""
+	}
+
+	_, supportsEnabled := matchThinkingType("enabled", capability.ThinkingTypes)
+	_, supportsAdaptive := matchThinkingType("adaptive", capability.ThinkingTypes)
+
+	if capability.SupportsThinking && !supportsEnabled && supportsAdaptive {
+		// Compatibility mapping: enabled -> adaptive; budget_tokens is omitted.
+		return ""
+	}
+
+	// Unknown capability and models that directly support enabled retain the
+	// manual-thinking contract.
+	if thinking.BudgetTokens <= 0 {
+		return "thinking.budget_tokens is required when thinking.type is enabled for this model"
+	}
+	if thinking.BudgetTokens < 1024 {
+		return "thinking.budget_tokens must be at least 1024"
+	}
+	if maxTokens == 0 {
+		return "thinking.type enabled cannot be used with max_tokens=0"
+	}
+	// budget_tokens may exceed max_tokens only when interleaved thinking is
+	// actually active. Merely attaching tools is insufficient: manual-thinking
+	// models require the interleaved-thinking beta and Haiku does not support it.
+	if maxTokens > 0 && thinking.BudgetTokens >= maxTokens &&
+		!(hasTools && interleavedThinking) {
+		return "thinking.budget_tokens must be less than max_tokens"
+	}
+	return ""
+}
+
+func claudeManualInterleavedThinkingEnabledForBetas(
+	betas claudeBetaSet,
+	_ string,
+	thinking *ClaudeThinkingConfig,
+	capability ModelReasoningCapability,
+) bool {
+	if thinking == nil ||
+		!strings.EqualFold(strings.TrimSpace(thinking.Type), "enabled") {
+		return false
+	}
+	if !capability.SupportsInterleavedThinking {
+		return false
+	}
+	_, supportsEnabled := matchThinkingType("enabled", capability.ThinkingTypes)
+	if capability.SupportsThinking && !supportsEnabled {
+		return false
+	}
+	return betas.Contains("interleaved-thinking-2025-05-14")
+}
+
+func claudeManualInterleavedThinkingEnabled(
+	r *http.Request,
+	model string,
+	thinking *ClaudeThinkingConfig,
+	capability ModelReasoningCapability,
+) bool {
+	if r == nil {
+		return false
+	}
+	betas := newClaudeBetaSet()
+	betas.AddValues(r.Header.Values("Anthropic-Beta"))
+	return claudeManualInterleavedThinkingEnabledForBetas(
+		betas,
+		model,
+		thinking,
+		capability,
+	)
+}
+
 type claudeThinkingResponseOptions struct {
 	Format      string
 	OmitDisplay bool
 }
 
-func resolveClaudeThinkingResponseOptions(thinking *ClaudeThinkingConfig, defaultFormat string) claudeThinkingResponseOptions {
+func resolveClaudeThinkingResponseOptions(
+	thinking *ClaudeThinkingConfig,
+	defaultFormat string,
+	model string,
+	capability ModelReasoningCapability,
+) claudeThinkingResponseOptions {
 	opts := claudeThinkingResponseOptions{Format: defaultFormat}
 	if opts.Format == "" {
 		opts.Format = "thinking"
 	}
-	if thinking == nil {
-		return opts
+
+	display := ""
+	if thinking != nil {
+		display = strings.ToLower(strings.TrimSpace(thinking.Display))
+	}
+	if display == "" {
+		if claudeDefaultThinkingDisplay(model, capability) != "omitted" {
+			return opts
+		}
+		display = "omitted"
 	}
 
-	display := strings.ToLower(strings.TrimSpace(thinking.Display))
 	switch display {
 	case "summarized":
 		opts.Format = "thinking"
@@ -307,20 +367,27 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 func NewHandler() *Handler {
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
-		pool:                 pool.GetPool(),
-		totalRequests:        int64(totalReq),
-		successRequests:      int64(successReq),
-		failedRequests:       int64(failedReq),
-		totalTokens:          int64(totalTokens),
-		totalCredits:         totalCredits,
-		startTime:            time.Now().Unix(),
-		stopRefresh:          make(chan struct{}),
-		stopStatsSaver:       make(chan struct{}),
-		promptCache:          newPromptCacheTracker(defaultPromptCacheTTL),
-		customApiLedger:      newCustomApiCreditLedger(),
-		microsoftSelections:  make(map[string]*microsoftProfileSelection),
-		microsoftCanceled:    make(map[string]time.Time),
-		microsoftDiscoveries: make(map[string]*microsoftProfileDiscovery),
+		pool:                      pool.GetPool(),
+		totalRequests:             int64(totalReq),
+		successRequests:           int64(successReq),
+		failedRequests:            int64(failedReq),
+		totalTokens:               int64(totalTokens),
+		totalCredits:              totalCredits,
+		startTime:                 time.Now().Unix(),
+		stopRefresh:               make(chan struct{}),
+		stopStatsSaver:            make(chan struct{}),
+		promptCache:               newPromptCacheTracker(defaultPromptCacheTTL),
+		customApiLedger:           newCustomApiCreditLedger(),
+		accountModelSnapshots:     make(map[accountLifecycleKey]accountModelSnapshot),
+		providerCooldownUntil:     make(map[accountLifecycleKey]time.Time),
+		providerModelDeniedUntil:  make(map[accountLifecycleKey]map[string]time.Time),
+		providerSourceGenerations: make(map[accountLifecycleKey]uint64),
+		providerExpiryWake:        make(chan struct{}, 1),
+		providerExpiryStop:        make(chan struct{}),
+		shutdownDone:              make(chan struct{}),
+		microsoftSelections:       make(map[string]*microsoftProfileSelection),
+		microsoftCanceled:         make(map[string]time.Time),
+		microsoftDiscoveries:      make(map[string]*microsoftProfileDiscovery),
 	}
 	// 启动时应用代理配置
 	// Outbound proxy: a rotator applies the global proxy, cycling a pool when one is
@@ -331,15 +398,139 @@ func NewHandler() *Handler {
 	cachePath := filepath.Join(config.GetConfigDir(), "prompt_cache.json")
 	h.promptCache.Load(cachePath)
 	h.promptCache.startSaveLoop(cachePath, 30*time.Second)
-	// 启动后台刷新
-	go h.backgroundRefresh()
-	// 启动后台统计保存 (每30秒保存一次)
-	go h.backgroundStatsSaver()
-	// 清理过期的 stored responses（>30 天）
-	go purgeExpiredResponses(responsesDefaultTTL)
-	// Opt-in auto-ingest watcher (KIRO_IMPORT_WATCH); no-op when disabled.
+	// Start every handler-owned background task under one lifecycle group.
+	h.backgroundWG.Add(1)
+	go func() {
+		defer h.backgroundWG.Done()
+		h.runProviderExpiryLoop()
+	}()
+	h.backgroundWG.Add(1)
+	go func() {
+		defer h.backgroundWG.Done()
+		h.backgroundRefresh()
+	}()
+	h.backgroundWG.Add(1)
+	go func() {
+		defer h.backgroundWG.Done()
+		h.backgroundStatsSaver()
+	}()
+	h.backgroundWG.Add(1)
+	go func() {
+		defer h.backgroundWG.Done()
+		purgeExpiredResponses(responsesDefaultTTL)
+	}()
+	// Phase 2 made the import watcher lifecycle-aware; start it only after the
+	// Handler lifecycle group is fully initialized.
 	h.startImportWatcher()
 	return h
+}
+
+func (h *Handler) cancelMicrosoftFlowsForShutdown() {
+	if h == nil {
+		return
+	}
+	var discoveries []*microsoftProfileDiscovery
+	h.microsoftFlowMu.Lock()
+	for sessionID, discovery := range h.microsoftDiscoveries {
+		if discovery != nil {
+			discoveries = append(discoveries, discovery)
+		}
+		delete(h.microsoftDiscoveries, sessionID)
+	}
+	h.microsoftFlowMu.Unlock()
+	for _, discovery := range discoveries {
+		discovery.cancel()
+	}
+
+	var selections []*microsoftProfileSelection
+	h.microsoftSelectionsMu.Lock()
+	for selectionID, selection := range h.microsoftSelections {
+		delete(h.microsoftSelections, selectionID)
+		if selection == nil {
+			continue
+		}
+		selection.canceled.Store(true)
+		if selection.timer != nil {
+			selection.timer.Stop()
+			selection.timer = nil
+		}
+		selections = append(selections, selection)
+	}
+	h.microsoftSelectionsMu.Unlock()
+	discardDetachedMicrosoftProfileSelections(selections)
+}
+
+func (h *Handler) startBackgroundTask(fn func()) bool {
+	if h == nil || fn == nil {
+		return false
+	}
+	h.backgroundStartMu.Lock()
+	defer h.backgroundStartMu.Unlock()
+	if h.closed.Load() {
+		return false
+	}
+	h.backgroundWG.Add(1)
+	go func() {
+		defer h.backgroundWG.Done()
+		fn()
+	}()
+	return true
+}
+
+// Shutdown stops handler-owned background work. Process-global resources such as
+// AccountPool are closed by the application root after the HTTP server drains.
+// Shutdown initiation is idempotent, while each caller may wait with its own
+// deadline and retry later if an earlier deadline expires.
+func (h *Handler) Shutdown(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.closeOnce.Do(func() {
+		h.backgroundStartMu.Lock()
+		h.closed.Store(true)
+		h.backgroundStartMu.Unlock()
+		h.cancelMicrosoftFlowsForShutdown()
+		if h.shutdownDone == nil {
+			h.shutdownDone = make(chan struct{})
+		}
+		if h.stopRefresh != nil {
+			close(h.stopRefresh)
+		}
+		if h.stopStatsSaver != nil {
+			close(h.stopStatsSaver)
+		}
+		if h.providerExpiryStop != nil {
+			close(h.providerExpiryStop)
+		}
+		if h.promptCache != nil {
+			h.promptCache.Stop()
+		}
+		if h.proxyRotator != nil {
+			h.proxyRotator.stopRotation()
+		}
+
+		done := h.shutdownDone
+		go func() {
+			h.backgroundWG.Wait()
+			close(done)
+		}()
+	})
+
+	select {
+	case <-h.shutdownDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Close is retained for compatibility with tests and embedders that do not need
+// a deadline. It never closes the process-global account pool.
+func (h *Handler) Close() {
+	_ = h.Shutdown(context.Background())
 }
 
 // backgroundRefresh 后台定时刷新账户信息
@@ -347,10 +538,21 @@ func (h *Handler) backgroundRefresh() {
 	ticker := time.NewTicker(30 * time.Minute) // 每 30 分钟刷新一次
 	defer ticker.Stop()
 
-	// 启动时延迟 10 秒后执行一次
-	time.Sleep(10 * time.Second)
-	h.refreshModelsCache()
-	h.refreshAllAccounts()
+	// 启动时延迟 10 秒后执行一次，同时允许 Close 立即中断。
+	startup := time.NewTimer(10 * time.Second)
+	select {
+	case <-startup.C:
+		h.refreshModelsCache()
+		h.refreshAllAccounts()
+	case <-h.stopRefresh:
+		if !startup.Stop() {
+			select {
+			case <-startup.C:
+			default:
+			}
+		}
+		return
+	}
 
 	for {
 		select {
@@ -364,52 +566,193 @@ func (h *Handler) backgroundRefresh() {
 }
 
 // refreshAllAccounts 刷新所有账户信息
+type accountRefreshMode uint8
+
+const (
+	accountRefreshBackground accountRefreshMode = iota
+	accountRefreshExplicit
+)
+
+type accountRefreshOutcome struct {
+	Info    interface{}
+	Message string
+}
+
+type accountTokenRefreshError struct {
+	err error
+}
+
+func (e *accountTokenRefreshError) Error() string {
+	if e == nil || e.err == nil {
+		return "token refresh failed"
+	}
+	return "token refresh failed: " + e.err.Error()
+}
+
+func (e *accountTokenRefreshError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+// refreshAccountByKind is the single account-lifecycle dispatcher used by
+// background, single-account, and batch refresh flows. Terminal/static provider
+// credentials never fall through to Kiro OAuth, account-info, or quota APIs.
+func (h *Handler) refreshAccountByKind(
+	ctx context.Context,
+	account *config.Account,
+	mode accountRefreshMode,
+) (*accountRefreshOutcome, error) {
+	if account == nil {
+		return nil, errors.New("account is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	switch {
+	case account.IsBedrock():
+		return &accountRefreshOutcome{Message: "Bedrock account; nothing to refresh"}, nil
+
+	case account.IsDirectAnthropic():
+		if mode == accountRefreshBackground {
+			return &accountRefreshOutcome{Message: "Direct Anthropic uses a static API key"}, nil
+		}
+		if err := h.fetchAndCacheAccountModelsContext(ctx, account); err != nil {
+			return nil, err
+		}
+		return &accountRefreshOutcome{Message: "Direct Anthropic model list refreshed"}, nil
+
+	case account.IsCustomApi():
+		quota, err := probeCustomApiQuotaWithContext(ctx, account.BaseURL, account.KiroApiKey)
+		if err != nil {
+			return nil, err
+		}
+		info := quota.toAccountInfo(time.Now().Unix())
+		if account.DispatchGeneration != 0 {
+			applied, err := config.UpdateAccountInfoIfLifecycle(account.ID, account.DispatchGeneration, info)
+			if err != nil {
+				return nil, err
+			}
+			if !applied {
+				return nil, errStaleAccountSelection
+			}
+		} else if err := config.UpdateAccountInfo(account.ID, info); err != nil {
+			return nil, err
+		}
+		if mode == accountRefreshExplicit {
+			if err := h.fetchAndCacheAccountModelsContext(ctx, account); err != nil {
+				logger.Warnf("[Refresh] custom_api model reload failed for %s: %v", account.ID, err)
+			}
+		}
+		return &accountRefreshOutcome{Info: info}, nil
+	}
+
+	if !account.SupportsKiroAccountInfo() {
+		return nil, fmt.Errorf("account kind %q does not support Kiro account refresh", account.AuthMethod)
+	}
+
+	refreshedToken := false
+	refreshKiroToken := func(force bool) error {
+		if !account.SupportsKiroTokenRefresh() || account.RefreshToken == "" {
+			return nil
+		}
+		refreshed, err := h.refreshAccountToken(account, force)
+		if err != nil {
+			return err
+		}
+		refreshedToken = refreshedToken || refreshed
+		return nil
+	}
+
+	needsTokenRefresh := account.ExpiresAt > 0 &&
+		time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds
+	if needsTokenRefresh {
+		if err := refreshKiroToken(false); err != nil {
+			return nil, err
+		}
+	}
+
+	isSuspended := func(refreshErr error) bool {
+		if refreshErr == nil {
+			return false
+		}
+		errMsg := refreshErr.Error()
+		return strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") ||
+			strings.Contains(errMsg, "Account suspended")
+	}
+
+	info, err := RefreshAccountInfo(account)
+	if isSuspended(err) {
+		return &accountRefreshOutcome{Message: "Account status updated"}, nil
+	}
+	if err != nil && !refreshedToken && account.SupportsKiroTokenRefresh() &&
+		account.RefreshToken != "" && shouldRetryAccountRefreshOnError(err.Error()) {
+		if refreshErr := refreshKiroToken(true); refreshErr != nil {
+			return nil, refreshErr
+		}
+		info, err = RefreshAccountInfo(account)
+	}
+	if isSuspended(err) {
+		return &accountRefreshOutcome{Message: "Account status updated"}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if account.DispatchGeneration != 0 {
+		applied, persistErr := config.UpdateAccountInfoIfLifecycle(account.ID, account.DispatchGeneration, *info)
+		if persistErr != nil {
+			return nil, persistErr
+		}
+		if !applied {
+			return nil, errStaleAccountSelection
+		}
+	} else if err := config.UpdateAccountInfo(account.ID, *info); err != nil {
+		return nil, err
+	}
+	return &accountRefreshOutcome{Info: info}, nil
+}
+
 func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
 	for i := range accounts {
 		account := &accounts[i]
-		if !account.Enabled {
+		if !account.Enabled || !account.HasKnownKind() {
 			continue
 		}
-		if accountBearerToken(account) == "" {
+		switch account.Kind() {
+		case config.AccountKindDirectAnthropic, config.AccountKindBedrock:
+			// Static terminal providers have no periodic account-info lifecycle.
 			continue
-		}
-		// Custom API accounts have no Kiro token/usage: refresh their quota from the
-		// linked upstream pool's /api/me instead of AWS (which would 403 and auto-ban).
-		if account.IsBedrock() {
-			continue // static IAM creds: no Kiro quota to refresh
-		}
-		if account.IsCustomApi() {
-			quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
-			if err != nil {
-				logger.Warnf("[BackgroundRefresh] custom_api quota fetch failed for %s: %v", account.ID, err)
+		case config.AccountKindCustomRelay:
+			if !accountReadyForModelDiscovery(account) {
 				continue
 			}
-			config.UpdateAccountInfo(account.ID, quota.toAccountInfo(time.Now().Unix()))
-			continue
-		}
-
-		// API Key accounts skip OAuth refresh; still sync usage/subscription.
-		if !config.IsAPIKeyAccount(account) {
-			// 检查 token 是否需要刷新
-			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-				if _, err := h.refreshAccountToken(account, false); err != nil {
-					logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
-					h.handleAccountFailure(account, err)
-					continue
-				}
+		default:
+			if strings.TrimSpace(account.AccessToken) == "" &&
+				strings.TrimSpace(account.KiroApiKey) == "" &&
+				strings.TrimSpace(account.RefreshToken) == "" {
+				continue
 			}
 		}
-
-		// 刷新账户信息
-		info, err := RefreshAccountInfo(account)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		outcome, err := h.refreshAccountByKind(ctx, account, accountRefreshBackground)
+		cancel()
 		if err != nil {
 			logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
+			// Preserve the previous policy: only an actual OAuth refresh failure
+			// enters account-health classification. Account-info probe failures are
+			// logged and retried on the next cycle without an account-wide penalty.
+			var tokenErr *accountTokenRefreshError
+			if errors.As(err, &tokenErr) {
+				h.handleAccountFailure(account, err)
+			}
 			continue
 		}
-
-		config.UpdateAccountInfo(account.ID, *info)
-		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+		if outcome != nil && outcome.Info != nil {
+			logger.Infof("[BackgroundRefresh] Refreshed %s", account.Email)
+		}
 	}
 	h.pool.Reload()
 }
@@ -459,8 +802,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// CORS - 完整的头部支持
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch")
-	w.Header().Set("Access-Control-Expose-Headers", "x-request-id, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, anthropic-user-profile-id, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch")
+	w.Header().Set("Access-Control-Expose-Headers", strings.Join([]string{"x-request-id", "request-id", "retry-after", "x-ratelimit-limit-requests", "x-ratelimit-limit-tokens", "x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens", "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining", "anthropic-ratelimit-requests-reset", "anthropic-ratelimit-input-tokens-limit", "anthropic-ratelimit-input-tokens-remaining", "anthropic-ratelimit-input-tokens-reset", "anthropic-ratelimit-output-tokens-limit", "anthropic-ratelimit-output-tokens-remaining", "anthropic-ratelimit-output-tokens-reset", "anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining", "anthropic-ratelimit-tokens-reset"}, ", "))
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(204)
@@ -619,12 +962,15 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 
 // handleModels 模型列表
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
+	h.rebuildEnabledModelUnion()
 	// 尝试用缓存的真实模型列表
 	h.modelsCacheMu.RLock()
 	cached := h.cachedModels
 	h.modelsCacheMu.RUnlock()
 	if len(cached) == 0 {
-		h.refreshModelsCache()
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+		h.refreshModelsCacheContext(ctx)
+		cancel()
 		h.modelsCacheMu.RLock()
 		cached = h.cachedModels
 		h.modelsCacheMu.RUnlock()
@@ -632,17 +978,11 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	thinkingSuffix := config.GetThinkingConfig().Suffix
 
-	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
-	if len(models) == 0 {
-		models = fallbackAnthropicModels(thinkingSuffix)
-	}
-
-	// 添加别名模型
-	models = append(models,
-		buildModelInfo("auto", "kiro-proxy", true),
-		buildModelInfo("gpt-4o", "kiro-proxy", true),
-		buildModelInfo("gpt-4", "kiro-proxy", true),
-	)
+	// The public view is generated from the same immutable registry generation
+	// used for account routing. Logical aliases and -thinking variants are only
+	// advertised when at least one current candidate can serve them.
+	registry := h.currentProviderRegistry()
+	models := buildProviderRegistryModelsResponse(registry, cached, thinkingSuffix)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -650,6 +990,25 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		"data":   models,
 	})
 	return
+}
+
+func buildProviderRegistryModelsResponse(registry *providerRegistrySnapshot, cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
+	if registry == nil {
+		return buildAnthropicModelsResponse(cached, "")
+	}
+	models := make([]map[string]interface{}, 0, len(registry.PublicModels)*2)
+	for _, item := range registry.PublicModels {
+		owner := "anthropic"
+		if item.Alias {
+			owner = "kiro-proxy"
+		}
+		supportsImage := modelSupportsImage(item.Model.InputTypes)
+		models = append(models, buildModelInfo(item.Model.ModelId, owner, supportsImage))
+		if strings.TrimSpace(thinkingSuffix) != "" && item.AnyThinking && item.AnyFreshCandidate {
+			models = append(models, buildModelInfo(item.Model.ModelId+thinkingSuffix, owner, supportsImage))
+		}
+	}
+	return models
 }
 
 func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
@@ -662,30 +1021,15 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 		for _, m := range cached {
 			supportsImage := modelSupportsImage(m.InputTypes)
 			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			// 自动生成 thinking 变体
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
+			// Advertise the compatibility suffix only when the enabled-account
+			// capability intersection proves that thinking is supported.
+			if strings.TrimSpace(thinkingSuffix) != "" &&
+				resolveClaudeProviderReasoningCapability(m.ModelId).SupportsThinking {
+				models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
+			}
 		}
 	}
 	return models
-}
-
-func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
-	return []map[string]interface{}{
-		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.6", "anthropic", true),
-		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-haiku-4.5", "anthropic", true),
-		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.5", "anthropic", true),
-		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
-	}
 }
 
 func modelSupportsImage(inputTypes []string) bool {
@@ -731,166 +1075,160 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 	}
 }
 
-// minWarmModelsCacheInterval bounds how often a cold cache can trigger a real
-// refreshModelsCache fan-out. See lastWarmAttemptNanos on Handler for why the
-// single-flight CAS alone is not enough.
-const minWarmModelsCacheInterval = 30 * time.Second
-
-// warmModelsCacheAsync refreshes the model cache off the request goroutine.
-//
-// Single-flighted via CAS: a cold pool taking a burst of concurrent requests
-// must fan out ListAvailableModels once, not once per request. The flag clears
-// when the refresh finishes, so a later cold request can retry — this is a warm
-// hint, not a one-shot latch.
-//
-// Also rate-limited via lastWarmAttemptNanos, independent of the CAS: on a
-// total outage (every Kiro account failing) refreshModelsCache never writes
-// cachedModels, so the cache stays empty and the CAS stays available to
-// re-arm on literally the next request. Without this gate that turns every
-// request during the outage into a fresh live fan-out across every enabled
-// account, feeding handleAccountFailure once per account per request and
-// accelerating auto-ban — and, in a Bedrock-only pool, churns a warm goroutine
-// forever for a refresh that can never succeed.
-func (h *Handler) warmModelsCacheAsync() {
-	if last := atomic.LoadInt64(&h.lastWarmAttemptNanos); last != 0 &&
-		time.Since(time.Unix(0, last)) < minWarmModelsCacheInterval {
-		return
-	}
-	if !atomic.CompareAndSwapInt32(&h.modelsWarming, 0, 1) {
-		return
-	}
-	atomic.StoreInt64(&h.lastWarmAttemptNanos, time.Now().UnixNano())
-	go func() {
-		// net/http recovers panics on a request's own handler goroutine, but NOT
-		// on a bare `go func()` spawned from one — an unrecovered panic here
-		// would take down the whole process. Recover first (before releasing the
-		// single-flight below) so a bug in refreshModelsCache degrades to a
-		// logged error instead of an outage.
-		defer func() {
-			if r := recover(); r != nil {
-				logger.Errorf("[ModelsCache] warm goroutine panicked: %v", r)
-			}
-		}()
-		defer atomic.StoreInt32(&h.modelsWarming, 0)
-		h.refreshModelsCache()
-	}()
-}
-
-// refreshModelsCache 从 Kiro API 拉取模型列表并缓存
+// refreshModelsCache refreshes all enabled account snapshots with a bounded
+// background context. Request handlers use refreshModelsCacheContext directly.
 func (h *Handler) refreshModelsCache() {
-	accounts := config.GetEnabledAccounts()
-	if len(accounts) == 0 {
-		return
-	}
-
-	aggregated := make([]ModelInfo, 0)
-	for i := range accounts {
-		account := &accounts[i]
-		// Custom API accounts load their model list from the linked upstream pool's
-		// /v1/models (not Kiro/AWS): fetch, cache for routing, and aggregate into the
-		// global model list. On failure, skip without banning.
-		if account.IsBedrock() {
-			continue // Bedrock models resolved locally; no upstream probe
-		}
-		if account.IsCustomApi() {
-			models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
-			if err != nil {
-				logger.Warnf("[ModelsCache] custom_api %s model fetch failed: %v", account.ID, err)
-				continue
-			}
-			modelIDs := make([]string, 0, len(models))
-			for _, m := range models {
-				modelIDs = append(modelIDs, m.ModelId)
-			}
-			h.pool.SetModelList(account.ID, modelIDs)
-			aggregated = mergeUniqueModels(aggregated, models)
-			continue
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
-		models, err := ListAvailableModels(account)
-		if err != nil {
-			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
-			continue
-		}
-		// 缓存每账号可用模型，用于路由时过滤
-		modelIDs := make([]string, 0, len(models))
-		for _, m := range models {
-			modelIDs = append(modelIDs, m.ModelId)
-		}
-		h.pool.SetModelList(account.ID, modelIDs)
-		aggregated = mergeUniqueModels(aggregated, models)
-	}
-
-	if len(aggregated) > 0 {
-		h.modelsCacheMu.Lock()
-		h.cachedModels = aggregated
-		h.modelsCacheTime = time.Now().Unix()
-		h.modelsCacheMu.Unlock()
-		logger.Infof("[ModelsCache] Cached %d models", len(aggregated))
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	h.refreshModelsCacheContext(ctx)
 }
 
-// fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
-// 同时更新 pool 的路由缓存与全局聚合模型列表。
+func (h *Handler) refreshModelsCacheContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	accounts := config.GetEnabledAccounts()
+	for i := range accounts {
+		if err := ctx.Err(); err != nil {
+			logger.Warnf("[ModelsCache] refresh cancelled: %v", err)
+			break
+		}
+		account := &accounts[i]
+		if !account.HasKnownKind() {
+			logger.Warnf("[ModelsCache] skipping account=%s with unknown authMethod=%q", account.ID, account.AuthMethod)
+			continue
+		}
+		if err := h.fetchAndCacheAccountModelsContext(ctx, account); err != nil {
+			logger.Warnf("[ModelsCache] account=%s model refresh failed: %v", account.ID, err)
+			if account.SupportsKiroAccountInfo() {
+				h.handleAccountFailure(account, err)
+			}
+		}
+	}
+	// Always rebuild, even when no provider returned models. This removes models
+	// from disabled/deleted accounts and prevents stale merge-only advertisements.
+	h.rebuildEnabledModelUnion()
+
+	h.modelsCacheMu.RLock()
+	count := len(h.cachedModels)
+	h.modelsCacheMu.RUnlock()
+	logger.Infof("[ModelsCache] Rebuilt enabled-account union with %d models", count)
+}
+
+// fetchAndCacheAccountModels is retained for background/legacy callers. Request
+// handlers should use fetchAndCacheAccountModelsContext so cancellation reaches
+// the provider probe.
 func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
-	// Custom API accounts load their model list from the linked upstream pool's
-	// /v1/models (not Kiro/AWS), then cache it for routing.
-	if account.IsBedrock() {
-		// Bedrock has no Kiro/AWS /v1/models endpoint: resolve the callable model
-		// list via control-plane discovery (falling back to the account/default
-		// map) and cache it so the panel's cached-models view and routing work.
-		ids := h.cachedOrDiscoverBedrockModels(account)
-		if len(ids) == 0 {
-			for _, v := range account.BedrockModelMap {
-				ids = append(ids, v)
-			}
-		}
-		if len(ids) == 0 {
-			for _, v := range defaultBedrockModelMap {
-				ids = append(ids, v)
-			}
-		}
-		h.pool.SetModelList(account.ID, ids)
-		return nil
+	return h.fetchAndCacheAccountModelsContext(context.Background(), account)
+}
+
+// fetchAndCacheAccountModelsContext replaces the complete per-account model
+// snapshot on success. It never merge-appends into the global list; the global
+// union is rebuilt from enabled-account snapshots so removed models disappear.
+func (h *Handler) fetchAndCacheAccountModelsContext(ctx context.Context, account *config.Account) error {
+	if account == nil {
+		return errors.New("account is nil")
 	}
-	if account.IsCustomApi() {
-		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
-		if err != nil {
-			return err
+	// Admin/create call sites can hold a pre-dispatch account copy with generation
+	// 0. Stamp the current lifecycle once before deriving source fingerprints so
+	// the refresh is fenced exactly like request-dispatched snapshots. Never
+	// rewrite a non-zero generation: it may intentionally represent stale N.
+	if account.DispatchGeneration == 0 {
+		if generation, ok := config.GetAccountLifecycleGeneration(account.ID); ok {
+			stamped := account.Clone()
+			stamped.DispatchGeneration = generation
+			account = &stamped
 		}
-		modelIDs := make([]string, 0, len(models))
-		for _, m := range models {
-			modelIDs = append(modelIDs, m.ModelId)
-		}
-		h.pool.SetModelList(account.ID, modelIDs)
-		return nil
 	}
-	if err := h.ensureValidToken(account); err != nil {
-		return fmt.Errorf("token refresh failed: %w", err)
+	if !account.HasKnownKind() {
+		return fmt.Errorf("unknown account auth method %q", account.AuthMethod)
 	}
-	models, err := ListAvailableModels(account)
-	if err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
+	sourceFingerprint := accountModelSourceFingerprint(account)
+	sourceGeneration := h.providerSourceGeneration(account)
+
+	if account.IsBedrock() {
+		ids, discoveryErr := h.cachedOrDiscoverBedrockModelsResult(account)
+		explicitIDs := make([]string, 0, len(account.BedrockModelMap))
+		for _, value := range account.BedrockModelMap {
+			if value = strings.TrimSpace(value); value != "" {
+				explicitIDs = mergeStringLists(explicitIDs, []string{value})
+			}
+		}
+		if discoveryErr != nil {
+			h.markAccountModelSnapshotStale(account, sourceFingerprint, sourceGeneration)
+			h.rebuildEnabledModelUnion()
+			// Explicit operator mappings remain usable even when the control-plane
+			// list permission is unavailable. Do not replace a still-routable stale
+			// discovery snapshot; it already includes the same configured targets.
+			if len(explicitIDs) > 0 && !h.accountModelSnapshotRoutableForSource(
+				account, sourceFingerprint, sourceGeneration, time.Now(),
+			) {
+				models := make([]ModelInfo, 0, len(explicitIDs))
+				for _, id := range explicitIDs {
+					models = append(models, ModelInfo{ModelId: id, ModelName: id})
+				}
+				if !h.replaceAccountModelSnapshot(account, sourceFingerprint, sourceGeneration, models, nil, explicitIDs) {
+					return errAccountModelSourceChanged
+				}
+			}
+			return discoveryErr
+		}
+		ids = mergeStringLists(ids, explicitIDs)
+		models := make([]ModelInfo, 0, len(ids))
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				models = append(models, ModelInfo{ModelId: id, ModelName: id})
+			}
+		}
+		if !h.replaceAccountModelSnapshot(account, sourceFingerprint, sourceGeneration, models, nil, ids) {
+			return errAccountModelSourceChanged
+		}
+		return nil
 	}
-	h.pool.SetModelList(account.ID, modelIDs)
 
-	// 合并到聚合缓存
-	h.modelsCacheMu.Lock()
-	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
-	h.modelsCacheTime = time.Now().Unix()
-	h.modelsCacheMu.Unlock()
+	var (
+		models   []ModelInfo
+		metadata map[string]directAnthropicModelMetadata
+		err      error
+	)
+	switch account.Kind() {
+	case config.AccountKindDirectAnthropic:
+		models, metadata, err = probeDirectAnthropicModelsDetailed(ctx, account.BaseURL, account.KiroApiKey)
+	case config.AccountKindCustomRelay:
+		models, err = probeCustomApiModelsWithContext(ctx, account.BaseURL, account.KiroApiKey)
+	case config.AccountKindKiroOAuth, config.AccountKindKiroAPIKey:
+		if err = h.ensureValidToken(account); err == nil {
+			models, err = ListAvailableModels(account)
+		}
+	default:
+		err = fmt.Errorf("account kind %s does not support model discovery", account.Kind())
+	}
+	if err != nil {
+		h.markAccountModelSnapshotStale(account, sourceFingerprint, sourceGeneration)
+		h.rebuildEnabledModelUnion()
+		if account.IsDirectAnthropic() && ctx.Err() == nil {
+			h.handleDirectAnthropicDiscoveryFailure(account, err)
+		}
+		return err
+	}
 
-	logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
+	modelIDs := make([]string, 0, len(models))
+	for _, model := range models {
+		if id := strings.TrimSpace(model.ModelId); id != "" {
+			modelIDs = append(modelIDs, id)
+		}
+	}
+	if !h.replaceAccountModelSnapshot(account, sourceFingerprint, sourceGeneration, models, metadata, modelIDs) {
+		return errAccountModelSourceChanged
+	}
+	logger.Infof("[ModelsCache] Replaced %d models for account %s", len(models), account.ID)
 	return nil
 }
 
@@ -920,14 +1258,15 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 	// An explicit refresh should re-run Bedrock discovery, not reuse the cache, and
 	// re-learn which region each model is callable in.
 	if account.IsBedrock() {
-		clearBedrockModelCache(account.ID)
-		clearBedrockRegionRoutes(account.ID)
+		clearBedrockModelCacheForLifecycle(account)
+		clearBedrockRegionRoutesForLifecycle(account)
+		bedrockThrottle.clearForLifecycle(account)
 		// Prewarm the per-model callable region in the background (opt-in cost: one
 		// tiny invoke per model per candidate region). The response returns as soon
 		// as discovery is cached; the region map fills in shortly after.
-		go func(acc config.Account) { h.prewarmBedrockRegions(&acc) }(*account)
+		h.startBackgroundTask(func() { acc := *account; h.prewarmBedrockRegions(&acc) })
 	}
-	if err := h.fetchAndCacheAccountModels(account); err != nil {
+	if err := h.fetchAndCacheAccountModelsContext(r.Context(), account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -941,7 +1280,7 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 // apiRefreshAllAccountsModels POST /admin/api/accounts/models/refresh
 // 直接复用 refreshModelsCache，为所有已启用账号刷新模型路由缓存。
 func (h *Handler) apiRefreshAllAccountsModels(w http.ResponseWriter, r *http.Request) {
-	h.refreshModelsCache()
+	h.refreshModelsCacheContext(r.Context())
 	h.modelsCacheMu.RLock()
 	cachedLen := len(h.cachedModels)
 	h.modelsCacheMu.RUnlock()
@@ -1005,18 +1344,41 @@ func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {
 	return base
 }
 
+func (h *Handler) warmModelsCacheAsync() {
+	if h == nil || h.closed.Load() {
+		return
+	}
+	if last := atomic.LoadInt64(&h.lastWarmAttemptNanos); last != 0 &&
+		time.Since(time.Unix(0, last)) < minWarmModelsCacheInterval {
+		return
+	}
+	if !atomic.CompareAndSwapInt32(&h.modelsWarming, 0, 1) {
+		return
+	}
+	atomic.StoreInt64(&h.lastWarmAttemptNanos, time.Now().UnixNano())
+	if !h.startBackgroundTask(func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logger.Errorf("[ModelsCache] warm goroutine panicked: %v", recovered)
+			}
+		}()
+		defer atomic.StoreInt32(&h.modelsWarming, 0)
+		h.refreshModelsCache()
+	}) {
+		atomic.StoreInt32(&h.modelsWarming, 0)
+	}
+}
+
+// reasoningBuildErrorIsFatal is retained for upstream regression/source compatibility.
+// Candidate-specific WIP routing is authoritative and does not use this helper as
+// a pre-dispatch hard gate.
+func (h *Handler) reasoningBuildErrorIsFatal() bool {
+	return h.hasKiroCapableAccount()
+}
+
 // Read reasoning capabilities from the cached model schema.
-//
-// This is a CACHE READ ONLY, and deliberately so: it sits on the hot path of
-// every Claude, count_tokens and OpenAI request, ahead of the per-account
-// dispatch loop. Refreshing inline here would (a) block a customer's first
-// request on a live ListAvailableModels fan-out across every enabled account,
-// and (b) drag Kiro accounts — and refreshModelsCache's handleAccountFailure
-// call — into requests that may target Bedrock or custom_api, which CLAUDE.md
-// requires stay out of every Kiro-facing path. A cold cache instead yields an
-// empty capability (the same result an unknown model gives) and warms itself
-// in the background for the next request.
 func (h *Handler) reasoningCapabilityForModel(modelID string) ModelReasoningCapability {
+	h.rebuildEnabledModelUnion()
 	normalizedID := strings.ToLower(
 		strings.TrimSpace(MapModel(modelID)),
 	)
@@ -1026,6 +1388,9 @@ func (h *Handler) reasoningCapabilityForModel(modelID string) ModelReasoningCapa
 	h.modelsCacheMu.RUnlock()
 
 	if len(models) == 0 {
+		// Never turn a request hot path into a synchronous Kiro-account fan-out.
+		// The request planner may still choose a direct/Bedrock provider while this
+		// best-effort cache warm runs in the Handler lifecycle group.
 		h.warmModelsCacheAsync()
 	}
 
@@ -1037,6 +1402,11 @@ func (h *Handler) reasoningCapabilityForModel(modelID string) ModelReasoningCapa
 			continue
 		}
 		capability := ParseModelReasoningCapability(model)
+		// The Kiro schema advertises thinking and budget fields, but not whether
+		// the manual interleaved-thinking beta has an effect. Preserve that
+		// model-specific capability from the conservative built-in table.
+		capability.SupportsInterleavedThinking =
+			fallbackClaudeReasoningCapability(modelID).SupportsInterleavedThinking
 
 		if diagnostics.Reasoning() && capability.SchemaParseError != "" {
 			logger.Warnf(
@@ -1049,31 +1419,11 @@ func (h *Handler) reasoningCapabilityForModel(modelID string) ModelReasoningCapa
 		return capability
 	}
 
-	return ModelReasoningCapability{
-		ModelID: modelID,
-	}
-}
-
-// reasoningBuildErrorIsFatal decides whether a schema-validation error from
-// Build{Claude,OpenAI}AdditionalModelRequestFields should hard-fail the
-// request with a 400, or be dropped and let the request continue.
-//
-// Kiro's schema-driven reasoning validation (reasoningCapabilityForModel,
-// above) is built from cachedModels, which is populated exclusively by
-// probing Kiro accounts (refreshModelsCache skips Bedrock/custom_api
-// entirely). In a pool with no Kiro-capable account at all, that schema is
-// necessarily empty/stale for every model, so rejecting a client's
-// thinking/effort request against it is validating against the wrong
-// backend: a Bedrock account speaks native Anthropic Messages directly (no
-// Kiro schema involved) and would accept e.g. thinking.type:"enabled" fine.
-// This runs BEFORE the per-account dispatch loop (handler.go's
-// account-selection loop further down), so at this point we only know
-// whether the pool *could* serve the request via Kiro — not which account
-// will actually be picked. Degrading here, rather than in the dispatch loop,
-// keeps the fix in one place instead of duplicating it across every
-// dispatch branch.
-func (h *Handler) reasoningBuildErrorIsFatal() bool {
-	return h.hasKiroCapableAccount()
+	// No candidate-local Kiro model schema means the Kiro adapter capability is
+	// unknown. Do not borrow the static Claude capability table here: this helper
+	// is queried before account selection, and doing so would let a direct/Bedrock
+	// model capability authorize fields for an unrelated Kiro credential.
+	return ModelReasoningCapability{}
 }
 
 func mergeStringLists(base []string, extra []string) []string {
@@ -1108,48 +1458,19 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
+	body, ok := h.readLimitedJSONBody(w, r, requestBodyErrorClaude)
+	if !ok {
 		return
 	}
 
-	var req ClaudeRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON")
+	plan, planErr := h.buildClaudeRequestPlan(body, r.Header)
+	if planErr != nil {
+		h.sendClaudeValidationError(w, http.StatusBadRequest, planErr)
 		return
 	}
-	if msg := validateClaudeThinkingConfig(req.Thinking, req.MaxTokens); msg != "" {
-		h.sendClaudeError(w, 400, "invalid_request_error", msg)
-		return
-	}
-
-	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinkingRequested := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
-	req.Model = actualModel
-
-	capability := h.reasoningCapabilityForModel(actualModel)
-
-	additionalFields, nativeRequested, buildErr := BuildClaudeAdditionalModelRequestFields(&req, capability)
-	if buildErr != nil {
-		// See reasoningBuildErrorIsFatal: a Bedrock/custom_api-only pool has no
-		// Kiro schema for this request to be validated against at all. count_tokens
-		// has no account-dispatch loop of its own, so this is the only place that
-		// decision can be made for this endpoint.
-		if h.reasoningBuildErrorIsFatal() {
-			h.sendClaudeError(w, 400, "invalid_request_error", buildErr.Error())
-			return
-		}
-		logger.Warnf("[Reasoning] count_tokens: dropping unsupported reasoning request for model %s (no Kiro-capable account in pool): %v", actualModel, buildErr)
-		additionalFields = nil
-		nativeRequested = false
-	}
-
-	thinkingRequested = thinkingRequested || nativeRequested
-
-	useLegacyThinkingPrompt := thinkingRequested && len(additionalFields) == 0
-
-	effectiveReq := cloneClaudeRequestForThinking(&req, useLegacyThinkingPrompt)
+	// Count the canonical provider request. This endpoint must not use Kiro's
+	// additionalModelRequestFieldsSchema as the source of Claude model validity.
+	effectiveReq := &plan.Request
 
 	estimatedTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	if estimatedTokens < 1 {
@@ -1195,6 +1516,165 @@ func claudeReasoningEffort(req *ClaudeRequest) string {
 	return strings.TrimSpace(req.ReasoningEffort)
 }
 
+func claudeThinkingDisplay(req *ClaudeRequest) string {
+	if req == nil || req.Thinking == nil {
+		return ""
+	}
+	return strings.TrimSpace(req.Thinking.Display)
+}
+
+// logClaudeThinkingInbound records the exact reasoning controls received from
+// the Claude client before model alias resolution or enabled -> adaptive mapping.
+func logClaudeThinkingInbound(endpoint string, req *ClaudeRequest) {
+	if !diagnostics.Reasoning() || req == nil {
+		return
+	}
+
+	logger.Infof(
+		"[ClaudeThinkingInbound] endpoint=%s model=%q stream=%t type=%q display=%q budgetTokens=%d effort=%q tools=%d",
+		endpoint,
+		req.Model,
+		req.Stream,
+		claudeThinkingType(req),
+		claudeThinkingDisplay(req),
+		claudeThinkingBudget(req),
+		claudeReasoningEffort(req),
+		len(req.Tools),
+	)
+}
+
+// claudeThinkingRoundTripStats summarizes the most recent assistant thinking
+// block and the following tool-result turn without logging opaque signatures.
+type claudeThinkingRoundTripStats struct {
+	LastAssistantFound bool
+	ThinkingBlocks     int
+	SignatureCount     int
+	SignatureTotalLen  int
+	SignatureHashes    []string
+	RedactedBlocks     int
+	ToolUseBlocks      int
+	ToolResultBlocks   int
+}
+
+func shortThinkingSignatureHash(signature string) string {
+	if signature == "" {
+		return ""
+	}
+
+	sum := sha256.Sum256([]byte(signature))
+	return fmt.Sprintf("%x", sum[:8])
+}
+
+func inspectClaudeThinkingRoundTrip(messages []ClaudeMessage) claudeThinkingRoundTripStats {
+	var stats claudeThinkingRoundTripStats
+
+	lastAssistantIndex := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if strings.EqualFold(strings.TrimSpace(messages[i].Role), "assistant") {
+			lastAssistantIndex = i
+			stats.LastAssistantFound = true
+			break
+		}
+	}
+
+	if lastAssistantIndex >= 0 {
+		for _, block := range claudeContentBlocks(messages[lastAssistantIndex].Content) {
+			blockType, _ := block["type"].(string)
+			switch blockType {
+			case "thinking":
+				stats.ThinkingBlocks++
+				if signature, _ := block["signature"].(string); signature != "" {
+					stats.SignatureCount++
+					stats.SignatureTotalLen += len(signature)
+					stats.SignatureHashes = append(
+						stats.SignatureHashes,
+						shortThinkingSignatureHash(signature),
+					)
+				}
+			case "redacted_thinking":
+				stats.RedactedBlocks++
+			case "tool_use":
+				stats.ToolUseBlocks++
+			}
+		}
+	}
+
+	for i := lastAssistantIndex + 1; i < len(messages); i++ {
+		if !strings.EqualFold(strings.TrimSpace(messages[i].Role), "user") {
+			continue
+		}
+		for _, block := range claudeContentBlocks(messages[i].Content) {
+			if blockType, _ := block["type"].(string); blockType == "tool_result" {
+				stats.ToolResultBlocks++
+			}
+		}
+	}
+
+	return stats
+}
+
+func claudeContentBlocks(content interface{}) []map[string]interface{} {
+	switch blocks := content.(type) {
+	case []interface{}:
+		result := make([]map[string]interface{}, 0, len(blocks))
+		for _, raw := range blocks {
+			if block, ok := raw.(map[string]interface{}); ok {
+				result = append(result, block)
+			}
+		}
+		return result
+	case []map[string]interface{}:
+		return blocks
+	case []ClaudeContentBlock:
+		result := make([]map[string]interface{}, 0, len(blocks))
+		for _, block := range blocks {
+			encoded, err := json.Marshal(block)
+			if err != nil {
+				continue
+			}
+			var decoded map[string]interface{}
+			if json.Unmarshal(encoded, &decoded) == nil {
+				result = append(result, decoded)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func resolveClaudeEffectiveThinking(
+	req *ClaudeRequest,
+	explicitOrSuffixThinking bool,
+	nativeRequested bool,
+	capability ModelReasoningCapability,
+) bool {
+	if req != nil && req.Thinking != nil {
+		switch strings.ToLower(strings.TrimSpace(req.Thinking.Type)) {
+		case "disabled", "none":
+			return false
+		case "enabled", "adaptive":
+			return true
+		}
+	}
+
+	if explicitOrSuffixThinking {
+		return true
+	}
+	// output_config.effort is a sampling/reasoning control, not a request for
+	// visible thinking blocks. Response shape changes only when the client asks
+	// for thinking (or the selected provider semantics require it).
+	if nativeRequested {
+		return true
+	}
+
+	model := ""
+	if req != nil {
+		model = req.Model
+	}
+	return claudeThinkingEnabledByDefault(model, capability)
+}
+
 func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method Not Allowed", 405)
@@ -1202,160 +1682,317 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	// 读取请求
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
+	body, ok := h.readLimitedJSONBody(w, r, requestBodyErrorClaude)
+	if !ok {
 		return
 	}
 
-	var req ClaudeRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
+	invocationBody := append([]byte(nil), body...)
+	plan, planErr := h.buildClaudeRequestPlan(body, r.Header)
+	if planErr != nil {
+		h.sendClaudeValidationError(w, http.StatusBadRequest, planErr)
 		return
 	}
-	if msg := validateClaudeRequestShape(&req); msg != "" {
-		h.sendClaudeError(w, 400, "invalid_request_error", msg)
-		return
+	req := plan.Request
+	body = plan.Semantic.Body
+	semanticRequest := plan.Semantic
+	applyClaudeSemanticHeaders(r.Header, semanticRequest.Headers)
+
+	logClaudeThinkingInbound("messages", &req)
+
+	var roundTripStats claudeThinkingRoundTripStats
+	if diagnostics.Reasoning() {
+		roundTripStats = inspectClaudeThinkingRoundTrip(req.Messages)
+		if roundTripStats.ThinkingBlocks > 0 ||
+			roundTripStats.RedactedBlocks > 0 ||
+			roundTripStats.ToolResultBlocks > 0 {
+
+			logger.Infof(
+				"[ClaudeThinkingRoundTrip] lastAssistant=%t thinkingBlocks=%d signatureCount=%d signatureTotalLen=%d signatureHashes=%v redactedBlocks=%d toolUseBlocks=%d toolResultBlocks=%d",
+				roundTripStats.LastAssistantFound,
+				roundTripStats.ThinkingBlocks,
+				roundTripStats.SignatureCount,
+				roundTripStats.SignatureTotalLen,
+				roundTripStats.SignatureHashes,
+				roundTripStats.RedactedBlocks,
+				roundTripStats.ToolUseBlocks,
+				roundTripStats.ToolResultBlocks,
+			)
+		}
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	requestedModel := req.Model
-	actualModel, legacyOrClientThinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	requestedModel := plan.RequestedModel
+	actualModel := plan.ResolvedModel
+	legacyOrClientThinking := plan.ThinkingRequested
+	transportRequirements := plan.Requirements
+	kiroProjection := plan.KiroProjection
+	providerCapability := plan.Capability
+	kiroCapability := h.reasoningCapabilityForModel(actualModel)
 
-	req.Model = actualModel
-
-	capability := h.reasoningCapabilityForModel(actualModel)
-
-	// Build only reasoning fields supported by this model.
-	additionalFields, nativeRequested, buildErr := BuildClaudeAdditionalModelRequestFields(&req, capability)
-	if buildErr != nil {
-		// See reasoningBuildErrorIsFatal: this runs ahead of the per-account
-		// dispatch loop below, so a mixed pool with no Kiro-capable account for
-		// this request (e.g. all-Bedrock) must not 400 here — Bedrock speaks
-		// native Anthropic Messages and needs no Kiro schema at all. Only hard-fail
-		// when a Kiro-capable account actually exists to serve this request.
-		if h.reasoningBuildErrorIsFatal() {
-			h.sendClaudeError(w, 400, "invalid_request_error", buildErr.Error())
+	// Protocol/model validation uses provider capability, never Kiro's adapter
+	// schema. Unknown aliases remain transparent-upstream validated.
+	if plan.ProviderCapabilityKnown {
+		_, supportsManualThinking := matchThinkingType("enabled", providerCapability.ThinkingTypes)
+		_, supportsAdaptiveThinking := matchThinkingType("adaptive", providerCapability.ThinkingTypes)
+		if msg := completionGuardValidateThinkingToolChoice(
+			req.Thinking,
+			req.ToolChoice,
+			supportsManualThinking,
+			supportsAdaptiveThinking,
+		); msg != "" {
+			h.sendClaudeError(w, 400, "invalid_request_error", msg)
 			return
 		}
-		logger.Warnf("[Reasoning] messages: dropping unsupported reasoning request for model %s (no Kiro-capable account in pool): %v", actualModel, buildErr)
-		additionalFields = nil
-		nativeRequested = false
 	}
 
-	// thinking gates response SHAPE: whether reasoning content is emitted to the
-	// client at all (see handleClaudeStream's `if !thinking { return }` and
-	// friends) and, via thinkingResponseOpts below, which wire format it uses.
-	// nativeRequested alone is NOT a safe signal for this: it goes true for a
-	// client that only sent output_config.effort (or the OpenAI-style
-	// reasoning_effort/top-level field) with NO thinking object at all —
-	// BuildClaudeAdditionalModelRequestFields sets requested=true purely from
-	// an effort value. thinkingResponseOpts (below) is keyed off req.Thinking
-	// only and falls back to the operator's configured thinkingCfg.ClaudeFormat
-	// when req.Thinking is nil, so an effort-only request that never mentioned
-	// "thinking" could otherwise have reasoning content injected into its
-	// response — e.g. inlined as `<think>...</think>` in the plain text stream
-	// if the operator's format is "think" — even though the client's own
-	// request never asked for a thinking block. Require an explicit
-	// req.Thinking object (already what legacyOrClientThinking demands for its
-	// own suffix/config-forced case) before nativeRequested can broaden the
-	// shape, so effort-only requests keep the pre-existing (pre-PR-#6)
-	// behavior: reasoning may still be requested from Kiro via additionalFields
-	// above, but is not surfaced as a distinct block/tag in the response.
-	thinking := legacyOrClientThinking || (req.Thinking != nil && nativeRequested)
+	// This aggregate Kiro capability is only a diagnostics/payload preview. The
+	// authoritative additionalModelRequestFields are rebuilt later from the exact
+	// selected account/model route, so one credential can never authorize another.
+	additionalFields, nativeRequested, kiroPreviewErr := BuildClaudeAdditionalModelRequestFields(&req, kiroCapability)
+	if kiroPreviewErr != nil {
+		additionalFields = nil
+		if diagnostics.Reasoning() {
+			logger.Infof(
+				"[KiroAdapterPreview] model=%s authoritative=false error=%q",
+				actualModel,
+				kiroPreviewErr.Error(),
+			)
+		}
+	}
+	if compatibilityErr := claudeKiroContentCompatibilityError(plan.Content); compatibilityErr != nil {
+		transportRequirements.Require(
+			"kiro_content_adapter",
+			claudeTransportMaskAll&^claudeTransportMaskKiro,
+			compatibilityErr.Error(),
+		)
+	}
+	kiroProjection = transportRequirements.KiroProjection
+	if transportRequirements.Allowed == 0 {
+		h.sendClaudeErrorWithDetailCode(
+			w,
+			http.StatusBadRequest,
+			"invalid_request_error",
+			"No configured Claude transport can represent the request: "+transportRequirements.Summary(),
+			"unsupported_transport_feature",
+		)
+		return
+	}
+
+	// Effective response thinking derives from client/provider intent. The
+	// aggregate Kiro adapter preview is not an authoritative capability source.
+	thinking := resolveClaudeEffectiveThinking(
+		&req,
+		legacyOrClientThinking,
+		false,
+		providerCapability,
+	)
 
 	if diagnostics.Reasoning() {
 		logger.Infof(
-			"[ClaudeThinking] requested=%t type=%q budgetTokens=%d effort=%q requestedModel=%q actualModel=%q",
+			"[ClaudeThinking] requested=%t type=%q display=%q budgetTokens=%d effort=%q requestedModel=%q actualModel=%q",
 			thinking,
 			claudeThinkingType(&req),
+			claudeThinkingDisplay(&req),
 			claudeThinkingBudget(&req),
 			claudeReasoningEffort(&req),
 			requestedModel,
 			actualModel,
 		)
 		logger.Infof(
-			"[KiroReasoning] model=%s requested=%t schemaPath=%s supportsThinking=%t thinkingTypes=%v thinkingDisplays=%v supportedEfforts=%v fields=%s",
+			"[KiroReasoningPreview] model=%s authoritative=false requested=%t schemaPath=%s supportsThinking=%t thinkingTypes=%v thinkingDisplays=%v supportedEfforts=%v fields=%s",
 			actualModel,
 			nativeRequested,
-			capability.EffortPath,
-			capability.SupportsThinking,
-			capability.ThinkingTypes,
-			capability.ThinkingDisplays,
-			capability.Efforts,
+			kiroCapability.EffortPath,
+			kiroCapability.SupportsThinking,
+			kiroCapability.ThinkingTypes,
+			kiroCapability.ThinkingDisplays,
+			kiroCapability.Efforts,
 			reasoningFieldsJSON(additionalFields),
 		)
 	}
 
-	useLegacyThinkingPrompt := thinking && len(additionalFields) == 0
+	if diagnostics.Reasoning() && kiroProjection.Fidelity != claudeProjectionExact {
+		logger.Infof(
+			"[ClaudeKiroProjection] fidelity=%s summary=%q",
+			kiroProjection.Fidelity.String(),
+			kiroProjection.Summary(),
+		)
+	}
+
+	// Legacy prompting is private Kiro-Go suffix compatibility only. Explicit
+	// Claude reasoning controls are candidate-validated and must never fall back
+	// to a prompt merely because the aggregate capability preview is narrower.
+	useLegacyThinkingPrompt := plan.LegacySuffixOnly && transportRequirements.AllowsKiro()
 
 	effectiveReq := cloneClaudeRequestForThinking(&req, useLegacyThinkingPrompt)
 
-	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
+	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(
+		req.Thinking,
+		thinkingCfg.ClaudeFormat,
+		actualModel,
+		providerCapability,
+	)
+
+	routing := claudeRoutingContext{
+		Semantic:          semanticRequest,
+		Requirements:      transportRequirements,
+		RequestedModel:    stripRequestedModelThinkingSuffix(requestedModel, thinkingCfg.Suffix),
+		InvocationBody:    invocationBody,
+		InvocationHeaders: cloneAnthropicSemanticHeaders(semanticRequest.Headers),
+	}
+	r = r.WithContext(withClaudeRoutingContext(r.Context(), routing))
 
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
-	apiKeyID := apiKeyIDFromContext(r.Context())
+	guardPlan := buildAgentCompletionGuardPlanForModelWithCatalogAndCapabilities(
+		&req,
+		thinking,
+		actualModel,
+		plan.Catalog,
+		plan.Capabilities,
+	)
+	if guardPlan.ValidationReason == "" {
+		guardPlan.ValidationReason = completionGuardValidateSemanticHeaders(
+			guardPlan.Catalog,
+			r.Header,
+		)
+	}
+	if guardPlan.Enabled &&
+		!guardPlan.ObserveOnly &&
+		guardPlan.ValidationReason != "" {
+		h.sendClaudeError(
+			w,
+			http.StatusBadRequest,
+			"invalid_request_error",
+			guardPlan.ValidationReason,
+		)
+		return
+	}
 
-	// Both web_search short-circuits below key off the REQUEST only (does it carry
-	// a native web_search tool?), not account type, and run BEFORE the normal
-	// Bedrock/custom_api passthrough dispatch further down. Kiro's MCP relay
-	// (callMcpAPI) is the only implementation either path has — an all-Bedrock or
-	// all-custom_api pool has no account that can serve it. Without this gate that
-	// pool would still take this branch, exhaust every account via performWebSearch/
-	// callUpstreamForWebSearch's own IsBedrock()/IsCustomApi() skips (added
-	// alongside this check), and return a hard error — when falling through to the
-	// normal dispatch would have let a Bedrock account serve the request directly
-	// (Bedrock passes tools through natively; the client executes web_search
-	// itself). Only take the fast path when the pool actually has a Kiro-capable
-	// account to serve it.
-	// Gate the (cfgLock-held, full-slice-copy) pool scan behind the cheap
-	// request-shape check: most requests carry no web_search tool at all, so
-	// checking the request first avoids hasKiroCapableAccount()'s
-	// GetAccounts() copy + linear scan on every /v1/messages call.
-	if hasWebSearchTool(&req) || hasWebSearchAmongTools(&req) {
-		if h.hasKiroCapableAccount() {
-			// Pure native web_search: relay via Kiro MCP (generateAssistantResponse does not run it).
-			if hasWebSearchTool(&req) {
-				h.handleWebSearchRequest(w, &req, estimatedInputTokens, apiKeyID)
-				return
-			}
-
-			// Mixed tools including native web_search: agentic loop digests web_search internally
-			// and returns client tool_use blocks as-is.
-			if hasWebSearchAmongTools(&req) {
-				logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop")
-				h.runWebSearchLoop(r.Context(), w, &req, thinking, estimatedInputTokens, apiKeyID)
+	if guardPlan.Enabled {
+		if guardPlan.ObserveOnly {
+			logger.Infof(
+				"[CompletionGuardObserved] model=%s stream=%t action=transparent_passthrough",
+				req.Model,
+				req.Stream,
+			)
+		} else if transportRequirements.RequiresKiroWebSearchMCP {
+			// Native server-side web_search is executed by the selected transport
+			// (Kiro MCP or direct Anthropic), not by hidden completion-guard turns.
+			logger.Infof(
+				"[CompletionGuardBypass] model=%s stream=%t native_web_search=true",
+				req.Model,
+				req.Stream,
+			)
+		} else if !transportRequirements.AllowsKiro() {
+			// Completion Guard retries through Kiro. A request whose semantics
+			// require another transport must be forwarded unchanged instead.
+			logger.Infof(
+				"[CompletionGuardBypass] model=%s stream=%t requirements=%q",
+				req.Model,
+				req.Stream,
+				transportRequirements.Summary(),
+			)
+		} else {
+			replaySafety, replayReason :=
+				completionGuardClaudeProjectionReplaySafety(kiroProjection)
+			if replaySafety == completionGuardProjectionReplayUnsafe {
+				// Guard retries synthesize private Claude turns. Keep fail-closed
+				// behavior for projections whose emulation depends on the exact
+				// original history (for example context management). New emulation
+				// features also land here until explicitly reviewed.
+				logger.Infof(
+					"[CompletionGuardBypass] model=%s stream=%t "+
+						"kiroProjection=%q replaySafety=%s reason=%s",
+					req.Model,
+					req.Stream,
+					kiroProjection.Summary(),
+					replaySafety.String(),
+					replayReason,
+				)
+			} else {
+				if replaySafety == completionGuardProjectionReplaySafe {
+					logger.Infof(
+						"[CompletionGuardProjection] model=%s stream=%t "+
+							"replaySafety=%s kiroProjection=%q",
+						req.Model,
+						req.Stream,
+						replaySafety.String(),
+						kiroProjection.Summary(),
+					)
+				}
+				h.handleClaudeCompletionGuard(w, r, req, req.Model, thinking, thinkingResponseOpts, useLegacyThinkingPrompt, additionalFields, guardPlan)
 				return
 			}
 		}
 	}
 
-	// 转换请求
-	// useLegacyThinkingPrompt (not the broader `thinking` flag) gates the
-	// legacy prompt-injected thinking instructions: when the model supports
-	// schema-driven reasoning and additionalFields was built, the native
-	// AdditionalModelRequestFields path below carries the request instead.
-	kiroPayload := ClaudeToKiro(&req, useLegacyThinkingPrompt)
-	kiroPayload.AdditionalModelRequestFields = additionalFields
+	var kiroPayload *KiroPayload
+	if transportRequirements.AllowsKiro() && !transportRequirements.RequiresKiroWebSearchMCP {
+		var translationErr error
+		kiroPayload, translationErr = ClaudeToKiroCheckedWithProjection(
+			&req,
+			useLegacyThinkingPrompt,
+			plan.Content,
+			kiroProjection,
+		)
+		if translationErr != nil {
+			h.sendClaudeError(
+				w,
+				http.StatusInternalServerError,
+				"claude_translation_invariant",
+				translationErr.Error(),
+			)
+			return
+		}
+		kiroPayload.AdditionalModelRequestFields = additionalFields
+	}
+
+	if diagnostics.Reasoning() && roundTripStats.SignatureCount > 0 {
+		logger.Infof(
+			"[KiroReasoningRoundTrip] inboundThinkingBlocks=%d inboundSignatures=%d signatureForwarded=false reason=%q",
+			roundTripStats.ThinkingBlocks,
+			roundTripStats.SignatureCount,
+			"Claude thinking/signature blocks are not serialized into Kiro assistant history",
+		)
+	}
 
 	// Stream or non-stream
+	apiKeyID := apiKeyIDFromContext(r.Context())
+	semanticHeaders := cloneAnthropicSemanticHeaders(semanticRequest.Headers)
 	// forwarded marks a request that already passed through one Kiro-Go pool, so a
 	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
 	forwarded := r.Header.Get(forwardHeader) != ""
-	// r.Context() flows to the handlers so upstream's stream-integrity retry can tell
-	// a client cancellation apart from a genuinely broken upstream stream.
 	if req.Stream {
-		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body, forwarded)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, invocationBody, forwarded, semanticHeaders, r.Context())
 	} else {
-		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body, forwarded)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, invocationBody, forwarded, semanticHeaders, r.Context())
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool, semanticHeaders http.Header, requestContext context.Context) {
+	routing, routingErr := resolveClaudeRoutingContext(
+		requestContext,
+		rawBody,
+		semanticHeaders,
+		model,
+	)
+	if routingErr != nil {
+		errorType := "invalid_request_error"
+		var validationErr *claudeTransportValidationError
+		if errors.As(routingErr, &validationErr) && validationErr.Code != "" {
+			errorType = validationErr.Code
+		}
+		h.sendClaudeError(w, http.StatusBadRequest, errorType, routingErr.Error())
+		return
+	}
+	semanticHeaders = routing.Semantic.Headers
+	rawBody = routing.Semantic.Body
+
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1398,36 +2035,106 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	}
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
-		if account == nil {
+		candidate, selectionErr := h.nextCompatibleClaudeCandidate(
+			routing.RequestedModel,
+			model,
+			excluded,
+			apiKeyID,
+			forwarded,
+			routing.Requirements,
+			rawBody,
+		)
+		if selectionErr != nil {
+			// Preserve the last concrete upstream/provider response. Selection
+			// exhaustion is less informative and must not replace a 401/403/429/5xx
+			// response that can still be returned to the client verbatim.
+			if lastErr == nil {
+				lastErr = selectionErr
+			}
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if candidate == nil || candidate.Selection == nil || candidate.Account == nil {
+			break
+		}
+		selection := candidate.Selection
+		account := candidate.Account
+		providerModelID := string(candidate.ProviderModelID)
+		if err := h.ensureValidTokenForSelection(selection); err != nil {
 			lastErr = err
+			if errors.Is(err, errStaleAccountSelection) {
+				continue
+			}
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleTokenValidationFailureForSelection(selection, err)
+			continue
+		}
+		if routing.Requirements.RequiresKiroWebSearchMCP && candidate.Transport == claudeTransportKiroNative {
+			webErr := h.handleSelectedKiroWebSearch(
+				requestContext, w, rawBody, model, estimatedInputTokens, apiKeyID, selection, account,
+			)
+			if webErr == nil {
+				return
+			}
+			if requestContext != nil && requestContext.Err() != nil {
+				return
+			}
+			lastErr = webErr
+			if errors.Is(webErr, errStaleAccountSelection) || !h.pool.IsSelectionCurrent(*selection) {
+				continue
+			}
+			excluded[account.ID] = true
+			h.handleAccountFailureForSelection(*selection, webErr)
 			continue
 		}
 		// Custom API accounts are transparent proxies to another Kiro-Go pool: forward
 		// the raw request instead of translating to Kiro. A successful forward ends the
 		// request; any pre-reply failure falls over to the next account like a Kiro error.
-		if account.IsCustomApi() {
+		if account.IsCustomApi() || claudeAccountIsDirectAnthropic(account) {
 			// Already forwarded once: don't add another hop, and don't penalize this
 			// healthy account (loop-guard is not a failure) — just skip it. The account
 			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
 			// real retry on an ineligible account.
-			if forwarded {
+			if forwarded && account.IsCustomApi() {
 				excluded[account.ID] = true
 				attempt--
 				continue
 			}
 			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
-				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
-				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				selection: selection, account: account, body: rawBody, endpoint: "anthropic", streaming: true,
+				model: model, providerModelID: providerModelID, apiKeyID: apiKeyID, forwarded: forwarded,
+				semanticHeaders: semanticHeaders,
+				requestContext:  requestContext,
 			}); fwdErr != nil {
+				if requestContext != nil && requestContext.Err() != nil {
+					return
+				}
 				lastErr = fwdErr
+				// The upstream result belongs to the lifecycle captured at dispatch.
+				// If that lifecycle was replaced while the request was in flight,
+				// retry selection without excluding or mutating the new account.
+				if !h.pool.IsSelectionCurrent(*selection) {
+					continue
+				}
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, fwdErr)
+
+				var transportErr *directAnthropicTransportError
+				if errors.As(fwdErr, &transportErr) {
+					h.setProviderCooldownForAccount(account, directAnthropicTransientCooldown)
+					continue
+				}
+
+				var directErr *directAnthropicResponseError
+				if errors.As(fwdErr, &directErr) {
+					if !directErr.Retryable {
+						h.recordFailureWithDetails("claude", model, account.ID, apiKeyID, directErr)
+						writeDirectAnthropicResponseError(w, directErr)
+						return
+					}
+					h.handleDirectAnthropicFailure(account, model, directErr)
+					continue
+				}
+
+				h.handleAccountFailureForSelection(*selection, fwdErr)
 				continue
 			}
 			return
@@ -1437,32 +2144,52 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		// transparent passthrough that ends the request on success; a pre-stream
 		// failure falls over to the next account.
 		if account.IsBedrock() {
+			bedrockBody, bodyErr := buildBedrockBodyWithSemanticHeaders(
+				rawBody,
+				semanticHeaders,
+			)
+			if bodyErr != nil {
+				lastErr = bodyErr
+				break
+			}
+			if accepted, reason := claudeTransportAcceptsBodySize(candidate.Transport, len(bedrockBody)); !accepted {
+				lastErr = fmt.Errorf("%w: %s", errClaudeTransportIncompatible, reason)
+				excluded[account.ID] = true
+				continue
+			}
 			if bErr := h.invokeBedrockStream(w, flusher, forwardParams{
-				account: account, body: rawBody, endpoint: "anthropic", streaming: true,
-				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				selection: selection, account: account, body: bedrockBody, endpoint: "anthropic", streaming: true,
+				model: model, providerModelID: providerModelID, apiKeyID: apiKeyID, forwarded: forwarded,
+				semanticHeaders: semanticHeaders,
+				requestContext:  requestContext,
 			}); bErr != nil {
 				lastErr = bErr
+				if !h.pool.IsSelectionCurrent(*selection) {
+					continue
+				}
 				excluded[account.ID] = true
 				// A throttle-cooldown skip is advisory (per-model, short); don't
 				// escalate it into an account-wide failure/cooldown.
 				if !errors.Is(bErr, errBedrockThrottled) {
-					h.handleAccountFailure(account, bErr)
+					h.handleAccountFailureForSelection(*selection, bErr)
 				}
 				continue
 			}
 			return
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
+		cacheUsage := h.promptCache.Compute(promptCacheAccountKey(account), cacheProfile)
 		messageStartUsage = cacheUsage
 
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
-		var toolUses []KiroToolUse
-		var upstreamStopReason string
+		var toolUseCount int
+		var toolTokenCount int
 		var nextContentIndex int
-		var rawContentBuilder strings.Builder
-		var rawThinkingBuilder strings.Builder
+		var contentTokenCounter approximateTokenCounter
+		var thinkingTokenCounter approximateTokenCounter
+		var activeThinkingAccumulator *kiroThinkingSignatureAccumulator
+		var activeThinkingSignatureSent bool
 		activeBlockIndex := -1
 		activeBlockType := ""
 
@@ -1470,6 +2197,31 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			if activeBlockIndex < 0 {
 				return
 			}
+
+			if activeBlockType == "thinking" {
+				// If Kiro emitted no provider signature for this block, keep the
+				// proxy-owned signature as a configurable compatibility fallback.
+				if !activeThinkingSignatureSent {
+					signature, synthetic :=
+						activeThinkingAccumulator.Resolve("")
+					if signature != "" {
+						h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+							"type":  "content_block_delta",
+							"index": activeBlockIndex,
+							"delta": map[string]string{
+								"type":      "signature_delta",
+								"signature": signature,
+							},
+						})
+					}
+					if synthetic && diagnostics.Reasoning() {
+						logger.Warnf("[ClaudeThinkingSignatureFallback] model=%s stream=true mode=%s", model, configuredSyntheticThinkingSignatureMode())
+					}
+				}
+				activeThinkingAccumulator = nil
+				activeThinkingSignatureSent = false
+			}
+
 			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
 				"index": activeBlockIndex,
@@ -1489,6 +2241,11 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			nextContentIndex++
 
 			if blockType == "thinking" {
+				if activeThinkingAccumulator == nil {
+					activeThinkingAccumulator =
+						newKiroThinkingSignatureAccumulator(model)
+				}
+				activeThinkingSignatureSent = false
 				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
@@ -1524,6 +2281,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				if text == "" {
 					return
 				}
+				contentTokenCounter.Add(text)
 				startContentBlock("text")
 				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
@@ -1535,6 +2293,19 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 
 			if !thinking {
 				return
+			}
+			if text != "" {
+				thinkingTokenCounter.Add(text)
+			}
+
+			if thinkingFormat != "think" && thinkingFormat != "reasoning_content" {
+				if thinkingState == 1 {
+					activeThinkingAccumulator =
+						newKiroThinkingSignatureAccumulator(model)
+				}
+				if text != "" && activeThinkingAccumulator != nil {
+					activeThinkingAccumulator.WriteString(text)
+				}
 			}
 
 			switch thinkingFormat {
@@ -1707,26 +2478,97 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			}
 		}
 
+		var upstreamStopReason string
+		var stopController *claudeKiroStopController
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
 				}
-				if isThinking {
-					rawThinkingBuilder.WriteString(text)
-				} else {
-					rawContentBuilder.WriteString(text)
-				}
 				processClaudeText(text, isThinking, false)
+			},
+			OnReasoningSignature: func(signature string) {
+				if diagnostics.Reasoning() && signature != "" {
+					logger.Infof(
+						"[ClaudeThinkingSignatureOut] model=%s stream=true len=%d hash=%s",
+						model,
+						len(signature),
+						shortThinkingSignatureHash(signature),
+					)
+				}
+				if !thinking || signature == "" {
+					return
+				}
+				// The compatibility text formats intentionally do not expose native
+				// Anthropic thinking blocks, so there is nowhere valid to attach a
+				// signature_delta in those modes.
+				if thinkingFormat == "think" || thinkingFormat == "reasoning_content" {
+					return
+				}
+				if !allowReasoningSource(&thinkingSource) {
+					return
+				}
+				// Kiro does not serialize provider-signed thinking state back into its
+				// assistant history. Expose a proxy-owned provenance marker instead so
+				// the next tool-result turn stays on the Kiro transport.
+				signature, _ = resolveKiroThinkingSignature(model, "", signature)
+
+				// For summarized display, this reuses the already-open thinking block.
+				// For omitted display, it creates an empty thinking block first.
+				startContentBlock("thinking")
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": activeBlockIndex,
+					"delta": map[string]string{
+						"type":      "signature_delta",
+						"signature": signature,
+					},
+				})
+				activeThinkingSignatureSent = true
+				closeActiveBlock()
+				eventThinkingOpen = false
+				thinkingStarted = false
+			},
+			OnReasoningRedacted: func(data string) {
+				if diagnostics.Reasoning() && data != "" {
+					logger.Infof(
+						"[ClaudeThinkingRedactedOut] model=%s stream=true len=%d hash=%s",
+						model,
+						len(data),
+						shortThinkingSignatureHash(data),
+					)
+				}
+				if !thinking || data == "" {
+					return
+				}
+				if thinkingFormat == "think" || thinkingFormat == "reasoning_content" {
+					return
+				}
+				if !allowReasoningSource(&thinkingSource) {
+					return
+				}
+
+				ensureMessageStart()
+				closeActiveBlock()
+				idx := nextContentIndex
+				nextContentIndex++
+				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+					"type":  "content_block_start",
+					"index": idx,
+					"content_block": map[string]string{
+						"type": "redacted_thinking",
+						"data": data,
+					},
+				})
+				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": idx,
+				})
 			},
 			OnToolUse: func(tu KiroToolUse) {
 				processClaudeText("", false, true)
-				rawContentBuilder.WriteString(tu.Name)
-				if b, err := json.Marshal(tu.Input); err == nil {
-					rawContentBuilder.Write(b)
-				}
-
-				toolUses = append(toolUses, tu)
+				toolUseCount++
+				toolTokenCount += estimateApproxTokens(tu.Name)
 				ensureMessageStart()
 				closeActiveBlock()
 
@@ -1745,6 +2587,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				})
 
 				inputJSON, _ := json.Marshal(tu.Input)
+				toolTokenCount += estimateJSONTokens(tu.Input)
 				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": idx,
@@ -1759,6 +2602,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 					"index": idx,
 				})
 			},
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
 				outputTokens = outTok
@@ -1769,49 +2613,53 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
-			OnStopReason: func(reason string) {
-				upstreamStopReason = reason
-			},
+		}
+		if guardWriter, ok := w.(*completionGuardStreamingWriter); ok {
+			callback.ReserveRetained = func(size int) error {
+				if err := guardWriter.reserveBufferedBytes(size); err != nil {
+					guardWriter.setProtocolViolation("response_too_large", err)
+					return err
+				}
+				return nil
+			}
+			callback.ReleaseRetained = guardWriter.releaseBufferedBytes
+			callback.Err = func() error {
+				if guardWriter.protocolErr != nil {
+					return guardWriter.protocolErr
+				}
+				return guardWriter.writeErr
+			}
 		}
 
-		measure := func() (int, int, string, bool) {
-			return rawContentBuilder.Len(), len(toolUses), upstreamStopReason, rawThinkingBuilder.Len() > 0
+		if payload == nil {
+			lastErr = fmt.Errorf("%w: Kiro candidate selected without a Kiro payload", errClaudeTransportIncompatible)
+			break
 		}
-
-		// A same-account retry only happens while nothing has been flushed, so
-		// SSE block indices are still at their initial values and need no
-		// rollback. What must be cleared is every accumulator plus the thinking
-		// tag parser state: processClaudeText buffers up to 50 runes before
-		// flushing, so a short truncated attempt can leave a partial tag behind
-		// that would otherwise be prefixed onto the retry's first chunk.
-		reset := func() {
-			rawContentBuilder.Reset()
-			rawThinkingBuilder.Reset()
-			toolUses = nil
-			inputTokens = 0
-			outputTokens = 0
-			credits = 0
-			realInputTokens = 0
-			upstreamStopReason = ""
-			textBuffer = ""
-			inThinkingBlock = false
-			dropTagThinking = false
-			thinkingSource = thinkingSourceUnknown
-			thinkingStarted = false
-			eventThinkingOpen = false
+		payload.AdditionalModelRequestFields = candidate.KiroAdditionalModelRequestFields
+		if diagnostics.Reasoning() {
+			logger.Infof(
+				"[KiroCandidateAdapter] account=%s providerModel=%s registry=%d fields=%s",
+				account.ID,
+				candidate.ProviderModelID,
+				candidate.RegistryVersion,
+				reasoningFieldsJSON(candidate.KiroAdditionalModelRequestFields),
+			)
 		}
-
-		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset,
-			func() bool { return !messageStarted })
+		stopController = applyClaudeStopSequencesToKiroCallback(callback, routing.Requirements.StopSequences)
+		err := CallKiroAPIContext(requestContext, account, payload, callback)
 		if err != nil {
-			if ctx.Err() != nil {
+			if requestContext != nil && requestContext.Err() != nil {
 				return
 			}
 			lastErr = err
-			excluded[account.ID] = true
-			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+			if errors.Is(err, errCompletionGuardBufferLimit) {
+				return
 			}
+			if !h.pool.IsSelectionCurrent(*selection) && !messageStarted {
+				continue
+			}
+			excluded[account.ID] = true
+			h.handleAccountFailureForSelection(*selection, err)
 			if !messageStarted {
 				continue
 			}
@@ -1822,6 +2670,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			})
 			return
 		}
+		stopController.Finish()
 
 		processClaudeText("", false, true)
 		if eventThinkingOpen {
@@ -1840,24 +2689,24 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		if cacheProfile != nil && realInputTokens > 0 {
 			cacheUsage = cacheUsage.splitAgainstTotal(cacheProfile.TotalInputTokens, inputTokens)
 		}
-		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
-		thinkingOutput := rawThinkingBuilder.String()
-		if thinking && thinkingOutput == "" && extractedReasoning != "" {
-			thinkingOutput = extractedReasoning
+		outputTokens = contentTokenCounter.Tokens() + toolTokenCount
+		if thinking {
+			outputTokens += thinkingTokenCounter.Tokens()
 		}
-		if !thinking {
-			thinkingOutput = ""
-		}
-		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
+		h.pool.RecordSuccessForSelection(*selection)
+		h.pool.RecordLatencyForSelection(*selection, float64(time.Since(reqStart).Milliseconds()))
+		h.pool.UpdateStatsForSelection(*selection, inputTokens+outputTokens, credits)
+		h.promptCache.Update(promptCacheAccountKey(account), cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		stopReason := mapClaudeStopReason(upstreamStopReason, len(toolUses))
+		var stopSequence interface{}
+		stopReason := resolveClaudeHandlerStopReason(upstreamStopReason, toolUseCount)
+		if matchedStop, ok := stopController.Matched(); ok {
+			stopReason = "stop_sequence"
+			stopSequence = matchedStop
+		}
 
 		if diagnostics.Stream() {
 			logger.Infof(
@@ -1865,8 +2714,8 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				model,
 				account.Email,
 				stopReason,
-				len(toolUses),
-				len([]rune(outputContent)),
+				toolUseCount,
+				contentTokenCounter.runes,
 				inputTokens,
 				outputTokens,
 				time.Since(reqStart).Milliseconds(),
@@ -1877,7 +2726,8 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
-				"stop_reason": stopReason,
+				"stop_reason":   stopReason,
+				"stop_sequence": stopSequence,
 			},
 			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 		})
@@ -1893,6 +2743,39 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	var transportErr *directAnthropicTransportError
+	if errors.As(lastErr, &transportErr) {
+		h.recordFailureWithDetails("claude", model, "", apiKeyID, transportErr)
+		h.sendClaudeError(w, http.StatusBadGateway, "api_error", "Direct Anthropic upstream transport failed")
+		return
+	}
+
+	var directErr *directAnthropicResponseError
+	if errors.As(lastErr, &directErr) {
+		h.recordFailureWithDetails("claude", model, "", apiKeyID, directErr)
+		writeDirectAnthropicResponseError(w, directErr)
+		return
+	}
+
+	if errors.Is(lastErr, errClaudeTransportIncompatible) {
+		h.sendClaudeErrorWithDetailCode(
+			w,
+			http.StatusBadRequest,
+			"invalid_request_error",
+			lastErr.Error(),
+			"unsupported_transport_feature",
+		)
+		return
+	}
+	if errors.Is(lastErr, errClaudeTransportUnavailable) {
+		h.sendClaudeError(
+			w,
+			http.StatusServiceUnavailable,
+			"claude_transport_unavailable",
+			lastErr.Error(),
+		)
+		return
+	}
 	h.recordFailureWithDetails("claude", model, "", apiKeyID, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
@@ -2056,79 +2939,222 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, rawBody []byte, forwarded bool, semanticHeaders http.Header, requestContext context.Context) {
+	routing, routingErr := resolveClaudeRoutingContext(
+		requestContext,
+		rawBody,
+		semanticHeaders,
+		model,
+	)
+	if routingErr != nil {
+		errorType := "invalid_request_error"
+		var validationErr *claudeTransportValidationError
+		if errors.As(routingErr, &validationErr) && validationErr.Code != "" {
+			errorType = validationErr.Code
+		}
+		h.sendClaudeError(w, http.StatusBadRequest, errorType, routingErr.Error())
+		return
+	}
+	semanticHeaders = routing.Semantic.Headers
+	rawBody = routing.Semantic.Body
+
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
-
+	var retainedBudget *completionGuardRetainedBudget
+	if provider, ok := w.(completionGuardRetainedBudgetProvider); ok {
+		retainedBudget = provider.completionGuardBudget()
+	}
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
-		if account == nil {
+		candidate, selectionErr := h.nextCompatibleClaudeCandidate(
+			routing.RequestedModel,
+			model,
+			excluded,
+			apiKeyID,
+			forwarded,
+			routing.Requirements,
+			rawBody,
+		)
+		if selectionErr != nil {
+			// Preserve the last concrete upstream/provider response. Selection
+			// exhaustion is less informative and must not replace a 401/403/429/5xx
+			// response that can still be returned to the client verbatim.
+			if lastErr == nil {
+				lastErr = selectionErr
+			}
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if candidate == nil || candidate.Selection == nil || candidate.Account == nil {
+			break
+		}
+		selection := candidate.Selection
+		account := candidate.Account
+		providerModelID := string(candidate.ProviderModelID)
+		if err := h.ensureValidTokenForSelection(selection); err != nil {
 			lastErr = err
+			if errors.Is(err, errStaleAccountSelection) {
+				continue
+			}
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleTokenValidationFailureForSelection(selection, err)
+			continue
+		}
+		if routing.Requirements.RequiresKiroWebSearchMCP && candidate.Transport == claudeTransportKiroNative {
+			webErr := h.handleSelectedKiroWebSearch(
+				requestContext, w, rawBody, model, estimatedInputTokens, apiKeyID, selection, account,
+			)
+			if webErr == nil {
+				return
+			}
+			if requestContext != nil && requestContext.Err() != nil {
+				return
+			}
+			lastErr = webErr
+			if errors.Is(webErr, errStaleAccountSelection) || !h.pool.IsSelectionCurrent(*selection) {
+				continue
+			}
+			excluded[account.ID] = true
+			h.handleAccountFailureForSelection(*selection, webErr)
 			continue
 		}
 		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
-		if account.IsCustomApi() {
+		if account.IsCustomApi() || claudeAccountIsDirectAnthropic(account) {
 			// Already forwarded once: don't add another hop, and don't penalize this
 			// healthy account (loop-guard is not a failure) — just skip it. The account
 			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
 			// real retry on an ineligible account.
-			if forwarded {
+			if forwarded && account.IsCustomApi() {
 				excluded[account.ID] = true
 				attempt--
 				continue
 			}
 			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
-				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
-				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				selection: selection, account: account, body: rawBody, endpoint: "anthropic", streaming: false,
+				model: model, providerModelID: providerModelID, apiKeyID: apiKeyID, forwarded: forwarded,
+				semanticHeaders: semanticHeaders,
+				requestContext:  requestContext,
 			}); fwdErr != nil {
+				if requestContext != nil && requestContext.Err() != nil {
+					return
+				}
 				lastErr = fwdErr
+				// The upstream result belongs to the lifecycle captured at dispatch.
+				// If that lifecycle was replaced while the request was in flight,
+				// retry selection without excluding or mutating the new account.
+				if !h.pool.IsSelectionCurrent(*selection) {
+					continue
+				}
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, fwdErr)
+
+				var transportErr *directAnthropicTransportError
+				if errors.As(fwdErr, &transportErr) {
+					h.setProviderCooldownForAccount(account, directAnthropicTransientCooldown)
+					continue
+				}
+
+				var directErr *directAnthropicResponseError
+				if errors.As(fwdErr, &directErr) {
+					if !directErr.Retryable {
+						h.recordFailureWithDetails("claude", model, account.ID, apiKeyID, directErr)
+						writeDirectAnthropicResponseError(w, directErr)
+						return
+					}
+					h.handleDirectAnthropicFailure(account, model, directErr)
+					continue
+				}
+
+				h.handleAccountFailureForSelection(*selection, fwdErr)
 				continue
 			}
 			return
 		}
 		// Native Bedrock non-streaming invoke (see streaming counterpart above).
 		if account.IsBedrock() {
+			bedrockBody, bodyErr := buildBedrockBodyWithSemanticHeaders(
+				rawBody,
+				semanticHeaders,
+			)
+			if bodyErr != nil {
+				lastErr = bodyErr
+				break
+			}
+			if accepted, reason := claudeTransportAcceptsBodySize(candidate.Transport, len(bedrockBody)); !accepted {
+				lastErr = fmt.Errorf("%w: %s", errClaudeTransportIncompatible, reason)
+				excluded[account.ID] = true
+				continue
+			}
 			if bErr := h.invokeBedrockNonStream(w, forwardParams{
-				account: account, body: rawBody, endpoint: "anthropic", streaming: false,
-				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				selection: selection, account: account, body: bedrockBody, endpoint: "anthropic", streaming: false,
+				model: model, providerModelID: providerModelID, apiKeyID: apiKeyID, forwarded: forwarded,
+				semanticHeaders: semanticHeaders,
+				requestContext:  requestContext,
 			}); bErr != nil {
 				lastErr = bErr
+				if !h.pool.IsSelectionCurrent(*selection) {
+					continue
+				}
 				excluded[account.ID] = true
 				if !errors.Is(bErr, errBedrockThrottled) {
-					h.handleAccountFailure(account, bErr)
+					h.handleAccountFailureForSelection(*selection, bErr)
 				}
 				continue
 			}
 			return
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
+		cacheUsage := h.promptCache.Compute(promptCacheAccountKey(account), cacheProfile)
 
-		var content string
-		var thinkingContent string
+		var reasoningSignature string
 		var toolUses []KiroToolUse
+		blockCollector := newClaudeNonStreamBlockCollector(
+			model,
+			thinkingOpts.OmitDisplay,
+			retainedBudget,
+		)
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
 		var upstreamStopReason string
+		var stopController *claudeKiroStopController
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
-				if isThinking {
-					thinkingContent += text
-				} else {
-					content += text
+				if isThinking && !thinking {
+					return
+				}
+				blockCollector.AppendText(text, isThinking)
+			},
+			OnReasoningSignature: func(signature string) {
+				if !thinking {
+					return
+				}
+				blockCollector.AppendSignature(signature)
+				reasoningSignature = signature
+				if diagnostics.Reasoning() && signature != "" {
+					logger.Infof(
+						"[ClaudeThinkingSignatureOut] model=%s stream=false len=%d hash=%s",
+						model,
+						len(signature),
+						shortThinkingSignatureHash(signature),
+					)
+				}
+			},
+			OnReasoningRedacted: func(data string) {
+				if thinking {
+					blockCollector.AppendRedacted(data)
+				}
+				if diagnostics.Reasoning() && data != "" {
+					logger.Infof(
+						"[ClaudeThinkingRedactedOut] model=%s stream=false len=%d hash=%s",
+						model,
+						len(data),
+						shortThinkingSignatureHash(data),
+					)
 				}
 			},
 			OnToolUse: func(tu KiroToolUse) {
-				toolUses = append(toolUses, tu)
+				if blockCollector.AppendToolUse(tu) {
+					toolUses = append(toolUses, tu)
+				}
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
@@ -2140,42 +3166,75 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
-			OnStopReason: func(reason string) {
-				upstreamStopReason = reason
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
+			CanRetry:     func() bool { return true },
+			ResetForRetry: func() {
+				blockCollector.Release()
+				blockCollector = newClaudeNonStreamBlockCollector(model, thinkingOpts.OmitDisplay, retainedBudget)
+				reasoningSignature = ""
+				toolUses = nil
+				inputTokens, outputTokens = 0, 0
+				credits = 0
+				realInputTokens = 0
+				upstreamStopReason = ""
+				if stopController != nil {
+					stopController.ResetForRetry()
+				}
 			},
+			Err: func() error { return blockCollector.Err() },
+		}
+		if retainedBudget != nil {
+			callback.ReserveRetained = func(size int) error {
+				if retainedBudget.reserve(size) {
+					return nil
+				}
+				return retainedBudget.Err()
+			}
+			callback.ReleaseRetained = retainedBudget.release
 		}
 
-		measure := func() (int, int, string, bool) {
-			return len(content), len(toolUses), upstreamStopReason, thinkingContent != ""
+		if payload == nil {
+			lastErr = fmt.Errorf("%w: Kiro candidate selected without a Kiro payload", errClaudeTransportIncompatible)
+			break
 		}
-
-		reset := func() {
-			content = ""
-			thinkingContent = ""
-			toolUses = nil
-			inputTokens = 0
-			outputTokens = 0
-			credits = 0
-			realInputTokens = 0
-			upstreamStopReason = ""
+		payload.AdditionalModelRequestFields = candidate.KiroAdditionalModelRequestFields
+		if diagnostics.Reasoning() {
+			logger.Infof(
+				"[KiroCandidateAdapter] account=%s providerModel=%s registry=%d fields=%s",
+				account.ID,
+				candidate.ProviderModelID,
+				candidate.RegistryVersion,
+				reasoningFieldsJSON(candidate.KiroAdditionalModelRequestFields),
+			)
 		}
-
-		// Fully buffered: nothing reaches the client until the response is
-		// encoded, so a retry can never duplicate output.
-		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
+		stopController = applyClaudeStopSequencesToKiroCallback(callback, routing.Requirements.StopSequences)
+		err := CallKiroAPIContext(requestContext, account, payload, callback)
 		if err != nil {
-			if ctx.Err() != nil {
+			blockCollector.Release()
+			if requestContext != nil && requestContext.Err() != nil {
 				return
 			}
 			lastErr = err
-			excluded[account.ID] = true
-			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+			if errors.Is(err, errCompletionGuardBufferLimit) {
+				break
 			}
+			if !h.pool.IsSelectionCurrent(*selection) {
+				continue
+			}
+			excluded[account.ID] = true
+			h.handleAccountFailureForSelection(*selection, err)
 			continue
 		}
+		stopController.Finish()
 
 		thinkingFormat := thinkingOpts.Format
+		content := blockCollector.Text()
+		thinkingContent := blockCollector.RawThinking()
+		if collectorErr := blockCollector.Err(); collectorErr != nil {
+			lastErr = collectorErr
+			blockCollector.Release()
+			break
+		}
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
 		rawThinkingContent := thinkingContent
 		if thinking && rawThinkingContent == "" && extractedReasoning != "" {
@@ -2199,14 +3258,14 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
+		h.pool.RecordSuccessForSelection(*selection)
+		h.pool.RecordLatencyForSelection(*selection, float64(time.Since(reqStart).Milliseconds()))
+		h.pool.UpdateStatsForSelection(*selection, inputTokens+outputTokens, credits)
+		h.promptCache.Update(promptCacheAccountKey(account), cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
-		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
+		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && (rawThinkingContent != "" || reasoningSignature != "")
 		if includeEmptyThinkingBlock {
 			responseThinkingContent = ""
 		}
@@ -2223,7 +3282,17 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, upstreamStopReason)
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		if thinkingOpts.Format == "thinking" && blockCollector.HasNativeReasoning() {
+			resp.Content = blockCollector.Blocks()
+		} else {
+			attachKiroThinkingSignature(resp, model, rawThinkingContent, reasoningSignature)
+		}
+		resp.StopReason = resolveClaudeHandlerStopReason(upstreamStopReason, len(toolUses))
+		if matchedStop, ok := stopController.Matched(); ok {
+			resp.StopReason = "stop_sequence"
+			resp.StopSequence = &matchedStop
+		}
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -2234,7 +3303,8 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			}
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
+		blockCollector.Release()
 		return
 	}
 
@@ -2243,21 +3313,90 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		return
 	}
 
+	var transportErr *directAnthropicTransportError
+	if errors.As(lastErr, &transportErr) {
+		h.recordFailureWithDetails("claude", model, "", apiKeyID, transportErr)
+		h.sendClaudeError(w, http.StatusBadGateway, "api_error", "Direct Anthropic upstream transport failed")
+		return
+	}
+
+	var directErr *directAnthropicResponseError
+	if errors.As(lastErr, &directErr) {
+		h.recordFailureWithDetails("claude", model, "", apiKeyID, directErr)
+		writeDirectAnthropicResponseError(w, directErr)
+		return
+	}
+
+	if errors.Is(lastErr, errClaudeTransportIncompatible) {
+		h.sendClaudeErrorWithDetailCode(
+			w,
+			http.StatusBadRequest,
+			"invalid_request_error",
+			lastErr.Error(),
+			"unsupported_transport_feature",
+		)
+		return
+	}
+	if errors.Is(lastErr, errClaudeTransportUnavailable) {
+		h.sendClaudeError(
+			w,
+			http.StatusServiceUnavailable,
+			"claude_transport_unavailable",
+			lastErr.Error(),
+		)
+		return
+	}
 	h.recordFailureWithDetails("claude", model, "", apiKeyID, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
+func (h *Handler) sendClaudeValidationError(
+	w http.ResponseWriter,
+	status int,
+	err *claudeTransportValidationError,
+) {
+	if err == nil {
+		h.sendClaudeError(w, status, "invalid_request_error", "Invalid Claude request")
+		return
+	}
+	h.sendClaudeErrorWithDetailCode(w, status, err.Code, err.Message, err.DetailCode)
+}
+
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
+	h.sendClaudeErrorWithDetailCode(w, status, errType, message, "")
+}
+
+func (h *Handler) sendClaudeErrorWithDetailCode(
+	w http.ResponseWriter,
+	status int,
+	errType,
+	message,
+	detailCode string,
+) {
+	w.Header().Del("Content-Length")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
+	errorBody := map[string]interface{}{
+		"type":    errType,
+		"message": message,
+	}
+	if strings.TrimSpace(detailCode) != "" {
+		errorBody["code"] = detailCode
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"type": "error",
-		"error": map[string]string{
-			"type":    errType,
-			"message": message,
-		},
+		"type":  "error",
+		"error": errorBody,
 	})
 }
+
+type openAIKiroPrepared struct {
+	Payload              *KiroPayload
+	Projection           openAIProjection
+	Thinking             bool
+	EstimatedInputTokens int
+}
+
+type openAIKiroPrepareFunc func() (*openAIKiroPrepared, error)
 
 // handleOpenAIChat OpenAI API 处理
 func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
@@ -2266,69 +3405,119 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to read request body")
+	body, ok := h.readLimitedJSONBody(w, r, requestBodyErrorOpenAI)
+	if !ok {
 		return
 	}
 
-	var req OpenAIRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	// Parse only the routing envelope eagerly. Transport-specific decoding,
+	// validation, and conversion are deliberately lazy so a transparent custom
+	// relay can receive the original OpenAI request without Kiro/Bedrock DTO
+	// semantics rejecting or mutating it first.
+	var envelope struct {
+		Model    string          `json:"model"`
+		Messages json.RawMessage `json:"messages"`
+		Stream   bool            `json:"stream"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
 		return
 	}
-	if msg := validateOpenAIRequestShape(&req); msg != "" {
-		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
+	var messages []json.RawMessage
+	if len(envelope.Messages) == 0 || json.Unmarshal(envelope.Messages, &messages) != nil || len(messages) == 0 {
+		h.sendOpenAIError(w, 400, "invalid_request_error", "messages must be a non-empty array")
 		return
 	}
 
-	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
+	actualModel, suffixThinking := ParseModelAndThinking(envelope.Model, thinkingCfg.Suffix)
 
-	actualModel, suffixThinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-
-	req.Model = actualModel
-
-	capability := h.reasoningCapabilityForModel(actualModel)
-
-	additionalFields, nativeRequested, buildErr := BuildOpenAIAdditionalModelRequestFields(&req, capability)
-	if buildErr != nil {
-		// See reasoningBuildErrorIsFatal on the Claude path above — same
-		// reasoning applies here: don't 400 a request the pool would have routed
-		// to Bedrock/custom_api just because it fails validation against a Kiro
-		// schema that has nothing to do with how it will actually be served.
-		if h.reasoningBuildErrorIsFatal() {
-			h.sendOpenAIError(w, 400, "invalid_request_error", buildErr.Error())
-			return
+	var prepared *openAIKiroPrepared
+	var prepareErr error
+	preparedOnce := false
+	prepareKiro := func() (*openAIKiroPrepared, error) {
+		if preparedOnce {
+			return prepared, prepareErr
 		}
-		logger.Warnf("[Reasoning] chat/completions: dropping unsupported reasoning request for model %s (no Kiro-capable account in pool): %v", actualModel, buildErr)
-		additionalFields = nil
-		nativeRequested = false
+		preparedOnce = true
+
+		var localReq OpenAIRequest
+		if err := json.Unmarshal(body, &localReq); err != nil {
+			prepareErr = fmt.Errorf("decode OpenAI request for Kiro: %w", err)
+			return nil, prepareErr
+		}
+		localReq.Model = actualModel
+		if msg := validateOpenAIRequestShape(&localReq); msg != "" {
+			prepareErr = errors.New(msg)
+			return nil, prepareErr
+		}
+
+		projection := analyzeOpenAIChatKiroProjection(body)
+		if !projection.Supported() {
+			prepareErr = errors.New(projection.Reason())
+			return nil, prepareErr
+		}
+
+		capability := h.reasoningCapabilityForModel(actualModel)
+		analyzeOpenAIKiroReasoningCapabilityProjection(&projection, &localReq, capability)
+		if !projection.Supported() {
+			prepareErr = errors.New(projection.Reason())
+			return nil, prepareErr
+		}
+		additionalFields, nativeRequested, err := BuildOpenAIAdditionalModelRequestFields(&localReq, capability)
+		if err != nil {
+			prepareErr = err
+			return nil, prepareErr
+		}
+		thinking := suffixThinking || nativeRequested
+		useLegacyThinkingPrompt := thinking && len(additionalFields) == 0
+		if useLegacyThinkingPrompt {
+			projection.emulate("reasoning", "legacy_thinking_prompt_emulation", "Kiro emulates requested reasoning through an injected priming prompt")
+		}
+		payload, runtimeProjection := projectOpenAIToKiro(&localReq, useLegacyThinkingPrompt)
+		projection.merge(runtimeProjection)
+		if !projection.Supported() {
+			prepareErr = errors.New(projection.Reason())
+			return nil, prepareErr
+		}
+		payload.AdditionalModelRequestFields = additionalFields
+		if !payloadFits(payload, maxPayloadTokens(actualModel)) {
+			prepareErr = errors.New("unsupported_transport_semantics: Kiro projection would require history truncation")
+			return nil, prepareErr
+		}
+		prepared = &openAIKiroPrepared{
+			Payload:              payload,
+			Projection:           projection,
+			Thinking:             thinking,
+			EstimatedInputTokens: estimateOpenAIRequestInputTokens(&localReq),
+		}
+		return prepared, nil
 	}
-
-	thinking := suffixThinking || nativeRequested
-
-	useLegacyThinkingPrompt := thinking && len(additionalFields) == 0
-
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
-
-	kiroPayload := OpenAIToKiro(&req, useLegacyThinkingPrompt)
-
-	kiroPayload.AdditionalModelRequestFields = additionalFields
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	// forwarded marks a request that already passed through one Kiro-Go pool, so a
 	// custom_api account cannot add another hop (loop guard, see forwardToUpstream).
 	forwarded := r.Header.Get(forwardHeader) != ""
-	if req.Stream {
-		h.handleOpenAIStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, body, forwarded)
+	if envelope.Stream {
+		h.handleOpenAIStreamProjected(w, actualModel, apiKeyID, body, forwarded, r.Context(), prepareKiro)
 	} else {
-		h.handleOpenAINonStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, body, forwarded)
+		h.handleOpenAINonStreamProjected(w, actualModel, apiKeyID, body, forwarded, r.Context(), prepareKiro)
 	}
 }
 
-// handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool) {
+// handleOpenAIStream preserves the existing internal call contract used by
+// focused stream tests and any same-package callers. New HTTP routing uses the
+// projection-aware implementation below so payload creation remains lazy.
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool, requestContext context.Context) {
+	prepareKiro := func() (*openAIKiroPrepared, error) {
+		return &openAIKiroPrepared{Payload: payload, Thinking: thinking, EstimatedInputTokens: estimatedInputTokens}, nil
+	}
+	h.handleOpenAIStreamProjected(w, model, apiKeyID, rawBody, forwarded, requestContext, prepareKiro)
+}
+
+// handleOpenAIStreamProjected serves OpenAI streaming requests after choosing a
+// transport family and only materializes a Kiro payload for a Kiro candidate.
+func (h *Handler) handleOpenAIStreamProjected(w http.ResponseWriter, model, apiKeyID string, rawBody []byte, forwarded bool, requestContext context.Context, prepareKiro openAIKiroPrepareFunc) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2345,17 +3534,75 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	chatID := "chatcmpl-" + uuid.New().String()
 	excluded := make(map[string]bool)
 	var lastErr error
+	var preparationErr error
+	var incompatibility string
 	reqStart := time.Now()
+	requestedModel := stripRequestedModelThinkingSuffix(
+		requestedModelFromJSON(rawBody, model),
+		config.GetThinkingConfig().Suffix,
+	)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
-		if account == nil {
+		selection := h.pool.GetNextSelectionForModelWithApiKey(requestedModel, excluded, apiKeyID)
+		if selection == nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
+		account := &selection.Account
+		providerID, _, resolved := h.resolveCandidateProviderModel(account, requestedModel, model)
+		if !resolved {
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			attempt--
+			continue
+		}
+		providerModelID := string(providerID)
+
+		// Determine transport compatibility before token refresh/account mutation.
+		// Semantic incompatibility is a routing decision, not an account failure.
+		if account.IsBedrock() {
+			projection := analyzeOpenAIChatBedrockProjection(rawBody, bedrockSpecificToolChoiceSupported(account, providerModelID))
+			if !projection.Supported() {
+				incompatibility = projection.Reason()
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+		} else if claudeAccountIsDirectAnthropic(account) {
+			incompatibility = "direct Anthropic has no OpenAI Chat transport"
+			excluded[account.ID] = true
+			attempt--
+			continue
+		} else if account.IsCustomApi() {
+			if forwarded {
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+		}
+
+		var payload *KiroPayload
+		var thinking bool
+		var estimatedInputTokens int
+		if !account.IsBedrock() && !account.IsCustomApi() {
+			kiro, err := prepareKiro()
+			if err != nil {
+				preparationErr = err
+				incompatibility = err.Error()
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+			payload = kiro.Payload
+			thinking = kiro.Thinking
+			estimatedInputTokens = kiro.EstimatedInputTokens
+		}
+
+		if err := h.ensureValidTokenForSelection(selection); err != nil {
+			lastErr = err
+			if errors.Is(err, errStaleAccountSelection) {
+				continue
+			}
+			excluded[account.ID] = true
+			h.handleTokenValidationFailureForSelection(selection, err)
 			continue
 		}
 
@@ -2365,13 +3612,16 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		// as custom_api: success ends the request; a pre-stream error fails over.
 		if account.IsBedrock() {
 			if bErr := h.invokeBedrockOpenAIStream(w, flusher, forwardParams{
-				account: account, body: rawBody, endpoint: "openai", streaming: true,
-				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				selection: selection, account: account, body: rawBody, endpoint: "openai", streaming: true,
+				model: model, providerModelID: providerModelID, apiKeyID: apiKeyID, forwarded: forwarded,
 			}); bErr != nil {
 				lastErr = bErr
+				if !h.pool.IsSelectionCurrent(*selection) {
+					continue
+				}
 				excluded[account.ID] = true
 				if !errors.Is(bErr, errBedrockThrottled) {
-					h.handleAccountFailure(account, bErr)
+					h.handleAccountFailureForSelection(*selection, bErr)
 				}
 				continue
 			}
@@ -2383,24 +3633,26 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			// healthy account (loop-guard is not a failure) — just skip it. The account
 			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
 			// real retry on an ineligible account.
-			if forwarded {
-				excluded[account.ID] = true
-				attempt--
-				continue
-			}
 			if fwdErr := h.forwardToUpstream(w, flusher, forwardParams{
-				account: account, body: rawBody, endpoint: "openai", streaming: true,
-				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				selection: selection, account: account, body: rawBody, endpoint: "openai", streaming: true,
+				model: model, providerModelID: providerModelID, apiKeyID: apiKeyID, forwarded: forwarded,
+				requestContext: requestContext,
 			}); fwdErr != nil {
+				if requestContext != nil &&
+					requestContext.Err() != nil {
+					return
+				}
 				lastErr = fwdErr
+				if !h.pool.IsSelectionCurrent(*selection) {
+					continue
+				}
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, fwdErr)
+				h.handleAccountFailureForSelection(*selection, fwdErr)
 				continue
 			}
 			return
 		}
 
-		var upstreamStopReason string
 		var toolCalls []ToolCall
 		var toolCallIndex int
 		var inputTokens, outputTokens int
@@ -2417,6 +3669,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		responseStarted := false
 
 		sendStreamError := func(err error) {
+			if err == nil {
+				return
+			}
 			data, _ := json.Marshal(map[string]interface{}{
 				"error": map[string]string{
 					"message": err.Error(),
@@ -2631,6 +3886,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			}
 		}
 
+		var upstreamStopReason string
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
@@ -2681,9 +3937,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				flusher.Flush()
 				responseStarted = true
 			},
-			OnStopReason: func(reason string) {
-				upstreamStopReason = reason
-			},
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
 				outputTokens = outTok
@@ -2696,56 +3950,24 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			},
 		}
 
-		measure := func() (int, int, string, bool) {
-			return rawContentBuilder.Len(), len(toolCalls), upstreamStopReason, rawReasoningBuilder.Len() > 0
-		}
-
-		// Retries only happen before anything is flushed, so chunk indices stay
-		// valid. The thinking tag parser state must be cleared too: processText
-		// holds back up to 50 runes, so a short truncated attempt would
-		// otherwise prepend its leftovers to the retry's first chunk.
-		reset := func() {
-			rawContentBuilder.Reset()
-			rawReasoningBuilder.Reset()
-			toolCalls = nil
-			toolCallIndex = 0
-			inputTokens = 0
-			outputTokens = 0
-			credits = 0
-			realInputTokens = 0
-			upstreamStopReason = ""
-			textBuffer = ""
-			inThinkingBlock = false
-			dropTagThinking = false
-			thinkingSource = thinkingSourceUnknown
-			thinkingStarted = false
-			eventThinkingOpen = false
-		}
-
-		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset,
-			func() bool { return !responseStarted })
+		err := CallKiroAPIContext(requestContext, account, payload, callback)
 		if err != nil {
-			if ctx.Err() != nil {
+			if requestContext != nil && requestContext.Err() != nil {
 				return
 			}
 			lastErr = err
-			excluded[account.ID] = true
-			// Integrity failures are upstream hiccups, not account faults.
-			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+			if !h.pool.IsSelectionCurrent(*selection) && !responseStarted {
+				continue
 			}
+			excluded[account.ID] = true
+			h.handleAccountFailureForSelection(*selection, err)
 			if !responseStarted {
 				continue
 			}
-			// Stream already started: cannot retry or send a JSON error. Surface the
-			// upstream message with an error frame (upstream behaviour), THEN a
-			// finish_reason:"error" chunk so OpenAI-shaped clients that only watch
-			// chat.completion.chunk get a terminal finish_reason and stop waiting.
-			// Never emit [DONE] here: upstream f8f6071 ("detect empty and truncated
-			// upstream streams instead of faking success") added detection precisely
-			// so a broken stream is never reported as a normal completion, and [DONE]
-			// is exactly that "the turn ended cleanly" signal — finish_reason:"error"
-			// is not, it is an explicit error terminator.
+			// Stream already started: replay and a normal completion sentinel are both
+			// unsafe. Emit an explicit SSE error frame for clients that understand the
+			// OpenAI error envelope, followed by finish_reason:error for chunk-only
+			// consumers. Never emit [DONE] on this failure path.
 			sendStreamError(err)
 			errChunk := map[string]interface{}{
 				"id":      chatID,
@@ -2760,6 +3982,8 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			}
 			errData, _ := json.Marshal(errChunk)
 			fmt.Fprintf(w, "data: %s\n\n", string(errData))
+			// Do not send [DONE] after an integrity/transport failure. [DONE] is the
+			// normal terminal sentinel and would turn a truncated stream into apparent success.
 			flusher.Flush()
 			h.recordFailureWithDetails("openai", model, account.ID, apiKeyID, err)
 			return
@@ -2790,14 +4014,12 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		}
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.RecordSuccessForSelection(*selection)
+		h.pool.RecordLatencyForSelection(*selection, float64(time.Since(reqStart).Milliseconds()))
+		h.pool.UpdateStatsForSelection(*selection, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		// finish_reason now mirrors the real upstream stop reason (max_tokens,
-		// stop_sequence, ...) instead of always reporting "stop"; tool calls still win.
-		finishReason := mapOpenAIFinishReason(upstreamStopReason, len(toolCalls))
+		finishReason := resolveOpenAIHandlerFinishReason(upstreamStopReason, len(toolCalls))
 
 		chunk := map[string]interface{}{
 			"id":      chatID,
@@ -2823,29 +4045,103 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	}
 
 	if lastErr == nil {
+		if preparationErr != nil || incompatibility != "" {
+			message := incompatibility
+			if message == "" && preparationErr != nil {
+				message = preparationErr.Error()
+			}
+			h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "No compatible OpenAI transport is available: "+message)
+			return
+		}
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
 	h.recordFailureWithDetails("openai", model, "", apiKeyID, lastErr)
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", lastErr.Error())
 }
 
-// handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool) {
+// handleOpenAINonStream preserves the existing same-package call contract.
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, rawBody []byte, forwarded bool, requestContext context.Context) {
+	prepareKiro := func() (*openAIKiroPrepared, error) {
+		return &openAIKiroPrepared{Payload: payload, Thinking: thinking, EstimatedInputTokens: estimatedInputTokens}, nil
+	}
+	h.handleOpenAINonStreamProjected(w, model, apiKeyID, rawBody, forwarded, requestContext, prepareKiro)
+}
+
+// handleOpenAINonStreamProjected is the projection-aware non-stream dispatcher.
+func (h *Handler) handleOpenAINonStreamProjected(w http.ResponseWriter, model, apiKeyID string, rawBody []byte, forwarded bool, requestContext context.Context, prepareKiro openAIKiroPrepareFunc) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var preparationErr error
+	var incompatibility string
 	reqStart := time.Now()
+	requestedModel := stripRequestedModelThinkingSuffix(
+		requestedModelFromJSON(rawBody, model),
+		config.GetThinkingConfig().Suffix,
+	)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
-		if account == nil {
+		selection := h.pool.GetNextSelectionForModelWithApiKey(requestedModel, excluded, apiKeyID)
+		if selection == nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
+		account := &selection.Account
+		providerID, _, resolved := h.resolveCandidateProviderModel(account, requestedModel, model)
+		if !resolved {
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			attempt--
+			continue
+		}
+		providerModelID := string(providerID)
+
+		// Determine transport compatibility before token refresh/account mutation.
+		// Semantic incompatibility is a routing decision, not an account failure.
+		if account.IsBedrock() {
+			projection := analyzeOpenAIChatBedrockProjection(rawBody, bedrockSpecificToolChoiceSupported(account, providerModelID))
+			if !projection.Supported() {
+				incompatibility = projection.Reason()
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+		} else if claudeAccountIsDirectAnthropic(account) {
+			incompatibility = "direct Anthropic has no OpenAI Chat transport"
+			excluded[account.ID] = true
+			attempt--
+			continue
+		} else if account.IsCustomApi() {
+			if forwarded {
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+		}
+
+		var payload *KiroPayload
+		var thinking bool
+		var estimatedInputTokens int
+		if !account.IsBedrock() && !account.IsCustomApi() {
+			kiro, err := prepareKiro()
+			if err != nil {
+				preparationErr = err
+				incompatibility = err.Error()
+				excluded[account.ID] = true
+				attempt--
+				continue
+			}
+			payload = kiro.Payload
+			thinking = kiro.Thinking
+			estimatedInputTokens = kiro.EstimatedInputTokens
+		}
+
+		if err := h.ensureValidTokenForSelection(selection); err != nil {
+			lastErr = err
+			if errors.Is(err, errStaleAccountSelection) {
+				continue
+			}
+			excluded[account.ID] = true
+			h.handleTokenValidationFailureForSelection(selection, err)
 			continue
 		}
 
@@ -2854,36 +4150,39 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		// chat.completion. Success ends the request; a pre-reply error fails over.
 		if account.IsBedrock() {
 			if bErr := h.invokeBedrockOpenAINonStream(w, forwardParams{
-				account: account, body: rawBody, endpoint: "openai", streaming: false,
-				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				selection: selection, account: account, body: rawBody, endpoint: "openai", streaming: false,
+				model: model, providerModelID: providerModelID, apiKeyID: apiKeyID, forwarded: forwarded,
 			}); bErr != nil {
 				lastErr = bErr
+				if !h.pool.IsSelectionCurrent(*selection) {
+					continue
+				}
 				excluded[account.ID] = true
 				if !errors.Is(bErr, errBedrockThrottled) {
-					h.handleAccountFailure(account, bErr)
+					h.handleAccountFailureForSelection(*selection, bErr)
 				}
 				continue
 			}
 			return
 		}
 		// Custom API accounts proxy to another Kiro-Go pool (see handleClaudeStream).
+		// The forwarded loop guard was already applied before token validation.
 		if account.IsCustomApi() {
-			// Already forwarded once: don't add another hop, and don't penalize this
-			// healthy account (loop-guard is not a failure) — just skip it. The account
-			// is excluded, so `attempt--` cannot loop forever; it only avoids spending a
-			// real retry on an ineligible account.
-			if forwarded {
-				excluded[account.ID] = true
-				attempt--
-				continue
-			}
 			if fwdErr := h.forwardToUpstream(w, nil, forwardParams{
-				account: account, body: rawBody, endpoint: "openai", streaming: false,
-				model: model, apiKeyID: apiKeyID, forwarded: forwarded,
+				selection: selection, account: account, body: rawBody, endpoint: "openai", streaming: false,
+				model: model, providerModelID: providerModelID, apiKeyID: apiKeyID, forwarded: forwarded,
+				requestContext: requestContext,
 			}); fwdErr != nil {
+				if requestContext != nil &&
+					requestContext.Err() != nil {
+					return
+				}
 				lastErr = fwdErr
+				if !h.pool.IsSelectionCurrent(*selection) {
+					continue
+				}
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, fwdErr)
+				h.handleAccountFailureForSelection(*selection, fwdErr)
 				continue
 			}
 			return
@@ -2911,39 +4210,30 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
-			OnStopReason: func(reason string) {
-				upstreamStopReason = reason
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
+			CanRetry:     func() bool { return true },
+			ResetForRetry: func() {
+				content = ""
+				reasoningContent = ""
+				toolUses = nil
+				inputTokens, outputTokens = 0, 0
+				credits = 0
+				realInputTokens = 0
+				upstreamStopReason = ""
 			},
 		}
 
-		measure := func() (int, int, string, bool) {
-			return len(content), len(toolUses), upstreamStopReason, reasoningContent != ""
-		}
-
-		reset := func() {
-			content = ""
-			reasoningContent = ""
-			toolUses = nil
-			inputTokens = 0
-			outputTokens = 0
-			credits = 0
-			realInputTokens = 0
-			upstreamStopReason = ""
-		}
-
-		// Fully buffered: nothing reaches the client until the response is
-		// encoded, so a retry can never duplicate output.
-		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
+		err := CallKiroAPIContext(requestContext, account, payload, callback)
 		if err != nil {
-			if ctx.Err() != nil {
+			if requestContext != nil && requestContext.Err() != nil {
 				return
 			}
 			lastErr = err
-			excluded[account.ID] = true
-			// Integrity failures are upstream hiccups, not account faults.
-			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+			if !h.pool.IsSelectionCurrent(*selection) {
+				continue
 			}
+			excluded[account.ID] = true
+			h.handleAccountFailureForSelection(*selection, err)
 			continue
 		}
 
@@ -2962,28 +4252,41 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordLatency(account.ID, float64(time.Since(reqStart).Milliseconds()))
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.RecordSuccessForSelection(*selection)
+		h.pool.RecordLatencyForSelection(*selection, float64(time.Since(reqStart).Milliseconds()))
+		h.pool.UpdateStatsForSelection(*selection, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, upstreamStopReason)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		if choices, ok := resp["choices"].([]map[string]interface{}); ok && len(choices) > 0 {
+			choices[0]["finish_reason"] = resolveOpenAIHandlerFinishReason(upstreamStopReason, len(toolUses))
+			resp["choices"] = choices
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
 
 	if lastErr == nil {
+		if preparationErr != nil || incompatibility != "" {
+			message := incompatibility
+			if message == "" && preparationErr != nil {
+				message = preparationErr.Error()
+			}
+			h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "No compatible OpenAI transport is available: "+message)
+			return
+		}
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 
 	h.recordFailureWithDetails("openai", model, "", apiKeyID, lastErr)
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	h.sendOpenAIError(w, http.StatusServiceUnavailable, "server_error", lastErr.Error())
 }
 
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
+	w.Header().Del("Content-Length")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2994,142 +4297,80 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 	})
 }
 
-// refreshAccountToken serializes the complete refresh-token rotation lifecycle:
-// load the latest persisted credential, refresh it, persist any rotation, and
-// only then publish it to the runtime pool. A single lock is intentionally used
-// across accounts because refreshes are rare and this keeps every refresh entry
-// point consistent.
-func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool, error) {
-	if account == nil || strings.TrimSpace(account.ID) == "" {
-		return false, fmt.Errorf("account is required for token refresh")
-	}
-	// Non-Kiro account types carry static credentials and have no OAuth lifecycle:
-	// custom_api holds an upstream bearer, Bedrock signs every request with a static
-	// IAM key. Running them through auth.RefreshToken would 403 and get the account
-	// auto-banned, so this Kiro-facing path stops short for them (see CLAUDE.md).
-	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") || account.IsBedrock() {
-		return false, nil
-	}
+type unsupportedAccountKindError struct {
+	AuthMethod string
+}
 
-	h.tokenRefreshMu.Lock()
-	defer h.tokenRefreshMu.Unlock()
+func (e *unsupportedAccountKindError) Error() string {
+	if e == nil {
+		return "unsupported account kind"
+	}
+	return fmt.Sprintf("unsupported account auth method %q", e.AuthMethod)
+}
 
-	var latest *config.Account
-	accounts := config.GetAccounts()
-	for i := range accounts {
-		if accounts[i].ID == account.ID {
-			latest = &accounts[i]
-			break
-		}
+// handleTokenValidationFailureForSelection applies request-derived failure state
+// only to the lifecycle that actually attempted the refresh.
+func (h *Handler) handleTokenValidationFailureForSelection(selection *pool.AccountSelection, err error) {
+	if selection == nil || err == nil || errors.Is(err, errStaleAccountSelection) {
+		return
 	}
-	if latest == nil {
-		return false, fmt.Errorf("account %s no longer exists", account.ID)
+	var kindErr *unsupportedAccountKindError
+	if errors.As(err, &kindErr) {
+		logger.Warnf("[AccountKind] skipping account=%s: %v", selection.Account.ID, err)
+		return
 	}
-	working := *latest
+	h.handleAccountFailureForSelection(*selection, err)
+}
 
-	// API Key credentials never expire and cannot be OAuth-refreshed.
-	if config.IsAPIKeyAccount(&working) {
-		token := strings.TrimSpace(working.KiroApiKey)
-		if token == "" {
-			token = strings.TrimSpace(working.AccessToken)
-		}
-		if token == "" {
-			return false, fmt.Errorf("account %s has no kiroApiKey", working.ID)
-		}
-		h.pool.UpdateCredentialState(
-			account,
-			working.ID,
-			token,
-			"",
-			0,
-			"",
-		)
-		return false, nil
+// ensureValidTokenForSelection refreshes a token through a generation-fenced
+// compare-and-swap. It never re-reads credentials from a newer lifecycle with
+// the same textual ID and never publishes a stale refresh result into it.
+func (h *Handler) ensureValidTokenForSelection(selection *pool.AccountSelection) error {
+	if selection == nil {
+		return errors.New("account selection is nil")
 	}
+	account := &selection.Account
+	if !account.HasKnownKind() {
+		return &unsupportedAccountKindError{AuthMethod: account.AuthMethod}
+	}
+	if !account.SupportsKiroTokenRefresh() {
+		return nil
+	}
+	if selection.LifecycleGeneration != 0 &&
+		account.DispatchGeneration != selection.LifecycleGeneration {
+		return errStaleAccountSelection
+	}
+	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
+		return nil
+	}
+	_, err := h.refreshAccountToken(account, false)
+	return err
+}
 
-	if !force && (working.ExpiresAt == 0 || time.Now().Unix() < working.ExpiresAt-tokenRefreshSkewSeconds) {
-		h.pool.UpdateCredentialState(
-			account,
-			working.ID,
-			working.AccessToken,
-			working.RefreshToken,
-			working.ExpiresAt,
-			working.ProfileArn,
-		)
-		return false, nil
+func (h *Handler) handleTokenValidationFailure(account *config.Account, err error) {
+	var kindErr *unsupportedAccountKindError
+	if errors.As(err, &kindErr) {
+		logger.Warnf("[AccountKind] skipping account=%s: %v", account.ID, err)
+		return
 	}
-	if strings.TrimSpace(working.RefreshToken) == "" {
-		return false, fmt.Errorf("account %s has no refresh token", working.ID)
-	}
-
-	// Propagate force into the auth layer too: auth.RefreshToken's own
-	// double-checked lock treats an account that now LOOKS fresh (because a
-	// concurrent caller's refresh already rotated it while we waited on
-	// tokenRefreshMu above) as "nothing to do" and returns the cached token
-	// without a round-trip. That collapses two callers into one refresh when
-	// force=false is desired (refresh-storm dedup), but a caller that
-	// explicitly asked to force a refresh (e.g. two racing external-IdP
-	// rotations that must each observe the other's rotated refresh token)
-	// needs its own IdP round-trip even though the token now looks valid.
-	// auth.RefreshTokenForce keeps the per-account lock (still serializes
-	// against concurrent rotation) but always performs the request.
-	refreshFn := auth.RefreshToken
-	if force {
-		refreshFn = auth.RefreshTokenForce
-	}
-	accessToken, refreshToken, expiresAt, profileArn, err := refreshFn(&working)
-	if err != nil {
-		return false, err
-	}
-	if refreshToken == "" {
-		refreshToken = working.RefreshToken
-	}
-
-	if err := config.UpdateAccountCredentialState(
-		working.ID,
-		accessToken,
-		refreshToken,
-		expiresAt,
-		profileArn,
-	); err != nil {
-		return false, fmt.Errorf("persist refreshed token for account %s: %w", working.ID, err)
-	}
-
-	// Do not expose a rotated credential through the pool until persistence has
-	// succeeded. This ordering prevents a later refresh from reading stale state.
-	h.pool.UpdateCredentialState(
-		account,
-		working.ID,
-		accessToken,
-		refreshToken,
-		expiresAt,
-		profileArn,
-	)
-	return true, nil
+	h.handleAccountFailure(account, err)
 }
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
-	// Custom API accounts carry a static upstream bearer (KiroApiKey); there is no
-	// OAuth token to refresh and no expiry to honor.
-	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), "custom_api") {
-		return nil
+	if account == nil {
+		return errors.New("account is nil")
 	}
-	// Bedrock accounts authenticate each request with a static IAM access key via
-	// SigV4; there is no OAuth token to refresh and no expiry to honor.
-	if account.IsBedrock() {
-		return nil
+	if !account.HasKnownKind() {
+		return &unsupportedAccountKindError{AuthMethod: account.AuthMethod}
 	}
-	if config.IsAPIKeyAccount(account) {
-		if accountBearerToken(account) == "" {
-			return fmt.Errorf("account %s has no kiroApiKey", account.ID)
-		}
+	// Static provider credentials do not have a refreshable Kiro OAuth token.
+	if !account.SupportsKiroTokenRefresh() {
 		return nil
 	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
-
 	_, err := h.refreshAccountToken(account, false)
 	return err
 }
@@ -3206,14 +4447,6 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartIamSso(w, r)
 	case path == "/auth/iam-sso/complete" && r.Method == "POST":
 		h.apiCompleteIamSso(w, r)
-	case path == "/auth/microsoft-sso/start" && r.Method == "POST":
-		h.apiStartMicrosoftSSO(w, r)
-	case path == "/auth/microsoft-sso/complete" && r.Method == "POST":
-		h.apiCompleteMicrosoftSSO(w, r)
-	case path == "/auth/microsoft-sso/select-profile" && r.Method == "POST":
-		h.apiSelectMicrosoftSSOProfile(w, r)
-	case path == "/auth/microsoft-sso/cancel" && r.Method == "POST":
-		h.apiCancelMicrosoftSSO(w, r)
 	case path == "/auth/builderid/start" && r.Method == "POST":
 		h.apiStartBuilderIdLogin(w, r)
 	case path == "/auth/builderid/poll" && r.Method == "POST":
@@ -3230,6 +4463,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
 		h.apiImportCredentials(w, r)
+	case path == "/auth/microsoft-sso/start" && r.Method == "POST":
+		h.apiStartMicrosoftSSO(w, r)
+	case path == "/auth/microsoft-sso/complete" && r.Method == "POST":
+		h.apiCompleteMicrosoftSSO(w, r)
+	case path == "/auth/microsoft-sso/select-profile" && r.Method == "POST":
+		h.apiSelectMicrosoftSSOProfile(w, r)
+	case path == "/auth/microsoft-sso/cancel" && r.Method == "POST":
+		h.apiCancelMicrosoftSSO(w, r)
 	case path == "/auth/import-cli-json" && r.Method == "POST":
 		h.apiImportCliJson(w, r)
 	case path == "/auth/import-ide-cache" && r.Method == "POST":
@@ -3318,7 +4559,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"banReason":         a.BanReason,
 			"banTime":           a.BanTime,
 			"expiresAt":         a.ExpiresAt,
-			"hasToken":          accountBearerToken(&a) != "",
+			"hasToken":          a.AccessToken != "",
 			"machineId":         a.MachineId,
 			"weight":            a.Weight,
 			"overageStatus":     a.OverageStatus,
@@ -3346,9 +4587,28 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"totalTokens":       stats.TotalTokens,
 			"totalCredits":      stats.TotalCredits,
 			"lastUsed":          stats.LastUsed,
+			"providerRuntime":   h.providerRuntimeDiagnostics(a.ID),
 		}
 	}
 	json.NewEncoder(w).Encode(result)
+}
+
+func setDirectAnthropicStaticAPIKey(account *config.Account, value string) error {
+	if account == nil {
+		return errors.New("account is nil")
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return errors.New("kiroApiKey is required for direct Anthropic accounts")
+	}
+	account.KiroApiKey = value
+	// Direct Anthropic static credentials belong exclusively to the x-api-key
+	// trust domain. Never duplicate them into the generic bearer-token field:
+	// doing so makes an accidental Kiro-transport fallthrough capable of sending
+	// the Anthropic secret as Authorization: Bearer.
+	account.AccessToken = ""
+	account.ExpiresAt = 0
+	return nil
 }
 
 func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
@@ -3363,6 +4623,24 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		account.ID = auth.GenerateAccountID()
 	}
 
+	if claudeAccountIsDirectAnthropic(&account) {
+		baseURL, err := normalizeDirectAnthropicBaseURL(account.BaseURL)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		account.BaseURL = baseURL
+		if err := setDirectAnthropicStaticAPIKey(&account, account.KiroApiKey); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if account.Provider == "" {
+			account.Provider = "Anthropic"
+		}
+	}
+
 	// Kiro API-key accounts: the key IS the credential. Validate it, normalize the
 	// auth method, and mirror it into AccessToken so pool routing / model refresh
 	// (which gate on a non-empty AccessToken) treat the account as ready. ExpiresAt
@@ -3370,7 +4648,7 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	// Detection is case-insensitive (matching IsApiKeyCredential) and also triggers
 	// when a bare kiroApiKey is supplied without an explicit authMethod.
 	account.KiroApiKey = strings.TrimSpace(account.KiroApiKey)
-	if account.IsApiKeyCredential() || account.KiroApiKey != "" {
+	if !claudeAccountIsDirectAnthropic(&account) && (account.IsApiKeyCredential() || account.KiroApiKey != "") {
 		if account.KiroApiKey == "" {
 			w.WriteHeader(400)
 			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
@@ -3414,7 +4692,13 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if account.Region == "" {
+	if !account.HasKnownKind() {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "unsupported authMethod: " + strings.TrimSpace(account.AuthMethod)})
+		return
+	}
+
+	if account.Region == "" && !claudeAccountIsDirectAnthropic(&account) {
 		account.Region = "us-east-1"
 	}
 
@@ -3426,132 +4710,206 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 
 	h.pool.Reload()
 	// 新账号若已启用且有 token，立即拉取并缓存模型列表
-	if account.Enabled && account.AccessToken != "" {
-		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+	if accountReadyForModelDiscovery(&account) {
+		acc := account.Clone()
+		h.startBackgroundTask(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if err := h.fetchAndCacheAccountModelsContext(ctx, &acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", acc.Email, err)
 			}
-		}(account)
+		})
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "id": account.ID})
 }
 
 func (h *Handler) apiDeleteAccount(w http.ResponseWriter, r *http.Request, id string) {
-	if err := config.DeleteAccount(id); err != nil {
-		w.WriteHeader(500)
+	observed, ok := config.GetAccountByID(id)
+	if !ok {
+		// Preserve the historical idempotent DELETE contract. The stale-recreate
+		// protection below applies once this request actually observed a lifecycle.
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		return
+	}
+
+	deleted, applied, err := config.DeleteAccountIfLifecycle(id, observed.DispatchGeneration)
+	if !applied {
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account changed while delete was pending; reload and retry"})
+		return
+	}
+
+	// Cleanup is scoped to the lifecycle that was actually retired. A recreate
+	// with the same textual ID may already have published N+1 runtime state.
+	if deleted.IsBedrock() {
+		clearBedrockModelCacheForLifecycle(&deleted)
+		clearBedrockRegionRoutesForLifecycle(&deleted)
+		bedrockThrottle.clearForLifecycle(&deleted)
+	}
+	h.clearAccountProviderRuntimeStateForLifecycle(&deleted)
+	h.pool.Reload()
+
+	if err != nil {
+		// A post-publication durability error still means the delete is visible and
+		// memory was committed; report the durability failure after aligning runtime.
+		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
-	h.pool.Reload()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func applyAdminAccountUpdates(account *config.Account, updates map[string]interface{}) error {
+	if account == nil {
+		return errors.New("account is nil")
+	}
+	if v, ok := updates["enabled"].(bool); ok {
+		account.Enabled = v
+	}
+	if v, ok := updates["nickname"].(string); ok {
+		account.Nickname = v
+	}
+	if v, ok := updates["machineId"].(string); ok {
+		account.MachineId = v
+	}
+	if v, ok := updates["weight"].(float64); ok {
+		account.Weight = int(v)
+	}
+	if v, ok := updates["proxyURL"].(string); ok {
+		account.ProxyURL = v
+	}
+
+	if claudeAccountIsDirectAnthropic(account) {
+		if v, ok := updates["baseUrl"].(string); ok {
+			baseURL, err := normalizeDirectAnthropicBaseURL(v)
+			if err != nil {
+				return err
+			}
+			account.BaseURL = baseURL
+		}
+		if v, ok := updates["kiroApiKey"].(string); ok {
+			if err := setDirectAnthropicStaticAPIKey(account, v); err != nil {
+				return err
+			}
+		}
+	}
+
+	if account.IsBedrock() {
+		if v, ok := updates["region"].(string); ok {
+			account.Region = strings.TrimSpace(v)
+		}
+		if v, ok := updates["bedrockApiKey"].(string); ok {
+			account.BedrockAPIKey = strings.TrimSpace(v)
+		}
+		if v, ok := updates["bedrockAccessKeyId"].(string); ok {
+			account.BedrockAccessKeyID = strings.TrimSpace(v)
+		}
+		if v, ok := updates["bedrockSecretAccessKey"].(string); ok {
+			account.BedrockSecretAccessKey = strings.TrimSpace(v)
+		}
+		if v, ok := updates["bedrockUseConverse"].(bool); ok {
+			account.BedrockUseConverse = v
+		}
+		if v, ok := updates["bedrockRegions"].([]interface{}); ok {
+			regions := make([]string, 0, len(v))
+			for _, item := range v {
+				if region, ok := item.(string); ok && strings.TrimSpace(region) != "" {
+					regions = append(regions, strings.TrimSpace(region))
+				}
+			}
+			account.BedrockRegions = regions
+		}
+		if account.BedrockAPIKey == "" &&
+			(account.BedrockAccessKeyID == "" || account.BedrockSecretAccessKey == "") {
+			return errors.New("bedrock account needs either an API key or an access key + secret")
+		}
+	}
+	return nil
 }
 
 func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id string) {
 	var updates map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
-		w.WriteHeader(400)
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
 
-	// 获取现有账号
-	accounts := config.GetAccounts()
-	var existing *config.Account
-	for i := range accounts {
-		if accounts[i].ID == id {
-			existing = &accounts[i]
-			break
-		}
-	}
-	if existing == nil {
-		w.WriteHeader(404)
+	observed, ok := config.GetAccountByID(id)
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
 		return
 	}
-
-	// 只更新传入的字段
-	oldEnabled := existing.Enabled
-	if v, ok := updates["enabled"].(bool); ok {
-		existing.Enabled = v
-	}
-	if v, ok := updates["nickname"].(string); ok {
-		existing.Nickname = v
-	}
-	if v, ok := updates["machineId"].(string); ok {
-		existing.MachineId = v
-	}
-	if v, ok := updates["weight"].(float64); ok {
-		existing.Weight = int(v)
-	}
-	if v, ok := updates["proxyURL"].(string); ok {
-		existing.ProxyURL = v
-	}
-	// Editable Bedrock fields — only for bedrock accounts. Region and credentials
-	// change which upstream/model set the account resolves, so clear the cached model
-	// discovery when any of them move. (Region is deliberately NOT editable for Kiro
-	// accounts here: their Region drives OIDC endpoints and must not be changed by a
-	// generic field update.)
-	if existing.IsBedrock() {
-		bedrockChanged := false
-		if v, ok := updates["region"].(string); ok && strings.TrimSpace(v) != existing.Region {
-			existing.Region = strings.TrimSpace(v)
-			bedrockChanged = true
-		}
-		if v, ok := updates["bedrockApiKey"].(string); ok {
-			existing.BedrockAPIKey = strings.TrimSpace(v)
-			bedrockChanged = true
-		}
-		if v, ok := updates["bedrockAccessKeyId"].(string); ok {
-			existing.BedrockAccessKeyID = strings.TrimSpace(v)
-			bedrockChanged = true
-		}
-		if v, ok := updates["bedrockSecretAccessKey"].(string); ok {
-			existing.BedrockSecretAccessKey = strings.TrimSpace(v)
-			bedrockChanged = true
-		}
-		if v, ok := updates["bedrockUseConverse"].(bool); ok {
-			existing.BedrockUseConverse = v
-		}
-		// bedrockRegions is a JSON array of extra candidate regions; accept string
-		// items and drop blanks.
-		if v, ok := updates["bedrockRegions"].([]interface{}); ok {
-			var regions []string
-			for _, item := range v {
-				if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
-					regions = append(regions, strings.TrimSpace(s))
-				}
-			}
-			existing.BedrockRegions = regions
-			bedrockChanged = true
-		}
-		// Guard the same either/or invariant the add endpoint enforces: an update must
-		// not leave the account with no usable credential (it would then fail every
-		// request pre-stream and be perpetually excluded).
-		if existing.BedrockAPIKey == "" && (existing.BedrockAccessKeyID == "" || existing.BedrockSecretAccessKey == "") {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "bedrock account needs either an API key or an access key + secret"})
-			return
-		}
-		if bedrockChanged {
-			clearBedrockModelCache(existing.ID)
-			clearBedrockRegionRoutes(existing.ID)
-		}
-	}
-
-	if err := config.UpdateAccount(id, *existing); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+	if !observed.HasKnownKind() {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "unsupported authMethod: " + strings.TrimSpace(observed.AuthMethod)})
 		return
 	}
 
+	var validationErr error
+	before, after, applied, err := config.MutateAccountIfLifecycle(
+		id,
+		observed.DispatchGeneration,
+		func(current *config.Account) error {
+			validationErr = applyAdminAccountUpdates(current, updates)
+			return validationErr
+		},
+	)
+	if !applied {
+		if validationErr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": validationErr.Error()})
+			return
+		}
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account changed while update was pending; reload and retry"})
+		return
+	}
+
+	lifecycleChanged := before.DispatchGeneration != after.DispatchGeneration
 	h.pool.Reload()
-	// 账号从禁用→启用时，自动拉取并缓存模型列表
-	if !oldEnabled && existing.Enabled && existing.AccessToken != "" {
-		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
-				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
+	if lifecycleChanged {
+		// Retire only N. Never clear runtime state by account ID here: a concurrent
+		// recreate may already have published N+1 under the same textual ID.
+		if before.IsBedrock() {
+			clearBedrockModelCacheForLifecycle(&before)
+			clearBedrockRegionRoutesForLifecycle(&before)
+			bedrockThrottle.clearForLifecycle(&before)
+		}
+		h.clearAccountProviderRuntimeStateForLifecycle(&before)
+	} else {
+		h.rebuildEnabledModelUnion()
+	}
+
+	// Re-enable/source changes need a model refresh using the committed account,
+	// which carries the current lifecycle generation and any concurrent refresh
+	// fields that were intentionally preserved by the partial mutation.
+	if accountReadyForModelDiscovery(&after) && (!before.Enabled || lifecycleChanged) {
+		acc := after.Clone()
+		h.startBackgroundTask(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if refreshErr := h.fetchAndCacheAccountModelsContext(ctx, &acc); refreshErr != nil {
+				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, refreshErr)
 			}
-		}(*existing)
+		})
+	}
+
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
@@ -3570,6 +4928,11 @@ func (h *Handler) apiGetAccountOverage(w http.ResponseWriter, r *http.Request, i
 	if account == nil {
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	if !account.SupportsOverageAPI() {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Overage API is not supported for this account kind"})
 		return
 	}
 
@@ -3621,6 +4984,11 @@ func (h *Handler) apiSetAccountOverage(w http.ResponseWriter, r *http.Request, i
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
 		return
 	}
+	if !account.SupportsOverageAPI() {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Overage API is not supported for this account kind"})
+		return
+	}
 
 	snap, err := SetOverageStatus(account, body.Enabled)
 	if err != nil {
@@ -3652,12 +5020,12 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		Action string   `json:"action"` // "enable", "disable", "refresh"
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(400)
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
 	if len(req.IDs) == 0 {
-		w.WriteHeader(400)
+		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "No account IDs provided"})
 		return
 	}
@@ -3665,36 +5033,87 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 	switch req.Action {
 	case "enable", "disable":
 		enabled := req.Action == "enable"
-		accounts := config.GetAccounts()
-		idSet := make(map[string]bool)
-		for _, id := range req.IDs {
-			idSet[id] = true
+		observedByID := make(map[string]config.Account)
+		for _, account := range config.GetAccounts() {
+			observedByID[account.ID] = account
 		}
-		var toRefreshModels []config.Account
-		for _, a := range accounts {
-			if idSet[a.ID] {
-				// 记录本次从禁用→启用、且有 token 的账号
-				if enabled && !a.Enabled && a.AccessToken != "" {
-					toRefreshModels = append(toRefreshModels, a)
+
+		toRefreshModels := make([]config.Account, 0)
+		staleIDs := make([]string, 0)
+		appliedCount := 0
+		var persistErr error
+
+		seenIDs := make(map[string]struct{}, len(req.IDs))
+		for _, id := range req.IDs {
+			if _, duplicate := seenIDs[id]; duplicate {
+				continue
+			}
+			seenIDs[id] = struct{}{}
+			observed, ok := observedByID[id]
+			if !ok {
+				continue
+			}
+			before, after, applied, err := config.MutateAccountIfLifecycle(
+				id,
+				observed.DispatchGeneration,
+				func(current *config.Account) error {
+					current.Enabled = enabled
+					if enabled && current.BanStatus != "" && current.BanStatus != "ACTIVE" {
+						current.BanStatus = "ACTIVE"
+						current.BanReason = ""
+						current.BanTime = 0
+					}
+					return nil
+				},
+			)
+			if !applied {
+				if err != nil && persistErr == nil {
+					persistErr = err
+				} else if err == nil {
+					staleIDs = append(staleIDs, id)
 				}
-				a.Enabled = enabled
-				if enabled && a.BanStatus != "" && a.BanStatus != "ACTIVE" {
-					a.BanStatus = "ACTIVE"
-					a.BanReason = ""
-					a.BanTime = 0
-				}
-				config.UpdateAccount(a.ID, a)
+				continue
+			}
+			appliedCount++
+			if err != nil && persistErr == nil {
+				persistErr = err
+			}
+			if enabled && !before.Enabled && accountReadyForModelDiscovery(&after) {
+				toRefreshModels = append(toRefreshModels, after)
 			}
 		}
+
 		h.pool.Reload()
-		// 为本次新启用的账号异步拉取模型缓存
+		h.rebuildEnabledModelUnion()
 		for _, acc := range toRefreshModels {
-			go func(a config.Account) {
-				a.Enabled = true
-				if err := h.fetchAndCacheAccountModels(&a); err != nil {
+			a := acc.Clone()
+			h.startBackgroundTask(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				if err := h.fetchAndCacheAccountModelsContext(ctx, &a); err != nil {
 					logger.Warnf("[ModelsCache] Auto-refresh failed for batch-enabled account %s: %v", a.Email, err)
 				}
-			}(acc)
+			})
+		}
+
+		if persistErr != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"count":   appliedCount,
+				"error":   persistErr.Error(),
+			})
+			return
+		}
+		if len(staleIDs) > 0 {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":  false,
+				"count":    appliedCount,
+				"staleIds": staleIDs,
+				"error":    "One or more accounts changed while the batch update was pending; reload and retry",
+			})
+			return
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(req.IDs)})
 
@@ -3714,33 +5133,23 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 				failCount++
 				continue
 			}
-			// 刷新 token
-			if account.RefreshToken != "" {
-				if _, err := h.refreshAccountToken(account, true); err != nil {
-					logger.Warnf("[BatchRefresh] Token refresh failed for %s: %v", account.Email, err)
-					failCount++
-					continue
-				}
-			}
-			// 刷新账户信息
-			info, err := RefreshAccountInfo(account)
-			if err != nil {
+			if _, err := h.refreshAccountByKind(r.Context(), account, accountRefreshExplicit); err != nil {
+				logger.Warnf("[BatchRefresh] Failed to refresh account %s: %v", id, err)
 				failCount++
 				continue
 			}
-			config.UpdateAccountInfo(id, *info)
 			successCount++
 		}
 		h.pool.Reload()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":   true,
-			"refreshed": successCount,
-			"failed":    failCount,
+			"success": true,
+			"count":   successCount,
+			"failed":  failCount,
 		})
 
 	default:
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid action: " + req.Action})
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid action"})
 	}
 }
 
@@ -3825,6 +5234,756 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 			"email": account.Email,
 		},
 	})
+}
+
+func (h *Handler) apiStartBuilderIdLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Region string `json:"region"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	session, err := auth.StartBuilderIdLogin(req.Region)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":       session.ID,
+		"userCode":        session.UserCode,
+		"verificationUri": session.VerificationUri,
+		"interval":        session.Interval,
+	})
+}
+
+func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	accessToken, refreshToken, clientID, clientSecret, region, expiresIn, status, err := auth.PollBuilderIdAuth(req.SessionID)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if status == "pending" || status == "slow_down" {
+		// 获取当前间隔
+		interval := 5
+		if session := auth.GetBuilderIdSession(req.SessionID); session != nil {
+			interval = session.Interval
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"completed": false,
+			"status":    status,
+			"interval":  interval,
+		})
+		return
+	}
+
+	// 授权完成，获取用户信息
+	email, _, _ := auth.GetUserInfo(accessToken)
+
+	// 创建账号
+	account := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Email:        email,
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		AuthMethod:   "idc",
+		Provider:     "BuilderId",
+		Region:       region,
+		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
+		Enabled:      true,
+		MachineId:    config.GenerateMachineId(),
+	}
+
+	if err := config.AddAccount(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"completed": true,
+		"account": map[string]interface{}{
+			"id":    account.ID,
+			"email": account.Email,
+		},
+	})
+}
+
+// apiStartKiroSso starts the Kiro hosted-portal sign-in (Enterprise SSO — Microsoft 365 /
+// Entra ID, plus Google/GitHub). It binds the loopback callback listener and returns the
+// sign-in URL the operator opens in a browser ON THE SAME HOST as the proxy (the OAuth
+// redirect targets 127.0.0.1:3128). The browser is driven through the enterprise external-IdP
+// leg automatically; the front end polls /auth/kiro-sso/poll until completion.
+func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Region string `json:"region"`
+	}
+	// Region is optional (defaults to us-east-1 in StartKiroSsoLogin), so a decode
+	// error (including an empty body) is intentionally tolerated — mirrors
+	// apiStartBuilderIdLogin.
+	json.NewDecoder(r.Body).Decode(&req)
+
+	session, signInURL, err := auth.StartKiroSsoLogin(req.Region)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId": session.ID,
+		"signInUrl": signInURL,
+		"interval":  2,
+	})
+}
+
+// apiCancelKiroSso tears down an in-flight hosted-portal sign-in (operator closed or
+// cancelled the modal), freeing the loopback callback port immediately instead of
+// waiting for the deadline. It also drops any tokens parked awaiting a profile
+// choice, so a dismissed picker doesn't leave credentials in memory for the TTL.
+func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.SessionID != "" {
+		auth.CancelKiroSsoLogin(req.SessionID)
+		dropPendingKiroSsoChoice(req.SessionID)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// --- Deferred profile choice (external_idp multi-region) ---------------------
+//
+// When the eager probe finds 2+ Kiro profiles for a freshly-exchanged
+// external_idp credential, the account is NOT created yet: the exchanged tokens
+// and the discovered profile list are parked here (keyed by the SSO session id)
+// until the operator picks a profile via /auth/kiro-sso/select-profile, cancels,
+// or the TTL expires. The TTL keeps unclaimed tokens from lingering in memory.
+
+// kiroSsoChoiceTTL bounds how long exchanged tokens wait for a profile choice.
+const kiroSsoChoiceTTL = 5 * time.Minute
+
+// pendingKiroSsoChoice parks one exchanged credential awaiting a profile pick.
+type pendingKiroSsoChoice struct {
+	result    *auth.KiroSsoResult
+	machineId string
+	profiles  []KiroProfile
+	// expiresAt is the ACCESS TOKEN's absolute expiry, stamped at exchange time.
+	// It must not be recomputed from ExpiresIn at finalize time: the operator can
+	// sit on the picker for minutes, and an expiry overstated by that gap would
+	// make the proactive refresh (tokenRefreshSkewSeconds) miss the real deadline.
+	expiresAt int64
+	// deadline is when this stash self-destructs. A re-stash (invalid pick keeps
+	// the entry alive for another attempt) reuses the ORIGINAL deadline so
+	// repeated invalid picks cannot extend how long tokens sit in memory.
+	deadline time.Time
+	timer    *time.Timer
+}
+
+var (
+	pendingKiroSsoChoices   = make(map[string]*pendingKiroSsoChoice)
+	pendingKiroSsoChoicesMu sync.Mutex
+)
+
+// stashPendingKiroSsoChoice parks an exchanged credential plus its discovered
+// profiles under the SSO session id, self-expiring at pending.deadline.
+func stashPendingKiroSsoChoice(sessionID string, pending *pendingKiroSsoChoice) {
+	// Identity-checked expiry: only delete the entry if it is still THIS stash.
+	// A plain delete-by-key could race a re-stash — Stop() on an already-fired
+	// timer is a no-op, and the fired callback would then destroy the fresh entry.
+	pending.timer = time.AfterFunc(time.Until(pending.deadline), func() {
+		pendingKiroSsoChoicesMu.Lock()
+		if cur, ok := pendingKiroSsoChoices[sessionID]; ok && cur == pending {
+			delete(pendingKiroSsoChoices, sessionID)
+			logger.Debugf("[KiroSSO] Pending profile choice for session %s expired", sessionID)
+		}
+		pendingKiroSsoChoicesMu.Unlock()
+	})
+	pendingKiroSsoChoicesMu.Lock()
+	// A repeated stash for the same session replaces the previous one; stop the
+	// superseded timer (best-effort — the identity check above covers the rest).
+	if prev, ok := pendingKiroSsoChoices[sessionID]; ok && prev.timer != nil {
+		prev.timer.Stop()
+	}
+	pendingKiroSsoChoices[sessionID] = pending
+	pendingKiroSsoChoicesMu.Unlock()
+}
+
+// takePendingKiroSsoChoice removes and returns the parked credential, or nil.
+func takePendingKiroSsoChoice(sessionID string) *pendingKiroSsoChoice {
+	pendingKiroSsoChoicesMu.Lock()
+	defer pendingKiroSsoChoicesMu.Unlock()
+	pending, ok := pendingKiroSsoChoices[sessionID]
+	if !ok {
+		return nil
+	}
+	delete(pendingKiroSsoChoices, sessionID)
+	if pending.timer != nil {
+		pending.timer.Stop()
+	}
+	return pending
+}
+
+// dropPendingKiroSsoChoice discards a parked credential (cancel / TTL expiry).
+func dropPendingKiroSsoChoice(sessionID string) {
+	if pending := takePendingKiroSsoChoice(sessionID); pending != nil {
+		logger.Debugf("[KiroSSO] Dropped pending profile choice for session %s", sessionID)
+	}
+}
+
+// apiSelectKiroSsoProfile finishes a deferred hosted-portal sign-in: the operator
+// picked one of the discovered profiles, so pin it and create the account.
+func (h *Handler) apiSelectKiroSsoProfile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID  string `json:"sessionId"`
+		ProfileArn string `json:"profileArn"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	req.ProfileArn = strings.TrimSpace(req.ProfileArn)
+	if req.SessionID == "" || req.ProfileArn == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "sessionId and profileArn are required"})
+		return
+	}
+
+	pending := takePendingKiroSsoChoice(req.SessionID)
+	if pending == nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "profile choice expired or already completed; sign in again"})
+		return
+	}
+
+	// Only an ARN that was actually offered may be pinned — reject anything else
+	// and re-park the stash so the operator can pick again.
+	valid := false
+	for _, p := range pending.profiles {
+		if p.ARN == req.ProfileArn {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		// Re-park with the ORIGINAL deadline: an invalid pick must not reset the TTL.
+		stashPendingKiroSsoChoice(req.SessionID, pending)
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is not one of the discovered profiles"})
+		return
+	}
+
+	pending.result.ProfileArn = req.ProfileArn
+	h.finalizeKiroSsoAccount(w, pending.result, pending.machineId, pending.expiresAt)
+}
+
+// apiListAccountKiroProfiles GET /accounts/{id}/kiro-profiles
+// Runs the multi-region profile discovery for an EXISTING account so the
+// operator can see every Kiro profile the credential can reach (e.g. a US and
+// an EU profile) and re-pin via POST. external_idp only: other auth methods
+// carry an authoritative region already.
+func (h *Handler) apiListAccountKiroProfiles(w http.ResponseWriter, r *http.Request, id string) {
+	account, status, errMsg := h.lookupAccountForProfileOps(id)
+	if account == nil {
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
+		return
+	}
+
+	profiles, err := DiscoverKiroProfiles(account)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"profiles": profiles,
+		"current":  strings.TrimSpace(account.ProfileArn),
+	})
+}
+
+// apiSwitchAccountKiroProfile POST /accounts/{id}/kiro-profiles {profileArn}
+// Re-pins an existing external_idp account to another discovered profile. The
+// requested ARN is validated against a fresh discovery (stateless: no stash to
+// expire) before overwriting the cached ProfileArn; the pool reload makes the
+// data-plane region switch take effect on the next request.
+func (h *Handler) apiSwitchAccountKiroProfile(w http.ResponseWriter, r *http.Request, id string) {
+	var req struct {
+		ProfileArn string `json:"profileArn"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	req.ProfileArn = strings.TrimSpace(req.ProfileArn)
+	if req.ProfileArn == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is required"})
+		return
+	}
+
+	observed, status, errMsg := h.lookupAccountForProfileOps(id)
+	if observed == nil {
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
+		return
+	}
+
+	profiles, err := DiscoverKiroProfiles(observed)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	valid := false
+	for _, profile := range profiles {
+		if profile.ARN == req.ProfileArn {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is not one of the discovered profiles"})
+		return
+	}
+
+	before, after, applied, err := config.MutateAccountIfLifecycle(
+		id,
+		observed.DispatchGeneration,
+		func(current *config.Account) error {
+			current.ProfileArn = req.ProfileArn
+			return nil
+		},
+	)
+	if !applied {
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account changed while profile discovery was pending; reload and retry"})
+		return
+	}
+
+	h.pool.Reload()
+	if before.DispatchGeneration != after.DispatchGeneration {
+		h.clearAccountProviderRuntimeStateForLifecycle(&before)
+	} else {
+		h.rebuildEnabledModelUnion()
+	}
+
+	// The model list is region-scoped. Refresh using the committed lifecycle.
+	modelsRefreshed := true
+	if refreshErr := h.fetchAndCacheAccountModelsContext(r.Context(), &after); refreshErr != nil {
+		modelsRefreshed = false
+		logger.Warnf("[ProfileArn] Model refresh after profile switch failed for %s: %v", accountEmailForLog(&after), refreshErr)
+	}
+
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":         true,
+		"profileArn":      req.ProfileArn,
+		"modelsRefreshed": modelsRefreshed,
+	})
+}
+
+// lookupAccountForProfileOps fetches an account copy (with the pool's freshest
+// tokens) for profile discovery/switch, restricted to external_idp accounts.
+// Returns (nil, httpStatus, message) when not found (404) or not eligible (400).
+func (h *Handler) lookupAccountForProfileOps(id string) (*config.Account, int, string) {
+	accounts := config.GetAccounts()
+	var account *config.Account
+	for i := range accounts {
+		if accounts[i].ID == id {
+			account = &accounts[i]
+			break
+		}
+	}
+	if account == nil {
+		return nil, 404, "Account not found"
+	}
+	if !strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
+		return nil, 400, "profile switching is only supported for external_idp accounts"
+	}
+	// 与 apiRefreshAccountModels 一致：用 pool 中运行时最新 token 探测，避免用到
+	// 已被刷新淘汰的磁盘态 token。
+	if latest := h.pool.GetByID(id); latest != nil {
+		account.AccessToken = latest.AccessToken
+		account.RefreshToken = latest.RefreshToken
+		account.ExpiresAt = latest.ExpiresAt
+		account.ProfileArn = latest.ProfileArn
+	}
+	return account, 200, ""
+}
+
+// apiPollKiroSso reports the hosted-portal sign-in status. While the user is signing in it
+// returns completed=false; once the listener captures the authorization code it exchanges it,
+// persists the account (AuthMethod "external_idp" for an Azure tenant, "social" otherwise), and
+// returns completed=true. The profileArn is resolved lazily on first use (the EXTERNAL_IDP
+// token type header is now sent on CodeWhisperer calls), so it is not required here.
+func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	result, status, err := auth.PollKiroSsoAuth(req.SessionID)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if status == "pending" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"completed": false,
+			"status":    "pending",
+		})
+		return
+	}
+
+	// 授权完成。external_idp（Azure 租户）账号的 home region 在登录时未知，且同一
+	// 账号可能在多个 region 各有一个 Kiro profile（例如 US 与 EU）。这里在建号前
+	// 主动跨 region 探测全部 profile：
+	//   0 个 → 维持旧行为，ProfileArn 留空、首次使用时懒解析；
+	//   1 个 → 直接固定该 profile（免去日后懒探测）；
+	//   2+ 个 → 暂不建号，把兑换好的 token 与 profile 列表暂存，让前端弹出选择器,
+	//           由 /auth/kiro-sso/select-profile 完成建号。
+	machineId := config.GenerateMachineId()
+	// Token 过期时刻在“兑换完成”的此刻定格。choose_profile 分支可能让 token 在
+	// 暂存区躺上几分钟，若到建号时才用 ExpiresIn 计算，过期时刻会被高估，导致
+	// 主动刷新（tokenRefreshSkewSeconds）错过真实截止时间。
+	tokenExpiresAt := time.Now().Unix() + int64(result.ExpiresIn)
+	if result.AuthMethod == "external_idp" && strings.TrimSpace(result.ProfileArn) == "" {
+		// 探测用临时账号：仅承载调用 ListAvailableProfiles 所需的凭证字段，不落盘。
+		probe := &config.Account{
+			Email:       result.Email,
+			AccessToken: result.AccessToken,
+			AuthMethod:  result.AuthMethod,
+			Provider:    result.Provider,
+			Region:      result.Region,
+			MachineId:   machineId,
+		}
+		profiles, err := DiscoverKiroProfiles(probe)
+		if err != nil {
+			// 探测失败不阻断建号：回退到与旧版一致的懒解析路径。
+			logger.Warnf("[KiroSSO] Profile discovery failed for %s, falling back to lazy resolution: %v", result.Email, err)
+		}
+		switch {
+		case len(profiles) == 1:
+			result.ProfileArn = profiles[0].ARN
+		case len(profiles) >= 2:
+			stashPendingKiroSsoChoice(req.SessionID, &pendingKiroSsoChoice{
+				result:    result,
+				machineId: machineId,
+				profiles:  profiles,
+				expiresAt: tokenExpiresAt,
+				deadline:  time.Now().Add(kiroSsoChoiceTTL),
+			})
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":   true,
+				"completed": true,
+				"status":    "choose_profile",
+				"profiles":  profiles,
+			})
+			return
+		}
+	}
+
+	h.finalizeKiroSsoAccount(w, result, machineId, tokenExpiresAt)
+}
+
+// buildKiroSsoAccount assembles the persisted account record from an exchanged
+// hosted-portal credential. Shared by the immediate path (0/1 profile) and the
+// deferred path (operator picked one of several profiles), so both create
+// byte-identical accounts. expiresAt is the absolute token expiry stamped at
+// exchange time — never derived from ExpiresIn here, because on the deferred
+// path minutes may have passed since the exchange.
+func buildKiroSsoAccount(result *auth.KiroSsoResult, machineId string, expiresAt int64) config.Account {
+	return config.Account{
+		ID:            auth.GenerateAccountID(),
+		Email:         result.Email,
+		AccessToken:   result.AccessToken,
+		RefreshToken:  result.RefreshToken,
+		ClientID:      result.ClientID,
+		AuthMethod:    result.AuthMethod,
+		Provider:      result.Provider,
+		Region:        result.Region,
+		ProfileArn:    result.ProfileArn,
+		TokenEndpoint: result.TokenEndpoint,
+		IssuerURL:     result.IssuerURL,
+		Scopes:        result.Scopes,
+		ExpiresAt:     expiresAt,
+		Enabled:       true,
+		MachineId:     machineId,
+	}
+}
+
+// finalizeKiroSsoAccount persists the account and writes the completed response.
+func (h *Handler) finalizeKiroSsoAccount(w http.ResponseWriter, result *auth.KiroSsoResult, machineId string, expiresAt int64) {
+	account := buildKiroSsoAccount(result, machineId, expiresAt)
+
+	if err := config.AddAccount(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"completed": true,
+		"account": map[string]interface{}{
+			"id":         account.ID,
+			"email":      account.Email,
+			"authMethod": account.AuthMethod,
+		},
+	})
+}
+
+func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		BearerToken string `json:"bearerToken"`
+		Region      string `json:"region"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	if req.BearerToken == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "bearerToken is required"})
+		return
+	}
+
+	// 支持批量导入，按行分割
+	tokens := strings.Split(strings.TrimSpace(req.BearerToken), "\n")
+	var imported []map[string]interface{}
+	var errors []string
+
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+
+		accessToken, refreshToken, clientID, clientSecret, expiresIn, err := auth.ImportFromSsoToken(token, req.Region)
+		if err != nil {
+			errors = append(errors, err.Error())
+			continue
+		}
+
+		// 获取用户信息
+		email, _, _ := auth.GetUserInfo(accessToken)
+
+		// 创建账号
+		account := config.Account{
+			ID:           auth.GenerateAccountID(),
+			Email:        email,
+			AccessToken:  accessToken,
+			RefreshToken: refreshToken,
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			AuthMethod:   "idc",
+			Region:       req.Region,
+			ExpiresAt:    time.Now().Unix() + int64(expiresIn),
+			Enabled:      true,
+			MachineId:    config.GenerateMachineId(),
+		}
+
+		if err := config.AddAccount(account); err != nil {
+			errors = append(errors, err.Error())
+			continue
+		}
+
+		imported = append(imported, map[string]interface{}{
+			"id":    account.ID,
+			"email": account.Email,
+		})
+	}
+
+	h.pool.Reload()
+
+	if len(imported) == 0 && len(errors) > 0 {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   strings.Join(errors, "; "),
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"accounts": imported,
+		"errors":   errors,
+	})
+}
+
+func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
+	// Cap the body: accessToken becomes attacker-influenced input that is base64- and
+	// JSON-decoded twice (issuerFromAccessTokenJWT / ExpFromAccessTokenJWT). Without a
+	// limit an oversized token is a memory-amplification DoS. Mirrors the io.LimitReader
+	// guard on outbound IdP responses in auth/kiro_sso.go's oidcDiscover.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
+	}
+	// decodeImportRequest (cli_json_import.go) accepts both the legacy camelCase
+	// payload this endpoint has always taken AND the kiro-login-helper.py
+	// snake_case shape (token_endpoint, issuer_url, profile_arn, ...), so a raw
+	// helper export can be pasted here unmodified. It intentionally does NOT
+	// collapse authMethod onto a canonical bucket — see importCredentialRequest's
+	// doc comment: the classifier below needs the raw alias (e.g. "AzureAD") to
+	// detect an explicit Microsoft declaration before any bucketing happens.
+	req, err := decodeImportRequest(body)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	// h.importCredential is the single core every import path (this endpoint,
+	// /auth/import-cli-json, /auth/import-ide-cache, and the directory watcher)
+	// funnels through, so all of them get identical classification, SSRF
+	// allow-listing, and trust-on-import behavior — see its doc comment.
+	result, err := h.importCredential(req)
+	if err != nil {
+		if _, ok := err.(*importValidationError); ok {
+			w.WriteHeader(importErrorStatus(err))
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		// Persistence failure (duplicate id/refresh-token/api-key, or a config
+		// write error). A refresh may have already rotated the IdP refresh token
+		// before persistence failed; surface it so the operator can retry without
+		// a full interactive re-login (writeAddAccountError's existing contract).
+		h.writeAddAccountError(w, err, result.RotatedRefreshToken)
+		return
+	}
+
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"account": map[string]interface{}{
+			"id":    result.Account.ID,
+			"email": result.Account.Email,
+		},
+	})
+}
+
+// externalIdpAuthMethodAliases are lower-cased authMethod values (or Kiro Account
+// Manager provider labels) that mean "external IdP / enterprise SSO" and must
+// normalize to "external_idp".
+var externalIdpAuthMethodAliases = map[string]bool{
+	"external_idp": true,
+	"azuread":      true,
+	"azure":        true,
+	"entra":        true,
+	"entra-id":     true,
+	"entra_id":     true,
+	"microsoft":    true,
+	"m365":         true,
+	"office365":    true,
+	"external":     true,
+}
+
+// normalizeImportAuthMethod maps a pasted credential JSON's authMethod (plus its
+// clientId/clientSecret/tokenEndpoint) onto one of the three canonical methods
+// ("external_idp" | "idc" | "social"). external_idp MUST be detected before the
+// clientId+clientSecret→idc inference, because external_idp accounts carry clientId
+// but NO clientSecret, so the old default branch misclassified them as "social" and
+// refresh hit the wrong endpoint.
+//
+// It preserves the pre-existing idc/social heuristics:
+//   - empty authMethod + clientId present             -> idc
+//   - empty authMethod, no clientId                   -> social
+//   - "enterprise" (Kiro Account Manager IdC label)   -> idc
+//   - unrecognized non-empty + clientId+clientSecret  -> idc, else social
+func normalizeImportAuthMethod(authMethod, clientID, clientSecret, tokenEndpoint string) string {
+	am := strings.ToLower(strings.TrimSpace(authMethod))
+	switch {
+	case externalIdpAuthMethodAliases[am]:
+		return "external_idp"
+	case am == "api_key" || am == "kiro_api_key" || am == "apikey" || am == "kiro-api-key":
+		return "api_key"
+	case am == "social" || am == "google" || am == "github":
+		return "social"
+	case am == "idc" || am == "builderid" || am == "enterprise":
+		return "idc"
+	}
+
+	// Endpoint-based inference is deliberately weaker than an explicit authMethod.
+	// Mixed/exported credential objects can carry tokenEndpoint as ancillary data;
+	// that must not silently turn an explicitly declared IdC/social credential into
+	// external_idp. Only an undeclared method may be inferred from the endpoint.
+	if am == "" {
+		if strings.TrimSpace(tokenEndpoint) != "" {
+			return "external_idp"
+		}
+		if clientID != "" {
+			return "idc"
+		}
+		return "social"
+	}
+	if clientID != "" && clientSecret != "" {
+		return "idc"
+	}
+	return "social"
+}
+
+func looksLikeKiroAPIKey(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	// Convenience form: ksk_xxx|region
+	if idx := strings.IndexByte(value, '|'); idx > 0 {
+		value = strings.TrimSpace(value[:idx])
+	}
+	return strings.HasPrefix(value, "ksk_")
 }
 
 func (h *Handler) apiStartMicrosoftSSO(w http.ResponseWriter, r *http.Request) {
@@ -4326,609 +6485,6 @@ func (h *Handler) writeAddAccountError(w http.ResponseWriter, err error, rotated
 	json.NewEncoder(w).Encode(payload)
 }
 
-func (h *Handler) apiStartBuilderIdLogin(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Region string `json:"region"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-
-	session, err := auth.StartBuilderIdLogin(req.Region)
-	if err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"sessionId":       session.ID,
-		"userCode":        session.UserCode,
-		"verificationUri": session.VerificationUri,
-		"interval":        session.Interval,
-	})
-}
-
-func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SessionID string `json:"sessionId"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	accessToken, refreshToken, clientID, clientSecret, region, expiresIn, status, err := auth.PollBuilderIdAuth(req.SessionID)
-	if err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   err.Error(),
-		})
-		return
-	}
-
-	if status == "pending" || status == "slow_down" {
-		// 获取当前间隔
-		interval := 5
-		if session := auth.GetBuilderIdSession(req.SessionID); session != nil {
-			interval = session.Interval
-		}
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":   true,
-			"completed": false,
-			"status":    status,
-			"interval":  interval,
-		})
-		return
-	}
-
-	// 授权完成，获取用户信息
-	email, _, _ := auth.GetUserInfo(accessToken)
-
-	// 创建账号
-	account := config.Account{
-		ID:           auth.GenerateAccountID(),
-		Email:        email,
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		AuthMethod:   "idc",
-		Provider:     "BuilderId",
-		Region:       region,
-		ExpiresAt:    time.Now().Unix() + int64(expiresIn),
-		Enabled:      true,
-		MachineId:    config.GenerateMachineId(),
-	}
-
-	if err := config.AddAccount(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	h.pool.Reload()
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":   true,
-		"completed": true,
-		"account": map[string]interface{}{
-			"id":    account.ID,
-			"email": account.Email,
-		},
-	})
-}
-
-// apiStartKiroSso starts the Kiro hosted-portal sign-in (Enterprise SSO — Microsoft 365 /
-// Entra ID, plus Google/GitHub). It binds the loopback callback listener and returns the
-// sign-in URL the operator opens in a browser ON THE SAME HOST as the proxy (the OAuth
-// redirect targets 127.0.0.1:3128). The browser is driven through the enterprise external-IdP
-// leg automatically; the front end polls /auth/kiro-sso/poll until completion.
-func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Region string `json:"region"`
-	}
-	// Region is optional (defaults to us-east-1 in StartKiroSsoLogin), so a decode
-	// error (including an empty body) is intentionally tolerated — mirrors
-	// apiStartBuilderIdLogin.
-	json.NewDecoder(r.Body).Decode(&req)
-
-	session, signInURL, err := auth.StartKiroSsoLogin(req.Region)
-	if err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"sessionId": session.ID,
-		"signInUrl": signInURL,
-		"interval":  2,
-	})
-}
-
-// apiCancelKiroSso tears down an in-flight hosted-portal sign-in (operator closed or
-// cancelled the modal), freeing the loopback callback port immediately instead of
-// waiting for the deadline. It also drops any tokens parked awaiting a profile
-// choice, so a dismissed picker doesn't leave credentials in memory for the TTL.
-func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SessionID string `json:"sessionId"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-	if req.SessionID != "" {
-		auth.CancelKiroSsoLogin(req.SessionID)
-		dropPendingKiroSsoChoice(req.SessionID)
-	}
-	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
-}
-
-// --- Deferred profile choice (external_idp multi-region) ---------------------
-//
-// When the eager probe finds 2+ Kiro profiles for a freshly-exchanged
-// external_idp credential, the account is NOT created yet: the exchanged tokens
-// and the discovered profile list are parked here (keyed by the SSO session id)
-// until the operator picks a profile via /auth/kiro-sso/select-profile, cancels,
-// or the TTL expires. The TTL keeps unclaimed tokens from lingering in memory.
-
-// kiroSsoChoiceTTL bounds how long exchanged tokens wait for a profile choice.
-const kiroSsoChoiceTTL = 5 * time.Minute
-
-// pendingKiroSsoChoice parks one exchanged credential awaiting a profile pick.
-type pendingKiroSsoChoice struct {
-	result    *auth.KiroSsoResult
-	machineId string
-	profiles  []KiroProfile
-	// expiresAt is the ACCESS TOKEN's absolute expiry, stamped at exchange time.
-	// It must not be recomputed from ExpiresIn at finalize time: the operator can
-	// sit on the picker for minutes, and an expiry overstated by that gap would
-	// make the proactive refresh (tokenRefreshSkewSeconds) miss the real deadline.
-	expiresAt int64
-	// deadline is when this stash self-destructs. A re-stash (invalid pick keeps
-	// the entry alive for another attempt) reuses the ORIGINAL deadline so
-	// repeated invalid picks cannot extend how long tokens sit in memory.
-	deadline time.Time
-	timer    *time.Timer
-}
-
-var (
-	pendingKiroSsoChoices   = make(map[string]*pendingKiroSsoChoice)
-	pendingKiroSsoChoicesMu sync.Mutex
-)
-
-// stashPendingKiroSsoChoice parks an exchanged credential plus its discovered
-// profiles under the SSO session id, self-expiring at pending.deadline.
-func stashPendingKiroSsoChoice(sessionID string, pending *pendingKiroSsoChoice) {
-	// Identity-checked expiry: only delete the entry if it is still THIS stash.
-	// A plain delete-by-key could race a re-stash — Stop() on an already-fired
-	// timer is a no-op, and the fired callback would then destroy the fresh entry.
-	pending.timer = time.AfterFunc(time.Until(pending.deadline), func() {
-		pendingKiroSsoChoicesMu.Lock()
-		if cur, ok := pendingKiroSsoChoices[sessionID]; ok && cur == pending {
-			delete(pendingKiroSsoChoices, sessionID)
-			logger.Debugf("[KiroSSO] Pending profile choice for session %s expired", sessionID)
-		}
-		pendingKiroSsoChoicesMu.Unlock()
-	})
-	pendingKiroSsoChoicesMu.Lock()
-	// A repeated stash for the same session replaces the previous one; stop the
-	// superseded timer (best-effort — the identity check above covers the rest).
-	if prev, ok := pendingKiroSsoChoices[sessionID]; ok && prev.timer != nil {
-		prev.timer.Stop()
-	}
-	pendingKiroSsoChoices[sessionID] = pending
-	pendingKiroSsoChoicesMu.Unlock()
-}
-
-// takePendingKiroSsoChoice removes and returns the parked credential, or nil.
-func takePendingKiroSsoChoice(sessionID string) *pendingKiroSsoChoice {
-	pendingKiroSsoChoicesMu.Lock()
-	defer pendingKiroSsoChoicesMu.Unlock()
-	pending, ok := pendingKiroSsoChoices[sessionID]
-	if !ok {
-		return nil
-	}
-	delete(pendingKiroSsoChoices, sessionID)
-	if pending.timer != nil {
-		pending.timer.Stop()
-	}
-	return pending
-}
-
-// dropPendingKiroSsoChoice discards a parked credential (cancel / TTL expiry).
-func dropPendingKiroSsoChoice(sessionID string) {
-	if pending := takePendingKiroSsoChoice(sessionID); pending != nil {
-		logger.Debugf("[KiroSSO] Dropped pending profile choice for session %s", sessionID)
-	}
-}
-
-// apiSelectKiroSsoProfile finishes a deferred hosted-portal sign-in: the operator
-// picked one of the discovered profiles, so pin it and create the account.
-func (h *Handler) apiSelectKiroSsoProfile(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SessionID  string `json:"sessionId"`
-		ProfileArn string `json:"profileArn"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-	req.ProfileArn = strings.TrimSpace(req.ProfileArn)
-	if req.SessionID == "" || req.ProfileArn == "" {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "sessionId and profileArn are required"})
-		return
-	}
-
-	pending := takePendingKiroSsoChoice(req.SessionID)
-	if pending == nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "profile choice expired or already completed; sign in again"})
-		return
-	}
-
-	// Only an ARN that was actually offered may be pinned — reject anything else
-	// and re-park the stash so the operator can pick again.
-	valid := false
-	for _, p := range pending.profiles {
-		if p.ARN == req.ProfileArn {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		// Re-park with the ORIGINAL deadline: an invalid pick must not reset the TTL.
-		stashPendingKiroSsoChoice(req.SessionID, pending)
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is not one of the discovered profiles"})
-		return
-	}
-
-	pending.result.ProfileArn = req.ProfileArn
-	h.finalizeKiroSsoAccount(w, pending.result, pending.machineId, pending.expiresAt)
-}
-
-// apiListAccountKiroProfiles GET /accounts/{id}/kiro-profiles
-// Runs the multi-region profile discovery for an EXISTING account so the
-// operator can see every Kiro profile the credential can reach (e.g. a US and
-// an EU profile) and re-pin via POST. external_idp only: other auth methods
-// carry an authoritative region already.
-func (h *Handler) apiListAccountKiroProfiles(w http.ResponseWriter, r *http.Request, id string) {
-	account, status, errMsg := h.lookupAccountForProfileOps(id)
-	if account == nil {
-		w.WriteHeader(status)
-		json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
-		return
-	}
-
-	profiles, err := DiscoverKiroProfiles(account)
-	if err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":  true,
-		"profiles": profiles,
-		"current":  strings.TrimSpace(account.ProfileArn),
-	})
-}
-
-// apiSwitchAccountKiroProfile POST /accounts/{id}/kiro-profiles {profileArn}
-// Re-pins an existing external_idp account to another discovered profile. The
-// requested ARN is validated against a fresh discovery (stateless: no stash to
-// expire) before overwriting the cached ProfileArn; the pool reload makes the
-// data-plane region switch take effect on the next request.
-func (h *Handler) apiSwitchAccountKiroProfile(w http.ResponseWriter, r *http.Request, id string) {
-	var req struct {
-		ProfileArn string `json:"profileArn"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-	req.ProfileArn = strings.TrimSpace(req.ProfileArn)
-	if req.ProfileArn == "" {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is required"})
-		return
-	}
-
-	account, status, errMsg := h.lookupAccountForProfileOps(id)
-	if account == nil {
-		w.WriteHeader(status)
-		json.NewEncoder(w).Encode(map[string]string{"error": errMsg})
-		return
-	}
-
-	profiles, err := DiscoverKiroProfiles(account)
-	if err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	valid := false
-	for _, p := range profiles {
-		if p.ARN == req.ProfileArn {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "profileArn is not one of the discovered profiles"})
-		return
-	}
-
-	if err := config.UpdateAccountProfileArn(id, req.ProfileArn); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	h.pool.Reload()
-
-	// The model list is region-scoped: a profile in another region can expose a
-	// different set, so refresh the cache for the new pin right away instead of
-	// serving the old region's models until the next scheduled refresh. Failure
-	// here must not undo the switch — the ARN is already persisted — so it is
-	// reported alongside success rather than as an error status.
-	account.ProfileArn = req.ProfileArn
-	modelsRefreshed := true
-	if err := h.fetchAndCacheAccountModels(account); err != nil {
-		modelsRefreshed = false
-		logger.Warnf("[ProfileArn] Model refresh after profile switch failed for %s: %v", accountEmailForLog(account), err)
-	}
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":         true,
-		"profileArn":      req.ProfileArn,
-		"modelsRefreshed": modelsRefreshed,
-	})
-}
-
-// lookupAccountForProfileOps fetches an account copy (with the pool's freshest
-// tokens) for profile discovery/switch, restricted to external_idp accounts.
-// Returns (nil, httpStatus, message) when not found (404) or not eligible (400).
-func (h *Handler) lookupAccountForProfileOps(id string) (*config.Account, int, string) {
-	accounts := config.GetAccounts()
-	var account *config.Account
-	for i := range accounts {
-		if accounts[i].ID == id {
-			account = &accounts[i]
-			break
-		}
-	}
-	if account == nil {
-		return nil, 404, "Account not found"
-	}
-	if !strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
-		return nil, 400, "profile switching is only supported for external_idp accounts"
-	}
-	// 与 apiRefreshAccountModels 一致：用 pool 中运行时最新 token 探测，避免用到
-	// 已被刷新淘汰的磁盘态 token。
-	if latest := h.pool.GetByID(id); latest != nil {
-		account.AccessToken = latest.AccessToken
-		account.RefreshToken = latest.RefreshToken
-		account.ExpiresAt = latest.ExpiresAt
-		account.ProfileArn = latest.ProfileArn
-	}
-	return account, 200, ""
-}
-
-// apiPollKiroSso reports the hosted-portal sign-in status. While the user is signing in it
-// returns completed=false; once the listener captures the authorization code it exchanges it,
-// persists the account (AuthMethod "external_idp" for an Azure tenant, "social" otherwise), and
-// returns completed=true. The profileArn is resolved lazily on first use (the EXTERNAL_IDP
-// token type header is now sent on CodeWhisperer calls), so it is not required here.
-func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SessionID string `json:"sessionId"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	result, status, err := auth.PollKiroSsoAuth(req.SessionID)
-	if err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   err.Error(),
-		})
-		return
-	}
-
-	if status == "pending" {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":   true,
-			"completed": false,
-			"status":    "pending",
-		})
-		return
-	}
-
-	// 授权完成。external_idp（Azure 租户）账号的 home region 在登录时未知，且同一
-	// 账号可能在多个 region 各有一个 Kiro profile（例如 US 与 EU）。这里在建号前
-	// 主动跨 region 探测全部 profile：
-	//   0 个 → 维持旧行为，ProfileArn 留空、首次使用时懒解析；
-	//   1 个 → 直接固定该 profile（免去日后懒探测）；
-	//   2+ 个 → 暂不建号，把兑换好的 token 与 profile 列表暂存，让前端弹出选择器,
-	//           由 /auth/kiro-sso/select-profile 完成建号。
-	machineId := config.GenerateMachineId()
-	// Token 过期时刻在“兑换完成”的此刻定格。choose_profile 分支可能让 token 在
-	// 暂存区躺上几分钟，若到建号时才用 ExpiresIn 计算，过期时刻会被高估，导致
-	// 主动刷新（tokenRefreshSkewSeconds）错过真实截止时间。
-	tokenExpiresAt := time.Now().Unix() + int64(result.ExpiresIn)
-	if result.AuthMethod == "external_idp" && strings.TrimSpace(result.ProfileArn) == "" {
-		// 探测用临时账号：仅承载调用 ListAvailableProfiles 所需的凭证字段，不落盘。
-		probe := &config.Account{
-			Email:       result.Email,
-			AccessToken: result.AccessToken,
-			AuthMethod:  result.AuthMethod,
-			Provider:    result.Provider,
-			Region:      result.Region,
-			MachineId:   machineId,
-		}
-		profiles, err := DiscoverKiroProfiles(probe)
-		if err != nil {
-			// 探测失败不阻断建号：回退到与旧版一致的懒解析路径。
-			logger.Warnf("[KiroSSO] Profile discovery failed for %s, falling back to lazy resolution: %v", result.Email, err)
-		}
-		switch {
-		case len(profiles) == 1:
-			result.ProfileArn = profiles[0].ARN
-		case len(profiles) >= 2:
-			stashPendingKiroSsoChoice(req.SessionID, &pendingKiroSsoChoice{
-				result:    result,
-				machineId: machineId,
-				profiles:  profiles,
-				expiresAt: tokenExpiresAt,
-				deadline:  time.Now().Add(kiroSsoChoiceTTL),
-			})
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success":   true,
-				"completed": true,
-				"status":    "choose_profile",
-				"profiles":  profiles,
-			})
-			return
-		}
-	}
-
-	h.finalizeKiroSsoAccount(w, result, machineId, tokenExpiresAt)
-}
-
-// buildKiroSsoAccount assembles the persisted account record from an exchanged
-// hosted-portal credential. Shared by the immediate path (0/1 profile) and the
-// deferred path (operator picked one of several profiles), so both create
-// byte-identical accounts. expiresAt is the absolute token expiry stamped at
-// exchange time — never derived from ExpiresIn here, because on the deferred
-// path minutes may have passed since the exchange.
-func buildKiroSsoAccount(result *auth.KiroSsoResult, machineId string, expiresAt int64) config.Account {
-	return config.Account{
-		ID:            auth.GenerateAccountID(),
-		Email:         result.Email,
-		AccessToken:   result.AccessToken,
-		RefreshToken:  result.RefreshToken,
-		ClientID:      result.ClientID,
-		AuthMethod:    result.AuthMethod,
-		Provider:      result.Provider,
-		Region:        result.Region,
-		ProfileArn:    result.ProfileArn,
-		TokenEndpoint: result.TokenEndpoint,
-		IssuerURL:     result.IssuerURL,
-		Scopes:        result.Scopes,
-		ExpiresAt:     expiresAt,
-		Enabled:       true,
-		MachineId:     machineId,
-	}
-}
-
-// finalizeKiroSsoAccount persists the account and writes the completed response.
-func (h *Handler) finalizeKiroSsoAccount(w http.ResponseWriter, result *auth.KiroSsoResult, machineId string, expiresAt int64) {
-	account := buildKiroSsoAccount(result, machineId, expiresAt)
-
-	if err := config.AddAccount(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	h.pool.Reload()
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":   true,
-		"completed": true,
-		"account": map[string]interface{}{
-			"id":         account.ID,
-			"email":      account.Email,
-			"authMethod": account.AuthMethod,
-		},
-	})
-}
-
-func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		BearerToken string `json:"bearerToken"`
-		Region      string `json:"region"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	if req.BearerToken == "" {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "bearerToken is required"})
-		return
-	}
-
-	// 支持批量导入，按行分割
-	tokens := strings.Split(strings.TrimSpace(req.BearerToken), "\n")
-	var imported []map[string]interface{}
-	var errors []string
-
-	for _, token := range tokens {
-		token = strings.TrimSpace(token)
-		if token == "" {
-			continue
-		}
-
-		accessToken, refreshToken, clientID, clientSecret, expiresIn, err := auth.ImportFromSsoToken(token, req.Region)
-		if err != nil {
-			errors = append(errors, err.Error())
-			continue
-		}
-
-		// 获取用户信息
-		email, _, _ := auth.GetUserInfo(accessToken)
-
-		// 创建账号
-		account := config.Account{
-			ID:           auth.GenerateAccountID(),
-			Email:        email,
-			AccessToken:  accessToken,
-			RefreshToken: refreshToken,
-			ClientID:     clientID,
-			ClientSecret: clientSecret,
-			AuthMethod:   "idc",
-			Region:       req.Region,
-			ExpiresAt:    time.Now().Unix() + int64(expiresIn),
-			Enabled:      true,
-			MachineId:    config.GenerateMachineId(),
-		}
-
-		if err := config.AddAccount(account); err != nil {
-			errors = append(errors, err.Error())
-			continue
-		}
-
-		imported = append(imported, map[string]interface{}{
-			"id":    account.ID,
-			"email": account.Email,
-		})
-	}
-
-	h.pool.Reload()
-
-	if len(imported) == 0 && len(errors) > 0 {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   strings.Join(errors, "; "),
-		})
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":  true,
-		"accounts": imported,
-		"errors":   errors,
-	})
-}
-
 // genericExternalIdpTokenResponse is the OAuth2 token-endpoint response shape
 // shared by any enterprise IdP that speaks the standard refresh_token grant
 // (RFC 6749 §6) — the same wire format Microsoft's endpoint uses, but this
@@ -4946,16 +6502,6 @@ type genericExternalIdpTokenResponse struct {
 // unbounded body at a still-open connection.
 const genericExternalIdpMaxResponseBytes = 256 << 10
 
-// refreshGenericExternalIdpToken performs a plain OAuth2 refresh_token grant
-// against a NON-Microsoft external IdP (see apiImportCredentials' generic vs
-// microsoftClassified split). It deliberately does NOT call into
-// auth.RefreshToken / auth.ValidateExternalIdpConfiguration: those enforce a
-// Microsoft-specific client_id (UUID) + tenant-bound issuer/endpoint match
-// that a generic enterprise IdP has no reason to satisfy. The one security
-// invariant this path keeps is the shared SSRF guard (tokenEndpoint must
-// already have passed auth.ValidateExternalIdpEndpoint before this is called;
-// this function re-validates it defensively) and no-redirect-following (a
-// redirect could bounce the refresh token to an attacker host).
 func refreshGenericExternalIdpToken(refreshToken, clientID, tokenEndpoint, scopes string) (accessToken, newRefreshToken string, expiresAt int64, err error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	clientID = strings.TrimSpace(clientID)
@@ -5032,76 +6578,11 @@ func refreshGenericExternalIdpToken(refreshToken, clientID, tokenEndpoint, scope
 	return token.AccessToken, newRefreshToken, time.Now().Unix() + token.ExpiresIn, nil
 }
 
-func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
-	// Cap the body: accessToken becomes attacker-influenced input that is base64- and
-	// JSON-decoded twice (issuerFromAccessTokenJWT / ExpFromAccessTokenJWT). Without a
-	// limit an oversized token is a memory-amplification DoS. Mirrors the io.LimitReader
-	// guard on outbound IdP responses in auth/kiro_sso.go's oidcDiscover.
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
-		return
-	}
-	// decodeImportRequest (cli_json_import.go) accepts both the legacy camelCase
-	// payload this endpoint has always taken AND the kiro-login-helper.py
-	// snake_case shape (token_endpoint, issuer_url, profile_arn, ...), so a raw
-	// helper export can be pasted here unmodified. It intentionally does NOT
-	// collapse authMethod onto a canonical bucket — see importCredentialRequest's
-	// doc comment: the classifier below needs the raw alias (e.g. "AzureAD") to
-	// detect an explicit Microsoft declaration before any bucketing happens.
-	req, err := decodeImportRequest(body)
-	if err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-
-	// h.importCredential is the single core every import path (this endpoint,
-	// /auth/import-cli-json, /auth/import-ide-cache, and the directory watcher)
-	// funnels through, so all of them get identical classification, SSRF
-	// allow-listing, and trust-on-import behavior — see its doc comment.
-	result, err := h.importCredential(req)
-	if err != nil {
-		if _, ok := err.(*importValidationError); ok {
-			w.WriteHeader(importErrorStatus(err))
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-		// Persistence failure (duplicate id/refresh-token/api-key, or a config
-		// write error). A refresh may have already rotated the IdP refresh token
-		// before persistence failed; surface it so the operator can retry without
-		// a full interactive re-login (writeAddAccountError's existing contract).
-		h.writeAddAccountError(w, err, result.RotatedRefreshToken)
-		return
-	}
-
-	h.pool.Reload()
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"account": map[string]interface{}{
-			"id":    result.Account.ID,
-			"email": result.Account.Email,
-		},
-	})
-}
-
-// importCredentialResult carries the account a successful h.importCredential
-// call persisted, plus any refresh token the IdP rotated before a LATER step
-// (persistence) failed — the legacy single-item endpoint surfaces that via
-// writeAddAccountError's "retry with rotatedRefreshToken" hint even though the
-// import itself did not succeed.
 type importCredentialResult struct {
 	Account             config.Account
 	RotatedRefreshToken string
 }
 
-// importValidationError marks an import failure caused by bad/missing input (a
-// 400) as opposed to a persistence failure (409 on a known duplicate, else 500
-// — writeAddAccountError already maps those). importErrorStatus maps it to the
-// right HTTP status so every caller (this endpoint, the batch cli-json
-// endpoint, the IDE-cache endpoint) is consistent.
 type importValidationError struct{ msg string }
 
 func (e *importValidationError) Error() string { return e.msg }
@@ -5113,15 +6594,6 @@ func importErrorStatus(err error) int {
 	return http.StatusInternalServerError
 }
 
-// importCredential is the single source of truth for turning a normalized
-// importCredentialRequest into a persisted account. apiImportCredentials,
-// apiImportCliJson, apiImportIdeCache, and the directory watcher all funnel
-// through here — this is deliberate: it is the ONLY place that decides whether
-// an external_idp credential is "genuinely Microsoft" (strict client_id/tenant
-// validation, mandatory live refresh) or "generic" (loose allow-list only,
-// trust-on-import). Forking a second classifier for a new import path would
-// risk the exact regression this classifier was written to fix — see the
-// microsoftClassified comment below.
 func (h *Handler) importCredential(req importCredentialRequest) (importCredentialResult, error) {
 	req.RefreshToken = strings.TrimSpace(req.RefreshToken)
 	req.KiroApiKey = strings.TrimSpace(req.KiroApiKey)
@@ -5233,11 +6705,12 @@ func (h *Handler) importCredential(req importCredentialRequest) (importCredentia
 			return importCredentialResult{}, err
 		}
 		if account.Enabled && account.AccessToken != "" {
-			go func(acc config.Account) {
+			acc := account.Clone()
+			h.startBackgroundTask(func() {
 				if err := h.fetchAndCacheAccountModels(&acc); err != nil {
 					logger.Warnf("[ModelsCache] Auto-refresh failed for new API key account %s: %v", acc.Email, err)
 				}
-			}(account)
+			})
 		}
 		return importCredentialResult{Account: account}, nil
 	}
@@ -5291,7 +6764,9 @@ func (h *Handler) importCredential(req importCredentialRequest) (importCredentia
 	// exports that carry only userId + accessToken. NOTE: this only decides
 	// AuthMethod (external_idp vs idc/social); it does NOT imply "genuinely
 	// Microsoft" — see microsoftClassified below.
-	if req.AuthMethod != auth.MicrosoftSSOAuthMethod && derivedTokenEndpoint != "" &&
+	explicitNonExternal := am == "idc" || am == "builderid" || am == "enterprise" ||
+		am == "social" || am == "google" || am == "github"
+	if !explicitNonExternal && req.AuthMethod != auth.MicrosoftSSOAuthMethod && derivedTokenEndpoint != "" &&
 		auth.ValidateExternalIdpEndpoint(derivedTokenEndpoint) == nil {
 		req.AuthMethod = auth.MicrosoftSSOAuthMethod
 	}
@@ -5570,14 +7045,6 @@ func (h *Handler) importCredential(req importCredentialRequest) (importCredentia
 	return importCredentialResult{Account: account}, nil
 }
 
-// apiImportCliJson ingests one or many CLIProxyAPI_*.json documents produced by
-// kiro-login-helper.py (the standalone Microsoft 365 / Entra ID sign-in helper).
-// It accepts a single helper object, a JSON array, a { "files": [...] } /
-// { "accounts": [...] } wrapper, or raw text with several objects, normalizes
-// each (snake_case native, camelCase tolerated), and imports each through
-// h.importCredential — the SAME core apiImportCredentials uses. Per-item
-// results are returned so a partial batch still reports which credentials
-// landed.
 func (h *Handler) apiImportCliJson(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
@@ -5652,12 +7119,6 @@ func (h *Handler) apiImportCliJson(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// apiImportIdeCache imports the credential the Kiro IDE already cached on this
-// host (~/.aws/sso/cache/kiro-auth-token.json), with no browser sign-in. The
-// cache location comes ONLY from the server-side KIRO_IDE_CACHE env var, else
-// the default path — NEVER from the request body. It funnels through the same
-// h.importCredential core as every other import path, so the persisted account
-// is identical to an interactive Enterprise SSO login.
 func (h *Handler) apiImportIdeCache(w http.ResponseWriter, r *http.Request) {
 	// Cap the body like every other import route (apiImportCredentials,
 	// apiImportCliJson) — even though its one field is now ignored (see
@@ -5713,75 +7174,6 @@ func (h *Handler) apiImportIdeCache(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// externalIdpAuthMethodAliases are lower-cased authMethod values (or Kiro Account
-// Manager provider labels) that mean "external IdP / enterprise SSO" and must
-// normalize to "external_idp".
-var externalIdpAuthMethodAliases = map[string]bool{
-	"external_idp": true,
-	"azuread":      true,
-	"azure":        true,
-	"entra":        true,
-	"entra-id":     true,
-	"entra_id":     true,
-	"microsoft":    true,
-	"m365":         true,
-	"office365":    true,
-	"external":     true,
-}
-
-// normalizeImportAuthMethod maps a pasted credential JSON's authMethod (plus its
-// clientId/clientSecret/tokenEndpoint) onto one of the four canonical methods
-// ("external_idp" | "idc" | "social" | "api_key"). external_idp MUST be detected
-// before the clientId+clientSecret→idc inference, because external_idp accounts
-// carry clientId but NO clientSecret, so the old default branch misclassified
-// them as "social" and refresh hit the wrong endpoint.
-//
-// It preserves the pre-existing idc/social heuristics:
-//   - empty authMethod + clientId present             -> idc
-//   - empty authMethod, no clientId                   -> social
-//   - "enterprise" (Kiro Account Manager IdC label)   -> idc
-//   - unrecognized non-empty + clientId+clientSecret  -> idc, else social
-//
-// The explicit api_key aliases exist so duplicateAccountReason (import_watcher.go)
-// can compare a dropped file's raw authMethod against a persisted api_key
-// account's canonical AuthMethod (FIX8): without this case an api_key blob fell
-// through to "social" here, so email+method never matched a real api_key
-// duplicate and the file landed in failed/ instead of processed/ on every
-// re-drop of an already-imported key (a real duplicate is still caught by
-// config.AddAccount's own AccountAPIKeyExists check — this only affects which
-// subdir the watcher files the drop into, not whether the duplicate is allowed
-// through).
-func normalizeImportAuthMethod(authMethod, clientID, clientSecret, tokenEndpoint string) string {
-	am := strings.ToLower(strings.TrimSpace(authMethod))
-	switch {
-	case am == "api_key" || am == "apikey" || am == "kiro_api_key":
-		return "api_key"
-	case externalIdpAuthMethodAliases[am]:
-		return "external_idp"
-	case am == "social" || am == "google" || am == "github":
-		return "social"
-	case am == "idc" || am == "builderid" || am == "enterprise":
-		return "idc"
-	// tokenEndpoint only infers external_idp when authMethod was NOT declared —
-	// an explicit idc/social must win over an incidental tokenEndpoint field
-	// (e.g. a mixed JSON template carrying both), or a request that clearly
-	// asked for idc/social would get silently redirected to the Microsoft
-	// validation path above and rejected before its own refresh ever runs.
-	case am == "" && tokenEndpoint != "":
-		return "external_idp"
-	}
-	if am == "" {
-		if clientID != "" {
-			return "idc"
-		}
-		return "social"
-	}
-	if clientID != "" && clientSecret != "" {
-		return "idc"
-	}
-	return "social"
-}
-
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"version":         config.Version,
@@ -5797,13 +7189,16 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
+	responseLanguage := config.GetResponseLanguageConfig()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":            config.GetApiKey(),
-		"requireApiKey":     config.IsApiKeyRequired(),
-		"port":              config.GetPort(),
-		"host":              config.GetHost(),
-		"allowOverUsage":    config.GetAllowOverUsage(),
-		"agentToolSteering": config.GetAgentToolSteering(),
+		"apiKey":                 config.GetApiKey(),
+		"requireApiKey":          config.IsApiKeyRequired(),
+		"port":                   config.GetPort(),
+		"host":                   config.GetHost(),
+		"allowOverUsage":         config.GetAllowOverUsage(),
+		"agentToolSteering":      config.GetAgentToolSteering(),
+		"responseLanguagePolicy": responseLanguage.Policy,
+		"responseLanguage":       responseLanguage.Language,
 	})
 }
 
@@ -5852,16 +7247,38 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey            *string `json:"apiKey,omitempty"`
-		RequireApiKey     *bool   `json:"requireApiKey,omitempty"`
-		Password          string  `json:"password,omitempty"`
-		AllowOverUsage    *bool   `json:"allowOverUsage,omitempty"`
-		AgentToolSteering *bool   `json:"agentToolSteering,omitempty"`
+		ApiKey                 *string `json:"apiKey,omitempty"`
+		RequireApiKey          *bool   `json:"requireApiKey,omitempty"`
+		Password               string  `json:"password,omitempty"`
+		AllowOverUsage         *bool   `json:"allowOverUsage,omitempty"`
+		AgentToolSteering      *bool   `json:"agentToolSteering,omitempty"`
+		ResponseLanguagePolicy *string `json:"responseLanguagePolicy,omitempty"`
+		ResponseLanguage       *string `json:"responseLanguage,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
+	}
+
+	var responseLanguageUpdate *config.ResponseLanguageConfig
+	if req.ResponseLanguagePolicy != nil || req.ResponseLanguage != nil {
+		current := config.GetResponseLanguageConfig()
+		policy := current.Policy
+		language := current.Language
+		if req.ResponseLanguagePolicy != nil {
+			policy = *req.ResponseLanguagePolicy
+		}
+		if req.ResponseLanguage != nil {
+			language = *req.ResponseLanguage
+		}
+		normalized, err := config.NormalizeResponseLanguageConfig(policy, language)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		responseLanguageUpdate = &normalized
 	}
 
 	if err := config.UpdateSettingsPatch(req.ApiKey, req.RequireApiKey, req.Password); err != nil {
@@ -5884,6 +7301,14 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if req.AgentToolSteering != nil {
 		if err := config.UpdateAgentToolSteering(*req.AgentToolSteering); err != nil {
 			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	if responseLanguageUpdate != nil {
+		if err := config.UpdateResponseLanguageConfig(responseLanguageUpdate.Policy, responseLanguageUpdate.Language); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
@@ -5961,9 +7386,37 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		// learned region routes so the test re-sweeps every candidate region. Bedrock
 		// per-region access can flap, so a stale "not callable anywhere" negative-cache
 		// entry would otherwise mask a region whose access just reopened.
-		clearBedrockRegionRoutes(account.ID)
+		clearBedrockRegionRoutesForLifecycle(account)
+		bedrockThrottle.clearForLifecycle(account)
 		reply, err := h.bedrockTestReply(account, tReq.Model)
 		if err != nil {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "reply": reply})
+		return
+	}
+	if claudeAccountIsDirectAnthropic(account) {
+		var tReq struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&tReq)
+		testModel := strings.TrimSpace(tReq.Model)
+		if testModel == "" {
+			testModel = directAnthropicDefaultTestModel
+		}
+		reply, err := directAnthropicTestReply(r.Context(), account.BaseURL, account.KiroApiKey, testModel)
+		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
+			var responseErr *directAnthropicResponseError
+			if errors.As(err, &responseErr) {
+				h.handleDirectAnthropicFailure(account, testModel, responseErr)
+			} else {
+				h.setProviderCooldownForAccount(account, directAnthropicTransientCooldown)
+			}
 			w.WriteHeader(502)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
@@ -5976,8 +7429,16 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 			Model string `json:"model"`
 		}
 		json.NewDecoder(r.Body).Decode(&tReq)
-		reply, err := customApiTestReply(account.BaseURL, account.KiroApiKey, tReq.Model)
+		reply, err := customApiTestReply(
+			r.Context(),
+			account.BaseURL,
+			account.KiroApiKey,
+			tReq.Model,
+		)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
 			w.WriteHeader(502)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
@@ -6025,9 +7486,6 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 
 	err := CallKiroAPIContext(r.Context(), account, kiroPayload, callback)
 	if err != nil {
-		if r.Context().Err() != nil {
-			return
-		}
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -6057,100 +7515,29 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
-	// Custom API accounts have no Kiro token/usage to refresh. "Refresh" for them means
-	// re-validating the upstream key against its /api/me quota and reloading the model
-	// list from the upstream /v1/models — never a Kiro/AWS call.
-	if account.IsBedrock() {
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Bedrock account; nothing to refresh"})
-		return
-	}
-	if account.IsCustomApi() {
-		quota, err := probeCustomApiQuota(account.BaseURL, account.KiroApiKey)
-		if err != nil {
-			w.WriteHeader(502)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-		info := quota.toAccountInfo(time.Now().Unix())
-		if updateErr := config.UpdateAccountInfo(id, info); updateErr != nil {
-			logger.Warnf("[Refresh] custom_api quota persist failed for %s: %v", account.ID, updateErr)
-		}
-		if err := h.fetchAndCacheAccountModels(account); err != nil {
-			logger.Warnf("[Refresh] custom_api model reload failed for %s: %v", account.ID, err)
-		}
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "info": info})
-		return
-	}
-
-	// 先尝试刷新 token（不管是否过期，确保 token 有效）
-	refreshTokenIfNeeded := func() error {
-		if account.RefreshToken == "" {
-			return nil
-		}
-		_, err := h.refreshAccountToken(account, true)
-		return err
-	}
-
-	// 检查 token 是否快过期，先刷新
-	if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-		if err := refreshTokenIfNeeded(); err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
-			return
-		}
-	}
-
-	// 获取账户信息
-	info, err := RefreshAccountInfo(account)
+	outcome, err := h.refreshAccountByKind(r.Context(), account, accountRefreshExplicit)
 	if err != nil {
-		// 检查是否为封禁相关错误
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") || strings.Contains(errMsg, "Account suspended") {
-			// 封禁状态已在 RefreshAccountInfo 中处理，静默返回成功
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": true,
-				"message": "Account status updated",
-			})
-			return
+		status := http.StatusInternalServerError
+		if account.IsCustomApi() || account.IsDirectAnthropic() {
+			status = http.StatusBadGateway
 		}
-
-		// 如果是 403/401，说明 token 无效，尝试刷新后重试
-		if shouldRetryAccountRefreshOnError(errMsg) {
-			if refreshErr := refreshTokenIfNeeded(); refreshErr == nil {
-				// 重试
-				info, err = RefreshAccountInfo(account)
-				if err != nil {
-					// 重试后仍然失败，检查是否为封禁状态
-					if strings.Contains(err.Error(), "TEMPORARILY_SUSPENDED") || strings.Contains(err.Error(), "Account suspended") {
-						json.NewEncoder(w).Encode(map[string]interface{}{
-							"success": true,
-							"message": "Account status updated",
-						})
-						return
-					}
-				}
-			}
-		}
-
-		// 其他错误才显示错误信息
-		if err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-	}
-
-	// 保存到配置
-	if err := config.UpdateAccountInfo(id, *info); err != nil {
-		w.WriteHeader(500)
+		w.WriteHeader(status)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"info":    info,
-	})
+	response := map[string]interface{}{"success": true}
+	if outcome != nil {
+		if outcome.Info != nil {
+			response["info"] = outcome.Info
+		}
+		if outcome.Message != "" {
+			response["message"] = outcome.Message
+		}
+	}
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(response)
+
 }
 
 // apiGetAccountFull 获取单个账号的完整信息（包含敏感字段）
@@ -6256,19 +7643,12 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 	// Custom API accounts serve whatever the linked pool serves: load the model list
 	// from the upstream provider's /v1/models, not from Kiro/AWS.
 	if account.IsBedrock() {
-		// Prefer live-discovered callable models (access agreement AVAILABLE); fall
-		// back to the account/default static map when discovery is unavailable (e.g.
-		// the key lacks bedrock:ListFoundationModels).
+		// Prefer live-discovered callable models. Explicit account mappings are
+		// operator evidence; built-in defaults are resolver conveniences only and
+		// must not manufacture availability in the admin/public model view.
 		ids := h.cachedOrDiscoverBedrockModels(account)
-		if len(ids) == 0 {
-			for _, v := range account.BedrockModelMap {
-				ids = append(ids, v)
-			}
-		}
-		if len(ids) == 0 {
-			for _, v := range defaultBedrockModelMap {
-				ids = append(ids, v)
-			}
+		for _, value := range account.BedrockModelMap {
+			ids = mergeStringLists(ids, []string{value})
 		}
 		// The panel expects {success, models:[{modelId}]} (same shape as custom_api),
 		// not a bare string array. Annotate each model with its learned callable
@@ -6277,27 +7657,30 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		models := make([]map[string]interface{}, 0, len(ids))
 		for _, mid := range ids {
 			region := ""
-			if r, ok := getBedrockRoute(account.ID, mid); ok && r.callable {
+			if r, ok := getBedrockRouteForAccount(account, mid); ok && r.callable {
 				region = r.region
 			}
 			models = append(models, map[string]interface{}{"modelId": mid, "region": region})
 		}
-		h.pool.SetModelList(account.ID, ids)
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models, "candidateRegions": candidateRegions(account)})
 		return
 	}
-	if account.IsCustomApi() {
-		models, err := probeCustomApiModels(account.BaseURL, account.KiroApiKey)
+	if account.IsCustomApi() || account.IsDirectAnthropic() {
+		var models []ModelInfo
+		var err error
+		if account.IsDirectAnthropic() {
+			models, err = probeDirectAnthropicModels(r.Context(), account.BaseURL, account.KiroApiKey)
+		} else {
+			models, err = probeCustomApiModelsWithContext(r.Context(), account.BaseURL, account.KiroApiKey)
+		}
 		if err != nil {
+			if account.IsDirectAnthropic() && r.Context().Err() == nil {
+				h.handleDirectAnthropicDiscoveryFailure(account, err)
+			}
 			w.WriteHeader(502)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		modelIDs := make([]string, 0, len(models))
-		for _, m := range models {
-			modelIDs = append(modelIDs, m.ModelId)
-		}
-		h.pool.SetModelList(id, modelIDs)
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "models": models})
 		return
 	}
@@ -6308,17 +7691,6 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
-
-	// 同步更新路由缓存
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
-	}
-	h.pool.SetModelList(id, modelIDs)
-	h.modelsCacheMu.Lock()
-	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
-	h.modelsCacheTime = time.Now().Unix()
-	h.modelsCacheMu.Unlock()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
@@ -6606,47 +7978,11 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 
 	exportAccounts := make([]ExportAccount, 0, len(accounts))
 	for _, a := range accounts {
-		// API Key accounts are not OAuth credentials; export a flat-compatible shape.
-		if config.IsAPIKeyAccount(&a) {
-			exportAccounts = append(exportAccounts, ExportAccount{
-				ID:        a.ID,
-				Email:     a.Email,
-				Nickname:  a.Nickname,
-				Idp:       "APIKey",
-				UserId:    a.UserId,
-				MachineId: a.MachineId,
-				Credentials: ExportCredentials{
-					AccessToken:  a.KiroApiKey,
-					RefreshToken: "",
-					Region:       a.Region,
-					AuthMethod:   "api_key",
-					Provider:     "APIKey",
-				},
-				Subscription: ExportSubscription{
-					Type:  a.SubscriptionType,
-					Title: a.SubscriptionTitle,
-				},
-				Usage: ExportUsage{
-					Current:     a.UsageCurrent,
-					Limit:       a.UsageLimit,
-					PercentUsed: a.UsagePercent,
-					LastUpdated: a.LastRefresh,
-				},
-				Tags:       []string{"api_key"},
-				Status:     "active",
-				CreatedAt:  0,
-				LastUsedAt: a.LastUsed,
-			})
-			continue
-		}
-
 		// 映射 provider 到 idp
 		idp := a.Provider
 		if idp == "" {
 			if a.AuthMethod == "social" {
 				idp = "Google"
-			} else if a.AuthMethod == auth.MicrosoftSSOAuthMethod {
-				idp = auth.MicrosoftSSOProvider
 			} else {
 				idp = "BuilderId"
 			}

@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"kiro-go/config"
@@ -35,6 +34,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 
 	if err := config.AddAccount(config.Account{
 		ID:          "first",
+		AuthMethod:  "social",
 		Enabled:     true,
 		AccessToken: "token-first",
 		ProfileArn:  "arn:aws:codewhisperer:profile/first",
@@ -43,6 +43,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 	if err := config.AddAccount(config.Account{
 		ID:          "second",
+		AuthMethod:  "social",
 		Enabled:     true,
 		AccessToken: "token-second",
 		ProfileArn:  "arn:aws:codewhisperer:profile/second",
@@ -103,7 +104,20 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(context.Background(), rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "", nil, false)
+	h.handleClaudeNonStream(
+		rec,
+		payload,
+		"claude-sonnet-4.5",
+		false,
+		claudeThinkingResponseOptions{},
+		1,
+		nil,
+		"",
+		[]byte(`{"model":"claude-sonnet-4.5","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`),
+		false,
+		nil,
+		context.Background(),
+	)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry to succeed, status=%d body=%s", rec.Code, rec.Body.String())
@@ -126,51 +140,10 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	if len(resp.Content) == 0 || resp.Content[0].Text != "retried successfully" {
 		t.Fatalf("expected retried response content, got %#v", resp.Content)
 	}
-}
 
-func TestOpenAIHandlerPropagatesClientCancellation(t *testing.T) {
-	cfgFile := t.TempDir() + "/config.json"
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), "request-id", "client-cancel"))
-	defer cancel()
-	if err := config.AddAccount(config.Account{
-		ID: "cancel-test", Enabled: true, AuthMethod: "api_key", KiroApiKey: "ksk_test", ProxyURL: kiroRetryTestProxyURL,
-	}); err != nil {
-		t.Fatalf("add account: %v", err)
-	}
-
-	var calls int
-	oldClient, hadOldClient := proxyClientCache.Load(kiroRetryTestProxyURL)
-	proxyClientCache.Store(kiroRetryTestProxyURL, &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		calls++
-		if got := req.Context().Value("request-id"); got != "client-cancel" {
-			t.Fatalf("upstream request context value = %v, want client-cancel", got)
-		}
-		cancel()
-		return kiroStreamTestResponse(bytes.NewReader(nil)), nil
-	})})
-	t.Cleanup(func() {
-		if hadOldClient {
-			proxyClientCache.Store(kiroRetryTestProxyURL, oldClient)
-		} else {
-			proxyClientCache.Delete(kiroRetryTestProxyURL)
-		}
-	})
-
-	p := accountpool.GetPool()
-	p.Reload()
-	h := &Handler{pool: p, promptCache: newPromptCacheTracker(defaultPromptCacheTTL)}
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"claude-sonnet-4.5","messages":[{"role":"user","content":"hello"}]}`)).WithContext(ctx)
-	rec := httptest.NewRecorder()
-	h.handleOpenAIChat(rec, req)
-	if calls != 1 {
-		t.Fatalf("upstream calls=%d, want 1 after cancellation", calls)
-	}
-	if rec.Body.Len() != 0 {
-		t.Fatalf("canceled request must not write a proxy response, got %s", rec.Body.String())
-	}
+	// AccountPool.UpdateStats persists asynchronously. Wait before TempDir
+	// cleanup rotates the process-global config path for the next test.
+	p.WaitForPendingStats()
 }
 
 func TestThinkingSourceTagFirst(t *testing.T) {
@@ -243,16 +216,21 @@ func TestValidateOpenAIRequestShapeAllowsToolResultFinalTurn(t *testing.T) {
 	}
 }
 
-func TestValidateClaudeRequestShapeRejectsAssistantPrefill(t *testing.T) {
-	req := &ClaudeRequest{
-		Messages: []ClaudeMessage{
-			{Role: "user", Content: "hello"},
-			{Role: "assistant", Content: "prefill"},
-		},
+func TestClaudeRequestPlanRoutesAssistantPrefillByModelCapability(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-4.6","max_tokens":64,"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"prefill"}]}`)
+	plan, validationErr := buildClaudeRequestPlanWithResolver(
+		body,
+		nil,
+		"-thinking",
+		noClaudeReasoningCapability,
+	)
+	if validationErr != nil {
+		t.Fatal(validationErr)
 	}
-
-	if msg := validateClaudeRequestShape(req); msg == "" {
-		t.Fatalf("expected assistant-prefill final message to be rejected")
+	if !plan.Requirements.RequiresAssistantPrefill ||
+		plan.Requirements.Allowed != claudeTransportMaskCustom ||
+		plan.Requirements.AllowsKiro() {
+		t.Fatalf("assistant prefill requirements=%#v", plan.Requirements)
 	}
 }
 
@@ -396,32 +374,50 @@ func TestValidateClaudeThinkingConfig(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name:        "enabled requires budget",
+			name:        "adaptive rejects budget tokens",
+			thinking:    &ClaudeThinkingConfig{Type: "adaptive", BudgetTokens: 2048},
+			maxTokens:   4096,
+			expectError: true,
+		},
+		{
+			name:        "enabled without budget remains compatible",
 			thinking:    &ClaudeThinkingConfig{Type: "enabled"},
 			maxTokens:   4096,
-			expectError: true,
+			expectError: false,
 		},
 		{
-			name:        "enabled requires at least 1024 budget tokens",
+			name:        "small legacy budget is forwarded for backend validation",
 			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 512},
 			maxTokens:   4096,
-			expectError: true,
+			expectError: false,
 		},
 		{
-			name:        "enabled rejects max tokens zero",
+			name:        "enabled allows max tokens zero for backend validation",
 			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048},
 			maxTokens:   0,
-			expectError: true,
+			expectError: false,
 		},
 		{
-			name:        "enabled budget must stay below max tokens",
+			name:        "budget and max token relationship is backend validated",
 			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 4096},
+			maxTokens:   4096,
+			expectError: false,
+		},
+		{
+			name:        "negative budget remains invalid",
+			thinking:    &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: -1},
 			maxTokens:   4096,
 			expectError: true,
 		},
 		{
 			name:        "disabled rejects display",
 			thinking:    &ClaudeThinkingConfig{Type: "disabled", Display: "summarized"},
+			maxTokens:   4096,
+			expectError: true,
+		},
+		{
+			name:        "disabled rejects budget tokens",
+			thinking:    &ClaudeThinkingConfig{Type: "disabled", BudgetTokens: 2048},
 			maxTokens:   4096,
 			expectError: true,
 		},
@@ -451,15 +447,26 @@ func TestResolveClaudeThinkingResponseOptions(t *testing.T) {
 		name       string
 		thinking   *ClaudeThinkingConfig
 		defaultFmt string
+		model      string
+		capability ModelReasoningCapability
 		wantFmt    string
 		wantOmit   bool
 	}{
 		{
-			name:       "default config is preserved when display unset",
+			name:       "default config is preserved for summarized-default models",
 			thinking:   &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048},
 			defaultFmt: "think",
+			model:      "claude-sonnet-4.6",
 			wantFmt:    "think",
 			wantOmit:   false,
+		},
+		{
+			name:       "opus 5 defaults to omitted display",
+			thinking:   nil,
+			defaultFmt: "think",
+			model:      "claude-opus-5",
+			wantFmt:    "thinking",
+			wantOmit:   true,
 		},
 		{
 			name:       "summarized forces official thinking blocks",
@@ -479,12 +486,70 @@ func TestResolveClaudeThinkingResponseOptions(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			opts := resolveClaudeThinkingResponseOptions(tc.thinking, tc.defaultFmt)
+			opts := resolveClaudeThinkingResponseOptions(
+				tc.thinking,
+				tc.defaultFmt,
+				tc.model,
+				tc.capability,
+			)
 			if opts.Format != tc.wantFmt {
 				t.Fatalf("expected format %q, got %q", tc.wantFmt, opts.Format)
 			}
 			if opts.OmitDisplay != tc.wantOmit {
 				t.Fatalf("expected omitDisplay=%v, got %v", tc.wantOmit, opts.OmitDisplay)
+			}
+		})
+	}
+}
+
+func TestResolveClaudeEffectiveThinking(t *testing.T) {
+	tests := []struct {
+		name       string
+		req        *ClaudeRequest
+		capability ModelReasoningCapability
+		want       bool
+	}{
+		{
+			name: "opus 5 is on by default",
+			req:  &ClaudeRequest{Model: "claude-opus-5"},
+			want: true,
+		},
+		{
+			name: "sonnet 5 is on by default",
+			req:  &ClaudeRequest{Model: "claude-sonnet-5"},
+			want: true,
+		},
+		{
+			name: "opus 4.8 remains opt in",
+			req:  &ClaudeRequest{Model: "claude-opus-4.8"},
+			want: false,
+		},
+		{
+			name: "explicit disabled overrides opus 5 default",
+			req: &ClaudeRequest{
+				Model:    "claude-opus-5",
+				Thinking: &ClaudeThinkingConfig{Type: "disabled"},
+				OutputConfig: &ClaudeOutputConfig{
+					Effort: "high",
+				},
+			},
+			want: false,
+		},
+		{
+			name: "schema default takes precedence over model fallback",
+			req:  &ClaudeRequest{Model: "custom-claude"},
+			capability: ModelReasoningCapability{
+				DefaultThinkingType: "adaptive",
+			},
+			want: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveClaudeEffectiveThinking(tc.req, false, false, tc.capability)
+			if got != tc.want {
+				t.Fatalf("thinking=%v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -576,180 +641,111 @@ func TestStatsIncludesCacheMetrics(t *testing.T) {
 	}
 }
 
-func TestOpenAIStreamReportsPostOutputUpstreamFailure(t *testing.T) {
-	cfgFile := t.TempDir() + "/config.json"
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
+func TestClaudeMidConversationSystemMessagesAllowKiroEmulation(t *testing.T) {
+	req := ClaudeRequest{
+		Model:     "claude-opus-5",
+		MaxTokens: 64,
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Start."},
+			{Role: "system", Content: "Use the new constraint."},
+			{Role: "assistant", Content: "Understood."},
+			{Role: "user", Content: "Continue."},
+		},
 	}
-	if err := config.AddAccount(config.Account{
-		ID:          "test-account",
-		Enabled:     true,
-		AccessToken: "token-test",
-		ProfileArn:  "arn:aws:codewhisperer:profile/test",
-	}); err != nil {
-		t.Fatalf("add account: %v", err)
+	if msg := validateClaudeMidConversationSystemMessages(req.Messages); msg != "" {
+		t.Fatalf("valid mid-conversation system placement rejected: %s", msg)
 	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set preferred endpoint: %v", err)
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable endpoint fallback: %v", err)
+	plan, validationErr := buildClaudeRequestPlanWithResolver(
+		body,
+		nil,
+		"-thinking",
+		noClaudeReasoningCapability,
+	)
+	if validationErr != nil {
+		t.Fatal(validationErr)
 	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": strings.Repeat("partial answer ", 8),
-		}))
-		_, _ = w.Write([]byte{0, 0, 1})
-	}))
-	defer server.Close()
-	// swapKiroEndpointsForTest also stubs kiroRestHttpStore (see its comment):
-	// handleOpenAIChat's reasoningCapabilityForModel warms the model cache in
-	// the background on a miss, and that must not be able to touch the real
-	// network / ProxyFromEnvironment from this test.
-	defer swapKiroEndpointsForTest(t, server)()
-
-	p := accountpool.GetPool()
-	p.Reload()
-	h := &Handler{
-		pool:        p,
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	if !plan.Requirements.RequiresMidConversationSystem ||
+		!plan.Requirements.AllowsKiro() ||
+		!plan.Requirements.Allows(claudeTransportDirectAnthropic) {
+		t.Fatalf("mid-conversation requirements=%#v", plan.Requirements)
 	}
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
-		"model":"claude-sonnet-4.5",
-		"messages":[{"role":"user","content":"hello"}],
-		"stream":true
-	}`))
-	rec := httptest.NewRecorder()
-	h.handleOpenAIChat(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected stream status 200, got %d body=%s", rec.Code, rec.Body.String())
+	if plan.KiroProjection.Fidelity != claudeProjectionEmulated ||
+		!strings.Contains(plan.KiroProjection.Summary(), "mid_conversation_system") {
+		t.Fatalf("mid-conversation projection=%s summary=%s", plan.KiroProjection.Fidelity, plan.KiroProjection.Summary())
 	}
-	body := rec.Body.String()
-	if !strings.Contains(body, "partial answer") {
-		t.Fatalf("expected partial content before failure, got %s", body)
-	}
-	if !strings.Contains(body, `"error"`) || !strings.Contains(body, `"message"`) {
-		t.Fatalf("expected an SSE error after partial content, got %s", body)
-	}
-	if strings.Contains(body, "[DONE]") {
-		t.Fatalf("a failed stream must not report completion, got %s", body)
+	if len(plan.Request.Messages) != len(req.Messages) ||
+		plan.Request.Messages[1].Role != "system" ||
+		plan.Request.Messages[1].Content != "Use the new constraint." {
+		t.Fatalf("system message was not preserved: %#v", plan.Request.Messages)
 	}
 }
 
-func TestClaudeResponsePreservesUpstreamMaxTokensStopReason(t *testing.T) {
-	cfgFile := t.TempDir() + "/config.json"
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
-	if err := config.AddAccount(config.Account{
-		ID:          "test-account",
-		Enabled:     true,
-		AccessToken: "token-test",
-		ProfileArn:  "arn:aws:codewhisperer:profile/test",
-	}); err != nil {
-		t.Fatalf("add account: %v", err)
-	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set preferred endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable endpoint fallback: %v", err)
+func TestClaudeMidConversationSystemMessagePlacementValidation(t *testing.T) {
+	serverResult := []map[string]interface{}{{
+		"type":        "web_search_tool_result",
+		"tool_use_id": "srv-1",
+		"content":     "done",
+	}}
+
+	tests := []struct {
+		name     string
+		messages []ClaudeMessage
+		wantErr  bool
+	}{
+		{
+			name: "system first",
+			messages: []ClaudeMessage{
+				{Role: "system", Content: "bad"},
+				{Role: "user", Content: "continue"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "system followed by user",
+			messages: []ClaudeMessage{
+				{Role: "user", Content: "start"},
+				{Role: "system", Content: "bad"},
+				{Role: "user", Content: "continue"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "system after ordinary assistant",
+			messages: []ClaudeMessage{
+				{Role: "user", Content: "start"},
+				{Role: "assistant", Content: "plain text"},
+				{Role: "system", Content: "bad"},
+				{Role: "assistant", Content: "continue"},
+				{Role: "user", Content: "finish"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "system after assistant server result",
+			messages: []ClaudeMessage{
+				{Role: "user", Content: "start"},
+				{Role: "assistant", Content: serverResult},
+				{Role: "system", Content: "valid"},
+				{Role: "assistant", Content: "continue"},
+				{Role: "user", Content: "finish"},
+			},
+			wantErr: false,
+		},
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "partial answer",
-		}))
-		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
-			"stopReason": "MAX_TOKENS",
-		}))
-	}))
-	defer server.Close()
-	defer swapKiroEndpointsForTest(t, server)()
-
-	p := accountpool.GetPool()
-	p.Reload()
-	h := &Handler{
-		pool:        p,
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
-		"model":"claude-sonnet-4.5",
-		"max_tokens":100,
-		"messages":[{"role":"user","content":"hello"}]
-	}`))
-	rec := httptest.NewRecorder()
-	h.handleClaudeMessages(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	var response ClaudeResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
-	}
-	if response.StopReason != "max_tokens" {
-		t.Fatalf("stop_reason=%q, want max_tokens", response.StopReason)
-	}
-}
-
-func TestOpenAIStreamPreservesUpstreamMaxTokensFinishReason(t *testing.T) {
-	cfgFile := t.TempDir() + "/config.json"
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
-	if err := config.AddAccount(config.Account{
-		ID:          "test-account",
-		Enabled:     true,
-		AccessToken: "token-test",
-		ProfileArn:  "arn:aws:codewhisperer:profile/test",
-	}); err != nil {
-		t.Fatalf("add account: %v", err)
-	}
-	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
-		t.Fatalf("set preferred endpoint: %v", err)
-	}
-	if err := config.UpdateEndpointFallback(false); err != nil {
-		t.Fatalf("disable endpoint fallback: %v", err)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "partial answer",
-		}))
-		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
-			"stopReason": "MAX_TOKENS",
-		}))
-	}))
-	defer server.Close()
-	defer swapKiroEndpointsForTest(t, server)()
-
-	p := accountpool.GetPool()
-	p.Reload()
-	h := &Handler{
-		pool:        p,
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
-		"model":"claude-sonnet-4.5",
-		"messages":[{"role":"user","content":"hello"}],
-		"stream":true
-	}`))
-	rec := httptest.NewRecorder()
-	h.handleOpenAIChat(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected stream status 200, got %d body=%s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), `"finish_reason":"length"`) {
-		t.Fatalf("expected finish_reason=length, got %s", rec.Body.String())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := validateClaudeMidConversationSystemMessages(tc.messages)
+			if tc.wantErr && got == "" {
+				t.Fatal("invalid placement was accepted")
+			}
+			if !tc.wantErr && got != "" {
+				t.Fatalf("valid placement rejected: %s", got)
+			}
+		})
 	}
 }

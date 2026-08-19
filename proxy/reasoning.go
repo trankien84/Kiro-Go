@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"kiro-go/logger"
 	"sort"
 	"strings"
 )
@@ -19,14 +20,17 @@ const (
 type ModelReasoningCapability struct {
 	ModelID string
 
-	SupportsThinking     bool
-	ThinkingTypes        []string
-	SupportsDisplay      bool
-	ThinkingDisplays     []string
-	SupportsBudgetTokens bool
-	EffortPath           ReasoningSchemaPath
-	Efforts              []string
-	SchemaParseError     string
+	SupportsThinking            bool
+	ThinkingTypes               []string
+	SupportsDisplay             bool
+	ThinkingDisplays            []string
+	SupportsBudgetTokens        bool
+	SupportsInterleavedThinking bool
+	DefaultThinkingType         string
+	DefaultThinkingDisplay      string
+	EffortPath                  ReasoningSchemaPath
+	Efforts                     []string
+	SchemaParseError            string
 }
 
 func (c ModelReasoningCapability) SupportsNativeReasoning() bool {
@@ -60,13 +64,23 @@ func ParseModelReasoningCapability(model ModelInfo) ModelReasoningCapability {
 		capability.SupportsThinking = true
 
 		thinkingProps := schemaProperties(thinkingSchema)
-		capability.ThinkingTypes = enumStrings(
-			schemaObject(thinkingProps["type"]),
-		)
+		thinkingTypeSchema := schemaObject(thinkingProps["type"])
 		displaySchema := schemaObject(thinkingProps["display"])
 
+		capability.ThinkingTypes = enumStrings(thinkingTypeSchema)
 		capability.SupportsDisplay = displaySchema != nil
 		capability.ThinkingDisplays = enumStrings(displaySchema)
+
+		if defaultThinking := schemaObject(thinkingSchema["default"]); defaultThinking != nil {
+			capability.DefaultThinkingType = stringValue(defaultThinking["type"])
+			capability.DefaultThinkingDisplay = stringValue(defaultThinking["display"])
+		}
+		if capability.DefaultThinkingType == "" {
+			capability.DefaultThinkingType = schemaDefaultString(thinkingTypeSchema)
+		}
+		if capability.DefaultThinkingDisplay == "" {
+			capability.DefaultThinkingDisplay = schemaDefaultString(displaySchema)
+		}
 		capability.SupportsBudgetTokens =
 			thinkingProps != nil && thinkingProps["budget_tokens"] != nil
 	}
@@ -160,6 +174,18 @@ func schemaObject(value interface{}) map[string]interface{} {
 	return object
 }
 
+func stringValue(value interface{}) string {
+	text, _ := value.(string)
+	return strings.ToLower(strings.TrimSpace(text))
+}
+
+func schemaDefaultString(schema map[string]interface{}) string {
+	if schema == nil {
+		return ""
+	}
+	return stringValue(schema["default"])
+}
+
 func enumStrings(schema map[string]interface{}) []string {
 	if schema == nil {
 		return nil
@@ -210,6 +236,217 @@ func canonicalEffort(value string) string {
 	}
 }
 
+func normalizedClaudeModelID(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.ReplaceAll(value, "_", "-")
+}
+
+func modelHasAnyPrefix(modelID string, prefixes ...string) bool {
+	modelID = normalizedClaudeModelID(modelID)
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(modelID, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelCapsDisabledThinkingAtHigh(modelID string) bool {
+	// Do not generalize this to all Claude 5 models. The current public
+	// restriction is specific to Claude Opus 5.
+	return modelHasAnyPrefix(modelID, "claude-opus-5")
+}
+
+func validateThinkingEffortCombination(
+	modelID string,
+	thinkingDisabled bool,
+	effort string,
+) error {
+	if !thinkingDisabled || !modelCapsDisabledThinkingAtHigh(modelID) {
+		return nil
+	}
+
+	effort = canonicalEffort(effort)
+	switch effort {
+	case "xhigh", "max":
+		return fmt.Errorf(
+			"model %s does not support thinking.type disabled with effort %q; use high or lower, or enable thinking",
+			modelID,
+			effort,
+		)
+	default:
+		return nil
+	}
+}
+
+func claudeThinkingEnabledByDefault(
+	modelID string,
+	capability ModelReasoningCapability,
+) bool {
+	switch strings.ToLower(strings.TrimSpace(capability.DefaultThinkingType)) {
+	case "adaptive", "enabled":
+		return true
+	case "disabled", "none":
+		return false
+	}
+
+	// Current Claude models whose API contract enables adaptive thinking when
+	// the thinking field is omitted. Keep older Claude models opt-in.
+	return modelHasAnyPrefix(
+		modelID,
+		"claude-opus-5",
+		"claude-sonnet-5",
+		"claude-fable-5",
+		"claude-mythos-5",
+	)
+}
+
+func claudeDefaultThinkingDisplay(
+	modelID string,
+	capability ModelReasoningCapability,
+) string {
+	if display := strings.ToLower(strings.TrimSpace(capability.DefaultThinkingDisplay)); display != "" {
+		return display
+	}
+
+	// These models default to omitted thinking display. Older models that
+	// expose thinking default to summarized output.
+	if modelHasAnyPrefix(
+		modelID,
+		"claude-opus-5",
+		"claude-sonnet-5",
+		"claude-fable-5",
+		"claude-mythos-5",
+		"claude-opus-4.8",
+		"claude-opus-4-8",
+		"claude-opus-4.7",
+		"claude-opus-4-7",
+	) {
+		return "omitted"
+	}
+
+	return "summarized"
+}
+
+func claudeModelSupportsManualInterleavedThinking(modelID string) bool {
+	model := strings.ToLower(strings.TrimSpace(modelID))
+	model = strings.ReplaceAll(model, ".", "-")
+
+	// The beta header is accepted broadly, but only these manual-thinking
+	// model families actually interleave. Keep this allow-list conservative so
+	// a future Claude 4.x model is not assumed compatible by prefix alone.
+	switch {
+	case strings.HasPrefix(model, "claude-sonnet-4-6"):
+		return true
+	case strings.HasPrefix(model, "claude-opus-4-5"):
+		return true
+	case strings.HasPrefix(model, "claude-sonnet-4-5"):
+		return true
+	case strings.HasPrefix(model, "claude-opus-4-1"):
+		return true
+	case model == "claude-opus-4" || strings.HasPrefix(model, "claude-opus-4-2025"):
+		return true
+	case model == "claude-sonnet-4" || strings.HasPrefix(model, "claude-sonnet-4-2025"):
+		return true
+	default:
+		return false
+	}
+}
+
+func fallbackClaudeReasoningCapability(modelID string) ModelReasoningCapability {
+	capability := ModelReasoningCapability{ModelID: modelID}
+
+	// Prefer the live Kiro schema whenever it is available. These fallbacks only
+	// cover stable public Claude contracts so
+	// requests can still be translated while the model cache is cold or stale.
+	if modelHasAnyPrefix(modelID, "claude-opus-5", "claude-sonnet-5") {
+		capability.SupportsThinking = true
+		capability.ThinkingTypes = []string{"adaptive", "disabled"}
+		capability.SupportsDisplay = true
+		capability.ThinkingDisplays = []string{"summarized", "omitted"}
+		capability.DefaultThinkingType = "adaptive"
+		capability.DefaultThinkingDisplay = "omitted"
+		capability.EffortPath = ReasoningSchemaOutputConfig
+		capability.Efforts = []string{"low", "medium", "high", "xhigh", "max"}
+	}
+	if modelHasAnyPrefix(modelID, "claude-fable-5", "claude-mythos-5") {
+		capability.SupportsThinking = true
+		// Fable 5 and Mythos 5 use always-on adaptive thinking and reject
+		// thinking.type=disabled.
+		capability.ThinkingTypes = []string{"adaptive"}
+		capability.SupportsDisplay = true
+		capability.ThinkingDisplays = []string{"summarized", "omitted"}
+		capability.DefaultThinkingType = "adaptive"
+		capability.DefaultThinkingDisplay = "omitted"
+		capability.EffortPath = ReasoningSchemaOutputConfig
+		capability.Efforts = []string{"low", "medium", "high", "xhigh", "max"}
+	}
+	if modelHasAnyPrefix(
+		modelID,
+		"claude-opus-4.8",
+		"claude-opus-4-8",
+		"claude-opus-4.7",
+		"claude-opus-4-7",
+	) {
+		capability.SupportsThinking = true
+		capability.ThinkingTypes = []string{"adaptive", "disabled"}
+		capability.SupportsDisplay = true
+		capability.ThinkingDisplays = []string{"summarized", "omitted"}
+		capability.DefaultThinkingDisplay = "omitted"
+		capability.EffortPath = ReasoningSchemaOutputConfig
+		capability.Efforts = []string{"low", "medium", "high", "xhigh", "max"}
+	}
+	if modelHasAnyPrefix(
+		modelID,
+		"claude-opus-4.6",
+		"claude-opus-4-6",
+		"claude-sonnet-4.6",
+		"claude-sonnet-4-6",
+	) {
+		capability.SupportsThinking = true
+		capability.ThinkingTypes = []string{"enabled", "adaptive", "disabled"}
+		capability.SupportsDisplay = true
+		capability.ThinkingDisplays = []string{"summarized", "omitted"}
+		capability.SupportsBudgetTokens = true
+		capability.DefaultThinkingDisplay = "summarized"
+		capability.EffortPath = ReasoningSchemaOutputConfig
+		capability.Efforts = []string{"low", "medium", "high", "max"}
+	}
+	if modelHasAnyPrefix(
+		modelID,
+		"claude-opus-4.5",
+		"claude-opus-4-5",
+	) {
+		capability.SupportsThinking = true
+		capability.ThinkingTypes = []string{"enabled", "disabled"}
+		capability.SupportsDisplay = true
+		capability.ThinkingDisplays = []string{"summarized", "omitted"}
+		capability.SupportsBudgetTokens = true
+		capability.DefaultThinkingDisplay = "summarized"
+		capability.EffortPath = ReasoningSchemaOutputConfig
+		capability.Efforts = []string{"low", "medium", "high"}
+	}
+	if modelHasAnyPrefix(
+		modelID,
+		"claude-sonnet-4.5",
+		"claude-sonnet-4-5",
+		"claude-haiku-4.5",
+		"claude-haiku-4-5",
+	) {
+		capability.SupportsThinking = true
+		capability.ThinkingTypes = []string{"enabled", "disabled"}
+		capability.SupportsDisplay = true
+		capability.ThinkingDisplays = []string{"summarized", "omitted"}
+		capability.SupportsBudgetTokens = true
+		capability.DefaultThinkingDisplay = "summarized"
+	}
+
+	capability.SupportsInterleavedThinking =
+		claudeModelSupportsManualInterleavedThinking(modelID)
+
+	return capability
+}
+
 // Normalize aliases while preserving schema-provided values.
 func normalizeEffortList(values []string) []string {
 	byCanonical := make(map[string]string)
@@ -253,10 +490,21 @@ type reasoningIntent struct {
 	BudgetTokens int
 }
 
-func BuildClaudeAdditionalModelRequestFields(
-	req *ClaudeRequest,
-	capability ModelReasoningCapability,
-) (
+func normalizeRequestedThinkingType(requested string, supported []string) (string, error) {
+	raw := strings.ToLower(strings.TrimSpace(requested))
+	if raw == "" {
+		return "", nil
+	}
+
+	// Normalize the stable enabled/none aliases while preserving schema-defined
+	// values we do not know yet. Capability validation happens later in
+	// selectThinkingType, so an explicit unsupported value is rejected instead
+	// of silently becoming "no reasoning", while future schema-advertised types
+	// remain usable without a code change here.
+	return normalizeClaudeThinkingType(raw, supported), nil
+}
+
+func BuildClaudeAdditionalModelRequestFields(req *ClaudeRequest, capability ModelReasoningCapability) (
 	fields map[string]interface{},
 	requested bool,
 	err error,
@@ -268,7 +516,12 @@ func BuildClaudeAdditionalModelRequestFields(
 	intent := reasoningIntent{}
 
 	if req.Thinking != nil {
-		intent.ThinkingType = normalizeClaudeThinkingType(req.Thinking.Type, capability.ThinkingTypes)
+		thinkingType, typeErr := normalizeRequestedThinkingType(req.Thinking.Type, capability.ThinkingTypes)
+		if typeErr != nil {
+			// true because the client sent an explicit reasoning config.
+			return nil, true, typeErr
+		}
+		intent.ThinkingType = thinkingType
 		intent.Display = strings.ToLower(strings.TrimSpace(req.Thinking.Display))
 		intent.BudgetTokens = req.Thinking.BudgetTokens
 
@@ -276,13 +529,6 @@ func BuildClaudeAdditionalModelRequestFields(
 		case "disabled", "none":
 			intent.Disabled = true
 		default:
-			// Any other non-empty type — "enabled"/"adaptive" plus any value
-			// normalizeClaudeThinkingType did not recognize as an alias — is
-			// an explicit reasoning request. Leaving intent.Enabled false
-			// here would let a client-requested but schema-unsupported
-			// thinking.type (e.g. "forced") silently fall through as "no
-			// reasoning" instead of being rejected by selectThinkingType
-			// below.
 			if intent.ThinkingType != "" {
 				intent.Enabled = true
 			}
@@ -295,7 +541,7 @@ func BuildClaudeAdditionalModelRequestFields(
 	if strings.TrimSpace(intent.Effort) == "" {
 		intent.Effort = req.ReasoningEffort
 	}
-	if strings.TrimSpace(intent.Effort) != "" {
+	if strings.TrimSpace(intent.Effort) != "" && !intent.Disabled {
 		intent.Enabled = true
 	}
 
@@ -317,14 +563,13 @@ func BuildOpenAIAdditionalModelRequestFields(
 	intent := reasoningIntent{}
 
 	if req.Thinking != nil {
-		// Same "enabled"->"adaptive" alias Claude requests get (see
-		// BuildClaudeAdditionalModelRequestFields): a schema that only
-		// exposes "adaptive"/"disabled" (Kiro's norm) must not reject an
-		// OpenAI-style thinking.type:"enabled" request.
-		intent.ThinkingType = normalizeClaudeThinkingType(
-			req.Thinking.Type,
-			capability.ThinkingTypes,
-		)
+		thinkingType, typeErr := normalizeRequestedThinkingType(req.Thinking.Type, capability.ThinkingTypes)
+
+		if typeErr != nil {
+			return nil, true, typeErr
+		}
+
+		intent.ThinkingType = thinkingType
 		intent.Display = strings.ToLower(
 			strings.TrimSpace(req.Thinking.Display),
 		)
@@ -334,10 +579,6 @@ func BuildOpenAIAdditionalModelRequestFields(
 		case "disabled", "none":
 			intent.Disabled = true
 		default:
-			// See the matching comment in
-			// BuildClaudeAdditionalModelRequestFields: any other non-empty
-			// type is an explicit request, validated later by
-			// selectThinkingType rather than dropped silently here.
 			if intent.ThinkingType != "" {
 				intent.Enabled = true
 			}
@@ -360,27 +601,26 @@ func BuildOpenAIAdditionalModelRequestFields(
 		// Client did not request an effort level.
 
 	case "none":
-		// OpenAI's "none" means the client opted out of reasoning, i.e. no
-		// reasoning was requested — NOT an explicit instruction to send Kiro
-		// a "thinking":{"type":"disabled"} field. intent.Disabled (below,
-		// shared with the Claude thinking.type="disabled"/"none" path) is
-		// deliberately left false: setting it here would make
-		// buildAdditionalModelRequestFields synthesize and forward an active
-		// disable field, and mark the request as "reasoning requested",
-		// purely because the schema happens to support a thinking type —
-		// even though the client asked for nothing at all.
+		// OpenAI's "none" means the client did not request reasoning. Do not
+		// synthesize a Kiro thinking.type=disabled field merely because the model
+		// schema happens to expose one. An explicit thinking.type=disabled request
+		// remains an explicit disable through intent.Disabled.
 		intent.Enabled = false
 		intent.Effort = ""
 
 	default:
 		intent.Effort = effort
-		intent.Enabled = true
+		if !intent.Disabled {
+			intent.Enabled = true
+		}
 	}
 
 	return buildAdditionalModelRequestFields(intent, capability)
 }
 
-// Build only fields advertised by the model schema.
+// Build only fields advertised by the model schema. Stable, documented
+// model-specific incompatibilities are rejected locally; unknown combinations
+// remain backend-validated.
 func buildAdditionalModelRequestFields(
 	intent reasoningIntent,
 	capability ModelReasoningCapability,
@@ -389,32 +629,18 @@ func buildAdditionalModelRequestFields(
 	requested bool,
 	err error,
 ) {
-	if intent.Disabled {
-		if strings.TrimSpace(intent.Effort) != "" {
-			return nil, false, fmt.Errorf(
-				"thinking is disabled but reasoning effort was also provided",
-			)
-		}
-
-		if capability.SupportsThinking {
-			if disabledType, ok := matchThinkingType(
-				"disabled",
-				capability.ThinkingTypes,
-			); ok {
-				return map[string]interface{}{
-					"thinking": map[string]interface{}{
-						"type": disabledType,
-					},
-				}, true, nil
-			}
-		}
-
+	effort := strings.TrimSpace(intent.Effort)
+	requested = intent.Enabled || intent.Disabled || effort != ""
+	if !requested {
 		return nil, false, nil
 	}
 
-	requested = intent.Enabled
-	if !requested {
-		return nil, false, nil
+	if err := validateThinkingEffortCombination(
+		capability.ModelID,
+		intent.Disabled,
+		effort,
+	); err != nil {
+		return nil, true, err
 	}
 
 	if !capability.SupportsNativeReasoning() {
@@ -426,74 +652,84 @@ func buildAdditionalModelRequestFields(
 	if capability.SupportsThinking {
 		thinking := make(map[string]interface{})
 
-		thinkingType, ok := selectThinkingType(
-			intent.ThinkingType,
-			capability.ThinkingTypes,
-		)
-
-		if !ok {
-			return nil, true, fmt.Errorf(
-				"model %s does not support thinking.type %q; supported: %s",
-				capability.ModelID,
-				intent.ThinkingType,
-				strings.Join(
-					capability.ThinkingTypes,
-					", ",
-				),
+		if intent.Disabled {
+			disabledType, ok := matchThinkingType(
+				"disabled",
+				capability.ThinkingTypes,
 			)
-		}
-
-		if thinkingType != "" {
-			thinking["type"] = thinkingType
-		}
-
-		if intent.Display != "" {
-			if !capability.SupportsDisplay {
+			if !ok {
 				return nil, true, fmt.Errorf(
-					"model %s does not support thinking.display",
+					"model %s does not support thinking.type disabled; supported: %s",
 					capability.ModelID,
+					strings.Join(capability.ThinkingTypes, ", "),
+				)
+			}
+			thinking["type"] = disabledType
+		} else {
+			thinkingType, ok := selectThinkingType(
+				intent.ThinkingType,
+				capability.ThinkingTypes,
+			)
+			if !ok {
+				return nil, true, fmt.Errorf(
+					"model %s does not support thinking.type %q; supported: %s",
+					capability.ModelID,
+					intent.ThinkingType,
+					strings.Join(capability.ThinkingTypes, ", "),
 				)
 			}
 
-			display := intent.Display
+			if thinkingType != "" {
+				thinking["type"] = thinkingType
+			}
 
-			// If the schema defines an enum, only accept values present in the enum.
-			if len(capability.ThinkingDisplays) > 0 {
-				var ok bool
-
-				display, ok = matchSupportedDisplay(
-					intent.Display,
-					capability.ThinkingDisplays,
-				)
-				if !ok {
+			if intent.Display != "" {
+				if !capability.SupportsDisplay {
 					return nil, true, fmt.Errorf(
-						"model %s does not support thinking.display %q; supported: %s",
+						"model %s does not support thinking.display",
 						capability.ModelID,
-						intent.Display,
-						strings.Join(
-							capability.ThinkingDisplays,
-							", ",
-						),
 					)
 				}
+
+				display := intent.Display
+				if len(capability.ThinkingDisplays) > 0 {
+					var ok bool
+					display, ok = matchSupportedDisplay(
+						intent.Display,
+						capability.ThinkingDisplays,
+					)
+					if !ok {
+						return nil, true, fmt.Errorf(
+							"model %s does not support thinking.display %q; supported: %s",
+							capability.ModelID,
+							intent.Display,
+							strings.Join(capability.ThinkingDisplays, ", "),
+						)
+					}
+				}
+				thinking["display"] = display
 			}
 
-			// If the schema defines a field but no enum:
-			// forward the original value sent by the client.
-			thinking["display"] = display
-		}
-
-		if capability.SupportsBudgetTokens &&
-			intent.BudgetTokens > 0 {
-			thinking["budget_tokens"] = intent.BudgetTokens
+			// Claude Code may still send the legacy enabled+budget_tokens shape.
+			// Forward the budget only for models whose Kiro schema advertises it;
+			// adaptive-only models receive the mapped type without budget_tokens.
+			if capability.SupportsBudgetTokens && intent.BudgetTokens > 0 {
+				thinking["budget_tokens"] = intent.BudgetTokens
+			} else if intent.BudgetTokens > 0 {
+				logger.Warnf(
+					"[ReasoningCompatibility] model=%s requestedThinkingType=%s effectiveThinkingType=%s budgetTokens=%d forwarded=false reason=model_schema_does_not_support_budget_tokens",
+					capability.ModelID,
+					intent.ThinkingType,
+					thinkingType,
+					intent.BudgetTokens,
+				)
+			}
 		}
 
 		if len(thinking) > 0 {
 			fields["thinking"] = thinking
 		}
 	}
-
-	effort := strings.TrimSpace(intent.Effort)
 
 	if effort != "" {
 		supportedEffort, ok := matchSupportedEffort(

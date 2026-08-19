@@ -11,8 +11,10 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
@@ -246,6 +248,13 @@ func randomFromCharset(n int, charset string) string {
 
 // callMcpAPI posts the JSON-RPC request to Kiro MCP and returns the parsed response.
 func callMcpAPI(account *config.Account, mcpReq *McpRequest) (*McpResponse, error) {
+	return callMcpAPIContext(context.Background(), account, mcpReq)
+}
+
+func callMcpAPIContext(ctx context.Context, account *config.Account, mcpReq *McpRequest) (*McpResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if mcpReq == nil {
 		return nil, fmt.Errorf("nil MCP request")
 	}
@@ -272,7 +281,7 @@ func callMcpAPI(account *config.Account, mcpReq *McpRequest) (*McpResponse, erro
 	}
 	logger.Debugf("[MCP] Request: %s", string(reqBody))
 
-	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +376,7 @@ func (h *Handler) hasKiroCapableAccount() bool {
 		if !account.Enabled {
 			continue
 		}
-		if account.IsBedrock() || account.IsCustomApi() {
+		if !account.UsesKiroRuntime() {
 			continue
 		}
 		return true
@@ -391,38 +400,58 @@ func (h *Handler) hasKiroCapableAccount() bool {
 // key was landing on a different account than their other requests, which
 // this fork otherwise optimizes hard to avoid.
 func (h *Handler) performWebSearch(model, query, apiKeyID string) (*WebSearchResults, string, *config.Account, error) {
+	return h.performWebSearchContext(context.Background(), model, query, apiKeyID)
+}
+
+func (h *Handler) performWebSearchContext(ctx context.Context, model, query, apiKeyID string) (*WebSearchResults, string, *config.Account, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	excluded := make(map[string]bool)
 	var lastErr error
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelWithApiKey(model, excluded, apiKeyID)
-		if account == nil {
+		if err := ctx.Err(); err != nil {
+			return nil, "", nil, err
+		}
+		selection := h.pool.GetNextSelectionForModelWithApiKey(model, excluded, apiKeyID)
+		if selection == nil {
 			break
 		}
-		// web_search is relayed through Kiro's own MCP endpoint (callMcpAPI below) —
-		// there is no Bedrock or custom_api equivalent. Calling it with those account
-		// types' credentials would 403 against a Kiro-only endpoint and risk
-		// handleAccountFailure auto-banning an otherwise-healthy account (CLAUDE.md:
-		// every Kiro-facing loop needs an IsBedrock()/IsCustomApi() guard). Skip and
-		// don't burn a real retry attempt on an account that was never eligible.
-		if account.IsBedrock() || account.IsCustomApi() {
+		account := &selection.Account
+		// Kiro MCP is available only to Kiro runtime credentials. Skip terminal
+		// providers without charging a retry or mutating their health state.
+		if !account.UsesKiroRuntime() {
 			excluded[account.ID] = true
 			attempt--
 			continue
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenForSelection(selection); err != nil {
 			lastErr = err
+			if errors.Is(err, errStaleAccountSelection) {
+				continue
+			}
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleTokenValidationFailureForSelection(selection, err)
 			continue
 		}
 
 		toolUseID, mcpReq := createMcpRequest(query)
-		mcpResp, err := callMcpAPI(account, mcpReq)
+		mcpResp, err := callMcpAPIContext(ctx, account, mcpReq)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, "", nil, ctx.Err()
+			}
 			logger.Warnf("[WebSearch] MCP call failed on account %s: %v", account.Email, err)
 			lastErr = err
+			if !h.pool.IsSelectionCurrent(*selection) {
+				continue
+			}
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountFailureForSelection(*selection, err)
+			continue
+		}
+		if !h.pool.IsSelectionCurrent(*selection) {
+			lastErr = errStaleAccountSelection
 			continue
 		}
 		results := parseSearchResults(mcpResp)
@@ -432,11 +461,12 @@ func (h *Handler) performWebSearch(model, query, apiKeyID string) (*WebSearchRes
 			lastErr = fmt.Errorf("MCP web_search returned unparseable or error search payload")
 			logger.Warnf("[WebSearch] %v on account %s", lastErr, account.Email)
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, lastErr)
+			h.handleAccountFailureForSelection(*selection, lastErr)
 			continue
 		}
-		h.pool.RecordSuccess(account.ID)
-		return results, toolUseID, account, nil
+		h.pool.RecordSuccessForSelection(*selection)
+		accountSnapshot := account.Clone()
+		return results, toolUseID, &accountSnapshot, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no available accounts for web_search")

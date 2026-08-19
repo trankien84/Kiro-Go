@@ -20,6 +20,7 @@ func setupIntegrityPathTest(t *testing.T, server *httptest.Server) *Handler {
 	}
 	if err := config.AddAccount(config.Account{
 		ID:          "test-account",
+		AuthMethod:  "social",
 		Enabled:     true,
 		AccessToken: "token-test",
 		ProfileArn:  "arn:aws:codewhisperer:profile/test",
@@ -36,10 +37,15 @@ func setupIntegrityPathTest(t *testing.T, server *httptest.Server) *Handler {
 
 	p := accountpool.GetPool()
 	p.Reload()
-	return &Handler{
+	h := &Handler{
 		pool:        p,
 		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
 	}
+	t.Cleanup(func() {
+		h.Close()
+		p.WaitForPendingStats()
+	})
+	return h
 }
 
 // truncatedUpstream serves content long enough to be flushed to the client but
@@ -57,8 +63,10 @@ func truncatedUpstream(t *testing.T, hits *atomic.Int32) *httptest.Server {
 	}))
 }
 
-// A truncated stream whose content already reached the client must end with an
-// SSE error, never with a forged end_turn that tells the client it is done.
+// A truncated Kiro stream must end with an SSE error, never with a forged
+// end_turn. With CompletionGuard auto-delivery the candidate is intentionally
+// buffered, so Phase-3 may exhaust its own replay-safe retry budget; the guard
+// must not start a second retry loop on the resulting terminal transport error.
 func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 	var hits atomic.Int32
 	server := truncatedUpstream(t, &hits)
@@ -75,8 +83,8 @@ func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 	h.handleClaudeMessages(rec, req)
 
 	body := rec.Body.String()
-	if !strings.Contains(body, "partial answer") {
-		t.Fatalf("expected flushed content, got %s", body)
+	if strings.Contains(body, "partial answer") {
+		t.Fatalf("buffered truncated content leaked to the client: %s", body)
 	}
 	if strings.Contains(body, `"stop_reason":"end_turn"`) {
 		t.Fatalf("truncated stream must not be reported as end_turn, got %s", body)
@@ -84,9 +92,10 @@ func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 	if !strings.Contains(body, `"type":"error"`) {
 		t.Fatalf("expected SSE error event, got %s", body)
 	}
-	// Content was already flushed, so reissuing would duplicate output.
-	if hits.Load() != 1 {
-		t.Fatalf("must not retry after client flush, hits=%d", hits.Load())
+	// Phase-3 owns the replay-safe transport budget. CompletionGuard must not
+	// multiply it with its own protocol-recovery attempts.
+	if hits.Load() != kiroTransportMaxAttempts {
+		t.Fatalf("transport attempts=%d, want exactly Phase-3 budget=%d", hits.Load(), kiroTransportMaxAttempts)
 	}
 }
 

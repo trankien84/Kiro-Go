@@ -28,6 +28,95 @@ const (
 
 var profileArnResolutionCooldowns sync.Map
 
+func persistAccountProfileArnForRequest(account *config.Account, profileArn string) {
+	if account == nil || strings.TrimSpace(account.ID) == "" {
+		return
+	}
+	if account.DispatchGeneration != 0 {
+		applied, err := config.UpdateAccountProfileArnIfLifecycle(account.ID, account.DispatchGeneration, profileArn)
+		if err != nil {
+			logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", accountEmailForLog(account), err)
+			return
+		}
+		if !applied {
+			logger.Warnf("[ProfileArn] Ignored stale profile ARN write account=%s generation=%d", account.ID, account.DispatchGeneration)
+		}
+		return
+	}
+	if err := config.UpdateAccountProfileArn(account.ID, profileArn); err != nil {
+		logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", accountEmailForLog(account), err)
+	}
+}
+
+func persistAccountInfoForRequest(account *config.Account, info config.AccountInfo) {
+	if account == nil || strings.TrimSpace(account.ID) == "" {
+		return
+	}
+	if account.DispatchGeneration != 0 {
+		applied, err := config.UpdateAccountInfoIfLifecycle(account.ID, account.DispatchGeneration, info)
+		if err != nil {
+			logger.Debugf("[KiroAPI] failed to persist account info for %s: %v", accountEmailForLog(account), err)
+			return
+		}
+		if !applied {
+			logger.Debugf("[KiroAPI] ignored stale account info write account=%s generation=%d", account.ID, account.DispatchGeneration)
+		}
+		return
+	}
+	if err := config.UpdateAccountInfo(account.ID, info); err != nil {
+		logger.Debugf("[KiroAPI] failed to persist account info for %s: %v", accountEmailForLog(account), err)
+	}
+}
+
+func setAccountBanForRequest(account *config.Account, status, reason string) {
+	if account == nil || strings.TrimSpace(account.ID) == "" {
+		return
+	}
+	if account.DispatchGeneration != 0 {
+		applied, err := config.SetAccountBanStatusIfLifecycle(account.ID, account.DispatchGeneration, status, reason)
+		if err != nil {
+			logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", err)
+			return
+		}
+		if !applied {
+			logger.Warnf("[RefreshAccountInfo] Ignored stale ban write account=%s generation=%d", account.ID, account.DispatchGeneration)
+		}
+		return
+	}
+	if err := config.SetAccountBanStatus(account.ID, status, reason); err != nil {
+		logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", err)
+	}
+}
+
+func clearAccountBanForRequest(account *config.Account) {
+	if account == nil || strings.TrimSpace(account.ID) == "" {
+		return
+	}
+	if account.DispatchGeneration != 0 {
+		_, _, applied, err := config.MutateAccountIfLifecycle(account.ID, account.DispatchGeneration, func(current *config.Account) error {
+			current.BanStatus = "ACTIVE"
+			current.BanReason = ""
+			current.BanTime = 0
+			return nil
+		})
+		if err != nil {
+			logger.Errorf("[RefreshAccountInfo] Failed to clear account ban status: %v", err)
+			return
+		}
+		if !applied {
+			logger.Warnf("[RefreshAccountInfo] Ignored stale ban clear account=%s generation=%d", account.ID, account.DispatchGeneration)
+		}
+		return
+	}
+	updated := *account
+	updated.BanStatus = "ACTIVE"
+	updated.BanReason = ""
+	updated.BanTime = 0
+	if err := config.UpdateAccount(account.ID, updated); err != nil {
+		logger.Errorf("[RefreshAccountInfo] Failed to clear account ban status: %v", err)
+	}
+}
+
 var (
 	kiroRegionPattern  = regexp.MustCompile(`^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$`)
 	kiroAccountPattern = regexp.MustCompile(`^[0-9]{12}$`)
@@ -233,9 +322,7 @@ func reprobeApiKeyRegion(account *config.Account) (string, bool) {
 		// caller — see the function comment above.
 		account.Region = region
 		if info != nil {
-			if infoErr := config.UpdateAccountInfo(account.ID, *info); infoErr != nil {
-				logger.Debugf("[KiroAPI] failed to persist account info after region re-detect for %s: %v", accountEmailForLog(account), infoErr)
-			}
+			persistAccountInfoForRequest(account, *info)
 		}
 		logger.Infof("[KiroAPI] api_key account %s found candidate region %s (REST plane) after auth error; awaiting runtime-plane confirmation", accountEmailForLog(account), region)
 		return region, true
@@ -386,9 +473,7 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		// auth region, which can legitimately differ from the profile's region).
 		profileArn, err := resolveProfileArnAcrossRegions(account)
 		if err == nil && profileArn != "" {
-			if updateErr := config.UpdateAccountProfileArn(account.ID, profileArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
-			}
+			persistAccountProfileArnForRequest(account, profileArn)
 			account.ProfileArn = profileArn
 			return profileArn, nil
 		}
@@ -404,9 +489,7 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		!strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
 		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
 		if refreshErr == nil && refreshedArn != "" {
-			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
-			}
+			persistAccountProfileArnForRequest(account, refreshedArn)
 			account.ProfileArn = refreshedArn
 			return refreshedArn, nil
 		}
@@ -820,17 +903,10 @@ func banAccountInline(account *config.Account, banStatus, banReason string) {
 	if account == nil {
 		return
 	}
-	updated := *account
-	if !updated.Enabled && updated.BanStatus == banStatus && updated.BanReason == banReason {
+	if !account.Enabled && account.BanStatus == banStatus && account.BanReason == banReason {
 		return
 	}
-	updated.Enabled = false
-	updated.BanStatus = banStatus
-	updated.BanReason = banReason
-	updated.BanTime = time.Now().Unix()
-	if err := config.UpdateAccount(account.ID, updated); err != nil {
-		logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", err)
-	}
+	setAccountBanForRequest(account, banStatus, banReason)
 }
 
 // RefreshAccountInfo 刷新账户信息（使用量、订阅等）
@@ -857,9 +933,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	if account.BanStatus != "" && account.BanStatus != "ACTIVE" {
 		logger.Infof("[RefreshAccountInfo] Account %s is now active, clearing ban status", account.Email)
 
-		if updateErr := config.ClearAccountBanStatus(account.ID); updateErr != nil {
-			logger.Errorf("[RefreshAccountInfo] Failed to clear account ban status: %v", updateErr)
-		}
+		clearAccountBanForRequest(account)
 	}
 
 	// 解析用户信息

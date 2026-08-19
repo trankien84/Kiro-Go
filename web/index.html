@@ -275,6 +275,26 @@
           <button class="btn btn-primary" id="saveOverUsageBtn" data-i18n="settings.saveUsage"></button>
         </div>
 
+        <!-- Response language settings -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.responseLanguageSettings"></span></div>
+          <div class="form-group">
+            <label data-i18n="settings.responseLanguagePolicy"></label>
+            <select id="responseLanguagePolicy">
+              <option value="preserve" data-i18n="settings.responseLanguagePreserve"></option>
+              <option value="match-user" data-i18n="settings.responseLanguageMatchUser"></option>
+              <option value="fixed" data-i18n="settings.responseLanguageFixed"></option>
+            </select>
+            <small data-i18n="settings.responseLanguageHint"></small>
+          </div>
+          <div class="form-group hidden" id="responseLanguageFixedGroup">
+            <label data-i18n="settings.responseLanguageTag"></label>
+            <input type="text" id="responseLanguage" placeholder="vi" maxlength="64" autocomplete="off" spellcheck="false" />
+            <small data-i18n="settings.responseLanguageTagHint"></small>
+          </div>
+          <button class="btn btn-primary" id="saveResponseLanguageBtn" data-i18n="settings.saveResponseLanguage"></button>
+        </div>
+
         <!-- Thinking settings -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.thinkingSettings"></span></div>
