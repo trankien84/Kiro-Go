@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -78,16 +79,15 @@ func TestPhase65AProjectionReplaySafetyExactAndUnsupported(t *testing.T) {
 	}
 }
 
-func TestPhase65ACompletionGuardRejectsAnnouncedPendingAction(t *testing.T) {
+func TestPhase65ACompletionGuardLeavesNaturalLanguageCompletionToSemanticAudit(t *testing.T) {
 	plan := completionGuardTestPlanWithTools("auto", ClaudeTool{Name: "run_in_terminal"})
 
 	cases := []string{
 		"Extractor verified. Now the acquisition CLI that retains verbatim fragments and writes receipts.",
 		"The parser is ready. I'll run the tests next.",
-		"Enough context. Starting with the fragment extractor.",
 		"Đã kiểm tra parser. Tiếp theo mình sẽ chạy test.",
-		"I'll run the tests next, and if they fail I'll fix them.",
-		"Mình sẽ chạy test tiếp theo, và nếu test lỗi mình sẽ sửa.",
+		"Please confirm the destructive change before I continue.",
+		"Thay đổi này có thể phá backward compatibility. Mình sẽ tiếp tục sau khi bạn xác nhận.",
 	}
 
 	for _, text := range cases {
@@ -96,70 +96,27 @@ func TestPhase65ACompletionGuardRejectsAnnouncedPendingAction(t *testing.T) {
 				StopReason: "end_turn",
 				Content:    []ClaudeContentBlock{{Type: "text", Text: text}},
 			}, plan)
-			if outcome.Accepted || outcome.Reason != completionGuardPendingActionReason {
+			if !outcome.Accepted || outcome.Kind != "prose" || outcome.Reason != "" {
 				t.Fatalf("outcome=%#v", outcome)
 			}
 		})
 	}
 }
 
-func TestPhase65ACompletionGuardDoesNotOverreachOnFinalOrUserDirectedProse(t *testing.T) {
-	plan := completionGuardTestPlanWithTools("auto", ClaudeTool{Name: "run_in_terminal"})
-
-	cases := []string{
-		"Extractor verified. The implementation is complete.",
-		"Now the parser is ready for use.",
-		"Next, you can run the integration tests locally if you want an additional check.",
-		"The next steps are documented in README.md.",
-		"I will run the tests during implementation. The tests passed and the work is complete.",
-		"The implementation is complete. Next steps are documented in README.md.",
-		"Let me know if you want another example.",
-		"The implementation is complete. I'll review it if you want.",
-		"Everything is done. I will continue to help if needed.",
-		"The tests pass. I'll check anything else if you'd like.",
-		"Mọi thứ đã hoàn tất. Mình sẽ kiểm tra thêm nếu bạn muốn.",
-		"Đã xong. Tôi sẽ tiếp tục hỗ trợ nếu cần.",
-		"Now the parser handles images correctly.",
-		"Then the validator reports the final status.",
+func TestPhase65ACompletionAuditExplicitlyPreservesHumanWait(t *testing.T) {
+	for _, fragment := range []string{
+		"legitimately waiting for clarification, confirmation,",
+		"approval, a user choice, missing credentials",
+		"conditional on the user responding, confirming, approving",
+	} {
+		if !strings.Contains(completionGuardAuditSystemPrompt, fragment) {
+			t.Fatalf("audit prompt missing human-wait rule %q", fragment)
+		}
 	}
 
-	for _, text := range cases {
-		t.Run(text, func(t *testing.T) {
-			outcome := classifyCompletionGuardResponse(&ClaudeResponse{
-				StopReason: "end_turn",
-				Content:    []ClaudeContentBlock{{Type: "text", Text: text}},
-			}, plan)
-			if !outcome.Accepted || outcome.Kind != "prose" {
-				t.Fatalf("outcome=%#v", outcome)
-			}
-		})
-	}
-}
-
-func TestPhase65ACompletionGuardPendingActionRequiresCallableClientTool(t *testing.T) {
-	plan := agentCompletionGuardPlan{ToolChoiceKind: "auto"}
-	outcome := classifyCompletionGuardResponse(&ClaudeResponse{
-		StopReason: "end_turn",
-		Content: []ClaudeContentBlock{{
-			Type: "text",
-			Text: "I'll run the tests next.",
-		}},
-	}, plan)
-	if !outcome.Accepted || outcome.Kind != "prose" {
-		t.Fatalf("outcome=%#v", outcome)
-	}
-}
-
-func TestPhase65ACompletionGuardPendingActionPreservesNonTerminalStopSemantics(t *testing.T) {
-	plan := completionGuardTestPlanWithTools("auto", ClaudeTool{Name: "run_in_terminal"})
-	outcome := classifyCompletionGuardResponse(&ClaudeResponse{
-		StopReason: "max_tokens",
-		Content: []ClaudeContentBlock{{
-			Type: "text",
-			Text: "I'll run the tests next.",
-		}},
-	}, plan)
-	if !outcome.Accepted || outcome.Kind != "prose" || outcome.Reason != "" {
-		t.Fatalf("outcome=%#v", outcome)
+	description := completionGuardAuditTool("audit").Description
+	if !strings.Contains(description, "legitimately waits for clarification, confirmation, approval") ||
+		!strings.Contains(description, "user-provided prerequisite as complete") {
+		t.Fatalf("audit tool description does not preserve human wait: %q", description)
 	}
 }

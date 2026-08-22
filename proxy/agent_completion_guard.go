@@ -627,6 +627,8 @@ func completionGuardAuditTool(name string) ClaudeTool {
 			"Internal completion audit.",
 			"Do not continue the task and do not perform any external action.",
 			"Classify whether the candidate response fully satisfies the explicit user request.",
+			"Treat a response that legitimately waits for clarification, confirmation, approval,",
+			"a user choice, missing credentials, or another user-provided prerequisite as complete.",
 			"Use needs_action only when the user explicitly requested a concrete action",
 			"and the candidate merely described or promised that action without performing it.",
 			"When uncertain, choose complete.",
@@ -921,6 +923,9 @@ Choose "complete" when:
   translation, or advice and the candidate gives a reasonable final answer;
 - all explicitly requested concrete actions have evidence of successful
   completion;
+- the candidate is legitimately waiting for clarification, confirmation,
+  approval, a user choice, missing credentials, or another prerequisite that
+  must come from the user before it can safely proceed;
 - or the supplied evidence is insufficient to confidently claim that a
   further concrete action is required.
 
@@ -930,6 +935,10 @@ Choose "needs_action" only when:
   external data;
 - and the structured tool history plus candidate response clearly show that
   at least one explicitly requested action remains unperformed or failed.
+
+Do not choose "needs_action" merely because the candidate mentions a future
+action that is conditional on the user responding, confirming, approving,
+choosing an option, supplying credentials, or providing another prerequisite.
 
 When input or result data is truncated or ambiguous, do not guess.
 Prefer "complete" unless a missing action is clearly established.
@@ -1620,12 +1629,6 @@ func completionGuardCorrection(plan agentCompletionGuardPlan, reason string) str
 			reason,
 		)
 	}
-	if reason == completionGuardPendingActionReason {
-		return "[Kiro-Go completion recovery]\n" +
-			"The previous response announced another action but ended without invoking a client tool. " +
-			"If that action is still required, call an appropriate real provided tool now. " +
-			"If no tool action remains, return a genuinely final answer without announcing future work."
-	}
 	switch plan.ToolChoiceKind {
 	case "specific":
 		return fmt.Sprintf(
@@ -1740,7 +1743,6 @@ func completionGuardRecoverableReason(
 		"compaction_not_at_start",
 		"compaction_stop_without_block",
 		"compaction_stop_with_other_content",
-		completionGuardPendingActionReason,
 		"required_tool_not_called",
 		"empty_response_without_tool",
 		"tool_use_without_client_tool",
@@ -5550,14 +5552,6 @@ func buildCompletionGuardStreamRecoveryRequest(
 		}, "\n")
 
 		switch reason {
-		case completionGuardPendingActionReason:
-			prompt = strings.Join([]string{
-				"[Kiro-Go pending action recovery]",
-				"The visible assistant text announced another action but ended without invoking a client tool.",
-				"Continue from that point without repeating visible text.",
-				"If the announced action is still required, invoke the appropriate real provided tool now.",
-				"If no tool action remains, finish with a genuinely final answer and do not announce more future work.",
-			}, "\n")
 		case "required_tool_not_called", "tool_use_without_client_tool":
 			if plan.ToolChoiceKind == "specific" && plan.RequiredToolName != "" {
 				prompt = fmt.Sprintf(

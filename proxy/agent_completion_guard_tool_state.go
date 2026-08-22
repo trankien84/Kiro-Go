@@ -1088,17 +1088,6 @@ func classifyCompletionGuardResponseWithToolGraph(
 		out.Reason = "unexpected_stop_reason"
 	}
 
-	if out.Accepted && out.Kind == "prose" &&
-		completionGuardAnnouncedPendingAction(
-			out.NaturalText,
-			stopReason,
-			plan,
-		) {
-		out.Accepted = false
-		out.Kind = ""
-		out.Reason = completionGuardPendingActionReason
-	}
-
 	return out
 }
 
