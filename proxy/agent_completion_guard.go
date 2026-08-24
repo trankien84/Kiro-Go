@@ -612,6 +612,33 @@ type completionGuardAuditDecision struct {
 	MissingActions []string
 }
 
+type completionGuardAuditParseDiagnostics struct {
+	StopReason       string
+	ContentTypes     []string
+	ToolNames        []string
+	AuditToolMatches int
+	TextBlocks       int
+	ThinkingBlocks   int
+	OtherToolBlocks  int
+	UnknownBlocks    int
+	Reason           string
+}
+
+func (d completionGuardAuditParseDiagnostics) summary() string {
+	return fmt.Sprintf(
+		"reason=%s stopReason=%s contentTypes=%s toolNames=%s auditToolMatches=%d textBlocks=%d thinkingBlocks=%d otherToolBlocks=%d unknownBlocks=%d",
+		d.Reason,
+		d.StopReason,
+		strings.Join(d.ContentTypes, ","),
+		strings.Join(d.ToolNames, ","),
+		d.AuditToolMatches,
+		d.TextBlocks,
+		d.ThinkingBlocks,
+		d.OtherToolBlocks,
+		d.UnknownBlocks,
+	)
+}
+
 func (d completionGuardAuditDecision) needsAction(
 	minConfidence int,
 ) bool {
@@ -948,6 +975,35 @@ Do not call any external or client tool.
 Call the completion audit tool exactly once.
 `
 
+const completionGuardAuditCorrectivePrompt = `
+The previous audit attempt did not produce a valid completion-audit tool call.
+Return exactly one call to the provided completion audit tool now.
+Do not emit explanatory text.
+Do not call any other tool.
+Use exactly the required fields in the tool input.
+`
+
+func buildCompletionGuardAuditRequestForAttempt(
+	original ClaudeRequest,
+	auditContext completionGuardAuditContext,
+	candidateText string,
+	auditToolName string,
+	attempt int,
+) ClaudeRequest {
+	req := buildCompletionGuardAuditRequest(
+		original,
+		auditContext,
+		candidateText,
+		auditToolName,
+	)
+	if attempt > 0 {
+		baseSystem, _ := req.System.(string)
+		req.System = strings.TrimSpace(baseSystem) + "\n\n" +
+			strings.TrimSpace(completionGuardAuditCorrectivePrompt)
+	}
+	return req
+}
+
 func buildCompletionGuardAuditRequest(
 	original ClaudeRequest,
 	auditContext completionGuardAuditContext,
@@ -1006,47 +1062,121 @@ func parseCompletionGuardAuditDecision(
 	resp *ClaudeResponse,
 	auditToolName string,
 ) (completionGuardAuditDecision, bool) {
+	decision, _, ok := parseCompletionGuardAuditDecisionDetailed(
+		resp,
+		auditToolName,
+	)
+	return decision, ok
+}
+
+func parseCompletionGuardAuditDecisionDetailed(
+	resp *ClaudeResponse,
+	auditToolName string,
+) (
+	completionGuardAuditDecision,
+	completionGuardAuditParseDiagnostics,
+	bool,
+) {
+	diagnostics := completionGuardAuditParseDiagnostics{}
 	if resp == nil {
-		return completionGuardAuditDecision{}, false
+		diagnostics.Reason = "nil_response"
+		return completionGuardAuditDecision{}, diagnostics, false
 	}
-	if completionGuardValidateResponseEnvelope(resp) != "" {
-		return completionGuardAuditDecision{}, false
-	}
-	if strings.ToLower(strings.TrimSpace(resp.StopReason)) != "tool_use" ||
-		len(resp.Content) != 1 {
-		return completionGuardAuditDecision{}, false
+	if reason := completionGuardValidateResponseEnvelope(resp); reason != "" {
+		diagnostics.Reason = reason
+		return completionGuardAuditDecision{}, diagnostics, false
 	}
 
-	block := resp.Content[0]
-	if block.Type != "tool_use" ||
-		block.Name != auditToolName ||
-		completionGuardValidateClientTool(
-			block,
-			agentCompletionGuardPlan{},
-		) != "" {
-		return completionGuardAuditDecision{}, false
-	}
+	diagnostics.StopReason = strings.ToLower(strings.TrimSpace(resp.StopReason))
+	auditToolName = strings.TrimSpace(auditToolName)
+	var auditBlock *ClaudeContentBlock
 
-	input, ok := block.Input.(map[string]interface{})
-	if !ok || len(input) != 3 {
-		return completionGuardAuditDecision{}, false
-	}
-	for _, key := range []string{"status", "confidence", "missing_actions"} {
-		if _, exists := input[key]; !exists {
-			return completionGuardAuditDecision{}, false
+	for index := range resp.Content {
+		block := &resp.Content[index]
+		blockType := strings.ToLower(strings.TrimSpace(block.Type))
+		if blockType == "" {
+			blockType = "<empty>"
+		}
+		diagnostics.ContentTypes = append(diagnostics.ContentTypes, blockType)
+
+		switch blockType {
+		case "text", "connector_text":
+			diagnostics.TextBlocks++
+
+		case "thinking", "redacted_thinking":
+			diagnostics.ThinkingBlocks++
+			if reason := completionGuardValidateThinkingBlock(*block); reason != "" {
+				diagnostics.Reason = reason
+				return completionGuardAuditDecision{}, diagnostics, false
+			}
+
+		case "tool_use":
+			name := strings.TrimSpace(block.Name)
+			diagnostics.ToolNames = append(diagnostics.ToolNames, name)
+			if name != auditToolName {
+				diagnostics.OtherToolBlocks++
+				continue
+			}
+			diagnostics.AuditToolMatches++
+			if auditBlock == nil {
+				auditBlock = block
+			}
+
+		default:
+			diagnostics.UnknownBlocks++
 		}
 	}
 
+	if diagnostics.StopReason != "tool_use" {
+		diagnostics.Reason = "unexpected_stop_reason"
+		return completionGuardAuditDecision{}, diagnostics, false
+	}
+	if diagnostics.UnknownBlocks != 0 {
+		diagnostics.Reason = "unsupported_content_block"
+		return completionGuardAuditDecision{}, diagnostics, false
+	}
+	if diagnostics.OtherToolBlocks != 0 {
+		diagnostics.Reason = "unexpected_tool_call"
+		return completionGuardAuditDecision{}, diagnostics, false
+	}
+	if diagnostics.AuditToolMatches != 1 || auditBlock == nil {
+		if diagnostics.AuditToolMatches == 0 {
+			diagnostics.Reason = "missing_audit_tool_call"
+		} else {
+			diagnostics.Reason = "multiple_audit_tool_calls"
+		}
+		return completionGuardAuditDecision{}, diagnostics, false
+	}
+	if reason := completionGuardValidateClientTool(
+		*auditBlock,
+		agentCompletionGuardPlan{},
+	); reason != "" {
+		diagnostics.Reason = "invalid_audit_tool_call:" + reason
+		return completionGuardAuditDecision{}, diagnostics, false
+	}
+
+	input, ok := auditBlock.Input.(map[string]interface{})
+	if !ok || len(input) != 3 {
+		diagnostics.Reason = "invalid_audit_tool_input_shape"
+		return completionGuardAuditDecision{}, diagnostics, false
+	}
+	for _, key := range []string{"status", "confidence", "missing_actions"} {
+		if _, exists := input[key]; !exists {
+			diagnostics.Reason = "missing_audit_tool_input_field:" + key
+			return completionGuardAuditDecision{}, diagnostics, false
+		}
+	}
 	status, ok := input["status"].(string)
 	status = strings.ToLower(strings.TrimSpace(status))
 	if !ok || (status != "complete" && status != "needs_action") {
-		return completionGuardAuditDecision{}, false
+		diagnostics.Reason = "invalid_audit_status"
+		return completionGuardAuditDecision{}, diagnostics, false
 	}
 	confidence, ok := completionGuardAuditInteger(input["confidence"])
 	if !ok || confidence < 0 || confidence > 100 {
-		return completionGuardAuditDecision{}, false
+		diagnostics.Reason = "invalid_audit_confidence"
+		return completionGuardAuditDecision{}, diagnostics, false
 	}
-
 	decision := completionGuardAuditDecision{
 		Status:     status,
 		Confidence: confidence,
@@ -1056,7 +1186,8 @@ func parseCompletionGuardAuditDecision(
 		for _, value := range values {
 			text, ok := value.(string)
 			if !ok {
-				return completionGuardAuditDecision{}, false
+				diagnostics.Reason = "invalid_missing_action"
+				return completionGuardAuditDecision{}, diagnostics, false
 			}
 			if text = strings.TrimSpace(text); text != "" {
 				decision.MissingActions = append(decision.MissingActions, text)
@@ -1069,10 +1200,12 @@ func parseCompletionGuardAuditDecision(
 			}
 		}
 	default:
-		return completionGuardAuditDecision{}, false
+		diagnostics.Reason = "invalid_missing_actions"
+		return completionGuardAuditDecision{}, diagnostics, false
 	}
 
-	return decision, true
+	diagnostics.Reason = "ok"
+	return decision, diagnostics, true
 }
 
 func cloneCompletionGuardRequest(req ClaudeRequest) (ClaudeRequest, error) {
@@ -2496,103 +2629,124 @@ func (h *Handler) runCompletionGuardAudit(
 	ClaudeUsage,
 	error,
 ) {
-	auditReq := buildCompletionGuardAuditRequest(
-		original,
-		auditContext,
-		candidateText,
-		plan.AuditToolName,
-	)
-
-	rawBody, _ := json.Marshal(auditReq)
-	estimated := estimateClaudeRequestInputTokens(&auditReq)
-	cacheProfile := h.promptCache.BuildClaudeProfile(&auditReq, estimated)
-	auditCatalog, _ := completionGuardBuildNormalizedCatalog(&auditReq)
-	auditPlan := agentCompletionGuardPlan{
-		ToolChoiceKind:   "specific",
-		RequiredToolName: plan.AuditToolName,
-		Catalog:          auditCatalog,
-	}
-
-	// never and auto use the safe prompt-only path. Only always opts into
-	// the experimental Kiro-native wire field.
+	var totalUsage ClaudeUsage
 	useNative := plan.NativeToolChoiceMode == "always"
 
-	for pass := 0; pass < 2; pass++ {
-		payload := ClaudeToKiro(&auditReq, false)
-		nativeApplied := false
-
-		if useNative {
-			nativeApplied = applyNativeToolChoice(payload, auditPlan)
-			if !nativeApplied {
-				useNative = false
-			}
-		}
-
-		recorder := newCompletionGuardRecorder()
-		h.handleClaudeNonStream(
-			recorder,
-			payload,
-			model,
-			false,
-			claudeThinkingResponseOptions{},
-			estimated,
-			cacheProfile,
-			apiKeyIDFromContext(r.Context()),
-			rawBody,
-			forwarded,
-			cloneAnthropicSemanticHeaders(r.Header),
-			r.Context(),
-		)
-
-		status, body, recorderErr := recorder.takeResult()
-
-		if recorderErr != nil {
-			return completionGuardAuditDecision{}, ClaudeUsage{}, recorderErr
-		}
-
-		if status >= 400 {
-			if nativeApplied && nativeToolChoiceRejected(
-				status,
-				body,
-			) {
-				logger.Warnf(
-					"[CompletionAuditNativeToolChoiceRejected] status=%d fallback=prompt_only",
-					status,
-				)
-				useNative = false
-				continue
-			}
-
-			return completionGuardAuditDecision{}, ClaudeUsage{}, fmt.Errorf(
-				"audit upstream returned HTTP %d: %s",
-				status,
-				strings.TrimSpace(string(body)),
-			)
-		}
-
-		var response ClaudeResponse
-		if err := json.Unmarshal(body, &response); err != nil {
-			return completionGuardAuditDecision{}, ClaudeUsage{}, fmt.Errorf(
-				"invalid audit response: %w",
-				err,
-			)
-		}
-
-		decision, ok := parseCompletionGuardAuditDecision(
-			&response,
+	for attempt := 0; attempt < 2; attempt++ {
+		auditReq := buildCompletionGuardAuditRequestForAttempt(
+			original,
+			auditContext,
+			candidateText,
 			plan.AuditToolName,
+			attempt,
 		)
-		if !ok {
-			return completionGuardAuditDecision{}, response.Usage, errors.New(
-				"audit did not return a valid audit tool call",
-			)
+		rawBody, _ := json.Marshal(auditReq)
+		estimated := estimateClaudeRequestInputTokens(&auditReq)
+		cacheProfile := h.promptCache.BuildClaudeProfile(&auditReq, estimated)
+		auditCatalog, _ := completionGuardBuildNormalizedCatalog(&auditReq)
+		auditPlan := agentCompletionGuardPlan{
+			ToolChoiceKind:   "specific",
+			RequiredToolName: plan.AuditToolName,
+			Catalog:          auditCatalog,
 		}
 
-		return decision, response.Usage, nil
+		// never and auto use the safe prompt-only path. Only always opts into
+		// the experimental Kiro-native wire field. A wire-level rejection falls
+		// back to prompt-only without consuming the semantic corrective retry.
+		for {
+			payload := ClaudeToKiro(&auditReq, false)
+			nativeApplied := false
+
+			if useNative {
+				nativeApplied = applyNativeToolChoice(payload, auditPlan)
+				if !nativeApplied {
+					useNative = false
+				}
+			}
+			recorder := newCompletionGuardRecorder()
+			h.handleClaudeNonStream(
+				recorder,
+				payload,
+				model,
+				false,
+				claudeThinkingResponseOptions{},
+				estimated,
+				cacheProfile,
+				apiKeyIDFromContext(r.Context()),
+				rawBody,
+				forwarded,
+				cloneAnthropicSemanticHeaders(r.Header),
+				r.Context(),
+			)
+
+			status, body, recorderErr := recorder.takeResult()
+			if recorderErr != nil {
+				return completionGuardAuditDecision{}, totalUsage, recorderErr
+			}
+			if status >= 400 {
+				if nativeApplied && nativeToolChoiceRejected(status, body) {
+					logger.Warnf(
+						"[CompletionAuditNativeToolChoiceRejected] status=%d fallback=prompt_only",
+						status,
+					)
+					useNative = false
+					continue
+				}
+
+				return completionGuardAuditDecision{}, totalUsage, fmt.Errorf(
+					"audit upstream returned HTTP %d: %s",
+					status,
+					strings.TrimSpace(string(body)),
+				)
+			}
+
+			var response ClaudeResponse
+			if err := json.Unmarshal(body, &response); err != nil {
+				return completionGuardAuditDecision{}, totalUsage, fmt.Errorf(
+					"invalid audit response: %w",
+					err,
+				)
+			}
+			addCompletionGuardUsage(&totalUsage, response.Usage)
+
+			decision, diagnostics, ok := parseCompletionGuardAuditDecisionDetailed(
+				&response,
+				plan.AuditToolName,
+			)
+			if ok {
+				return decision, totalUsage, nil
+			}
+
+			logger.Warnf(
+				"[CompletionAuditInvalidResponse] attempt=%d stopReason=%q contentTypes=%q toolNames=%q auditToolMatches=%d textBlocks=%d thinkingBlocks=%d otherToolBlocks=%d unknownBlocks=%d reason=%s",
+				attempt+1,
+				diagnostics.StopReason,
+				strings.Join(diagnostics.ContentTypes, ","),
+				strings.Join(diagnostics.ToolNames, ","),
+				diagnostics.AuditToolMatches,
+				diagnostics.TextBlocks,
+				diagnostics.ThinkingBlocks,
+				diagnostics.OtherToolBlocks,
+				diagnostics.UnknownBlocks,
+				diagnostics.Reason,
+			)
+
+			if attempt == 0 {
+				logger.Warnf(
+					"[CompletionAuditRetry] attempt=1 nextAttempt=2 strategy=corrective_prompt",
+				)
+				break
+			}
+
+			return completionGuardAuditDecision{}, totalUsage, fmt.Errorf(
+				"audit did not return a valid audit tool call after corrective retry: %s",
+				diagnostics.summary(),
+			)
+		}
 	}
 
-	return completionGuardAuditDecision{}, ClaudeUsage{}, errors.New(
-		"completion audit native tool choice fallback was exhausted",
+	return completionGuardAuditDecision{}, totalUsage, errors.New(
+		"completion audit corrective retry was exhausted",
 	)
 }
 

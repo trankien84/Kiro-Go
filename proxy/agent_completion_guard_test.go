@@ -519,50 +519,65 @@ func TestCompletionGuardAutoCandidate(t *testing.T) {
 }
 
 func TestParseCompletionGuardAuditDecision(t *testing.T) {
-	resp := &ClaudeResponse{
-		StopReason: "tool_use",
-		Content: []ClaudeContentBlock{
-			{
-				Type: "tool_use",
-				ID:   "tool-audit",
-				Name: "audit",
-				Input: map[string]interface{}{
-					"status":     "needs_action",
-					"confidence": float64(98),
-					"missing_actions": []interface{}{
-						"edit proxy/kiro.go",
-						"run go test ./...",
-					},
-				},
+	baseTool := ClaudeContentBlock{
+		Type: "tool_use",
+		ID:   "tool-audit",
+		Name: "audit",
+		Input: map[string]interface{}{
+			"status":     "needs_action",
+			"confidence": float64(98),
+			"missing_actions": []interface{}{
+				"edit proxy/kiro.go",
+				"run go test ./...",
 			},
 		},
 	}
+	resp := &ClaudeResponse{
+		StopReason: "tool_use",
+		Content:    []ClaudeContentBlock{baseTool},
+	}
 
 	decision, ok := parseCompletionGuardAuditDecision(resp, "audit")
-
 	if !ok {
 		t.Fatal("audit decision was not parsed")
 	}
-
 	if !decision.needsAction(95) {
 		t.Fatalf("decision=%#v", decision)
 	}
-
 	if len(decision.MissingActions) != 2 {
 		t.Fatalf("decision=%#v", decision)
 	}
 
-	for name, invalid := range map[string]*ClaudeResponse{
-		"extra block": {
+	t.Run("allows harmless text and thinking around audit tool", func(t *testing.T) {
+		withContext := &ClaudeResponse{
 			StopReason: "tool_use",
-			Content: append(
-				append([]ClaudeContentBlock(nil), resp.Content...),
-				ClaudeContentBlock{Type: "text", Text: "extra"},
-			),
-		},
+			Content: []ClaudeContentBlock{
+				{Type: "thinking", Thinking: "checking evidence", Signature: "sig"},
+				{Type: "text", Text: "I will record the audit result."},
+				baseTool,
+				{Type: "redacted_thinking", Data: "opaque"},
+			},
+		}
+		parsed, diagnostics, ok := parseCompletionGuardAuditDecisionDetailed(
+			withContext,
+			"audit",
+		)
+		if !ok {
+			t.Fatalf("audit with harmless context was rejected: %s", diagnostics.summary())
+		}
+		if !parsed.needsAction(95) {
+			t.Fatalf("parsed=%#v", parsed)
+		}
+		if diagnostics.TextBlocks != 1 || diagnostics.ThinkingBlocks != 2 ||
+			diagnostics.AuditToolMatches != 1 || diagnostics.Reason != "ok" {
+			t.Fatalf("diagnostics=%#v", diagnostics)
+		}
+	})
+
+	for name, invalid := range map[string]*ClaudeResponse{
 		"wrong stop reason": {
 			StopReason: "end_turn",
-			Content:    resp.Content,
+			Content:    []ClaudeContentBlock{baseTool},
 		},
 		"missing tool id": {
 			StopReason: "tool_use",
@@ -603,12 +618,115 @@ func TestParseCompletionGuardAuditDecision(t *testing.T) {
 				},
 			}},
 		},
+		"unexpected tool": {
+			StopReason: "tool_use",
+			Content: []ClaudeContentBlock{
+				baseTool,
+				{
+					Type:  "tool_use",
+					ID:    "tool-other",
+					Name:  "read",
+					Input: map[string]interface{}{},
+				},
+			},
+		},
+		"duplicate audit tool": {
+			StopReason: "tool_use",
+			Content: []ClaudeContentBlock{
+				baseTool,
+				{
+					Type: "tool_use",
+					ID:   "tool-audit-2",
+					Name: "audit",
+					Input: map[string]interface{}{
+						"status":          "complete",
+						"confidence":      float64(99),
+						"missing_actions": []interface{}{},
+					},
+				},
+			},
+		},
+		"unsupported content block": {
+			StopReason: "tool_use",
+			Content: []ClaudeContentBlock{
+				baseTool,
+				{Type: "unknown_future_block"},
+			},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, ok := parseCompletionGuardAuditDecision(invalid, "audit"); ok {
 				t.Fatalf("invalid audit response was accepted: %#v", invalid)
 			}
 		})
+	}
+}
+
+func TestCompletionGuardAuditParseDiagnostics(t *testing.T) {
+	resp := &ClaudeResponse{
+		StopReason: "tool_use",
+		Content: []ClaudeContentBlock{
+			{Type: "text", Text: "checking"},
+			{
+				Type:  "tool_use",
+				ID:    "tool-other",
+				Name:  "read",
+				Input: map[string]interface{}{},
+			},
+		},
+	}
+	_, diagnostics, ok := parseCompletionGuardAuditDecisionDetailed(resp, "audit")
+	if ok {
+		t.Fatal("unexpected tool response was accepted")
+	}
+	if diagnostics.Reason != "unexpected_tool_call" ||
+		diagnostics.OtherToolBlocks != 1 ||
+		diagnostics.TextBlocks != 1 ||
+		len(diagnostics.ToolNames) != 1 || diagnostics.ToolNames[0] != "read" {
+		t.Fatalf("diagnostics=%#v", diagnostics)
+	}
+}
+
+func TestCompletionGuardAuditCorrectiveRetryRequest(t *testing.T) {
+	context := completionGuardAuditContext{
+		UserRequest: "Fix the file and run tests.",
+	}
+	first := buildCompletionGuardAuditRequestForAttempt(
+		ClaudeRequest{Model: "claude-opus-5"},
+		context,
+		"I found the issue.",
+		"audit",
+		0,
+	)
+	retry := buildCompletionGuardAuditRequestForAttempt(
+		ClaudeRequest{Model: "claude-opus-5"},
+		context,
+		"I found the issue.",
+		"audit",
+		1,
+	)
+	firstSystem, ok := first.System.(string)
+	if !ok {
+		t.Fatalf("first system type=%T", first.System)
+	}
+	retrySystem, ok := retry.System.(string)
+	if !ok {
+		t.Fatalf("retry system type=%T", retry.System)
+	}
+	if strings.Contains(firstSystem, "previous audit attempt") {
+		t.Fatalf("first attempt unexpectedly contains corrective prompt: %q", firstSystem)
+	}
+	for _, text := range []string{
+		"previous audit attempt",
+		"exactly one call",
+		"Do not emit explanatory text",
+	} {
+		if !strings.Contains(retrySystem, text) {
+			t.Fatalf("retry system prompt missing %q: %q", text, retrySystem)
+		}
+	}
+	if len(retry.Tools) != 1 || retry.Tools[0].Name != "audit" || retry.ToolChoice != nil {
+		t.Fatalf("retry request changed audit-tool isolation: %#v", retry)
 	}
 }
 
