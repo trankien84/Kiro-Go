@@ -85,7 +85,7 @@ func TestCompletionGuardPlanAndProtocolCoverage(
 	}
 
 	// Semantic audit must not run when tool_choice=none.
-	if none.AuditMode != "off" || none.AuditToolName != "" {
+	if none.AuditMode != "off" || none.AuditToolName != "" || none.AuditVerifierToolName != "" {
 		t.Fatalf("none plan unexpectedly configured audit: %#v", none)
 	}
 }
@@ -524,8 +524,7 @@ func TestParseCompletionGuardAuditDecision(t *testing.T) {
 		ID:   "tool-audit",
 		Name: "audit",
 		Input: map[string]interface{}{
-			"status":     "needs_action",
-			"confidence": float64(98),
+			"status": "needs_action",
 			"missing_actions": []interface{}{
 				"edit proxy/kiro.go",
 				"run go test ./...",
@@ -538,14 +537,8 @@ func TestParseCompletionGuardAuditDecision(t *testing.T) {
 	}
 
 	decision, ok := parseCompletionGuardAuditDecision(resp, "audit")
-	if !ok {
-		t.Fatal("audit decision was not parsed")
-	}
-	if !decision.needsAction(95) {
-		t.Fatalf("decision=%#v", decision)
-	}
-	if len(decision.MissingActions) != 2 {
-		t.Fatalf("decision=%#v", decision)
+	if !ok || !decision.needsAction() || len(decision.MissingActions) != 2 {
+		t.Fatalf("decision=%#v ok=%t", decision, ok)
 	}
 
 	t.Run("allows harmless text and thinking around audit tool", func(t *testing.T) {
@@ -562,17 +555,35 @@ func TestParseCompletionGuardAuditDecision(t *testing.T) {
 			withContext,
 			"audit",
 		)
-		if !ok {
-			t.Fatalf("audit with harmless context was rejected: %s", diagnostics.summary())
-		}
-		if !parsed.needsAction(95) {
-			t.Fatalf("parsed=%#v", parsed)
+		if !ok || !parsed.needsAction() {
+			t.Fatalf("parsed=%#v diagnostics=%s", parsed, diagnostics.summary())
 		}
 		if diagnostics.TextBlocks != 1 || diagnostics.ThinkingBlocks != 2 ||
 			diagnostics.AuditToolMatches != 1 || diagnostics.Reason != "ok" {
 			t.Fatalf("diagnostics=%#v", diagnostics)
 		}
 	})
+
+	for _, status := range []string{"complete", "waiting_for_user", "uncertain"} {
+		t.Run("valid "+status, func(t *testing.T) {
+			response := &ClaudeResponse{
+				StopReason: "tool_use",
+				Content: []ClaudeContentBlock{{
+					Type: "tool_use",
+					ID:   "tool-audit",
+					Name: "audit",
+					Input: map[string]interface{}{
+						"status":          status,
+						"missing_actions": []interface{}{},
+					},
+				}},
+			}
+			parsed, ok := parseCompletionGuardAuditDecision(response, "audit")
+			if !ok || parsed.Status != status || parsed.needsAction() {
+				t.Fatalf("parsed=%#v ok=%t", parsed, ok)
+			}
+		})
+	}
 
 	for name, invalid := range map[string]*ClaudeResponse{
 		"wrong stop reason": {
@@ -586,20 +597,6 @@ func TestParseCompletionGuardAuditDecision(t *testing.T) {
 				Name: "audit",
 				Input: map[string]interface{}{
 					"status":          "complete",
-					"confidence":      float64(99),
-					"missing_actions": []interface{}{},
-				},
-			}},
-		},
-		"fractional confidence": {
-			StopReason: "tool_use",
-			Content: []ClaudeContentBlock{{
-				Type: "tool_use",
-				ID:   "tool-audit",
-				Name: "audit",
-				Input: map[string]interface{}{
-					"status":          "complete",
-					"confidence":      99.5,
 					"missing_actions": []interface{}{},
 				},
 			}},
@@ -612,9 +609,38 @@ func TestParseCompletionGuardAuditDecision(t *testing.T) {
 				Name: "audit",
 				Input: map[string]interface{}{
 					"status":          "complete",
-					"confidence":      float64(99),
 					"missing_actions": []interface{}{},
 					"extra":           true,
+				},
+			}},
+		},
+		"needs action without missing actions": {
+			StopReason: "tool_use",
+			Content: []ClaudeContentBlock{{
+				Type: "tool_use", ID: "tool-audit", Name: "audit",
+				Input: map[string]interface{}{
+					"status":          "needs_action",
+					"missing_actions": []interface{}{},
+				},
+			}},
+		},
+		"non action status with missing actions": {
+			StopReason: "tool_use",
+			Content: []ClaudeContentBlock{{
+				Type: "tool_use", ID: "tool-audit", Name: "audit",
+				Input: map[string]interface{}{
+					"status":          "waiting_for_user",
+					"missing_actions": []interface{}{"ask for approval"},
+				},
+			}},
+		},
+		"invalid status": {
+			StopReason: "tool_use",
+			Content: []ClaudeContentBlock{{
+				Type: "tool_use", ID: "tool-audit", Name: "audit",
+				Input: map[string]interface{}{
+					"status":          "maybe",
+					"missing_actions": []interface{}{},
 				},
 			}},
 		},
@@ -622,36 +648,21 @@ func TestParseCompletionGuardAuditDecision(t *testing.T) {
 			StopReason: "tool_use",
 			Content: []ClaudeContentBlock{
 				baseTool,
-				{
-					Type:  "tool_use",
-					ID:    "tool-other",
-					Name:  "read",
-					Input: map[string]interface{}{},
-				},
+				{Type: "tool_use", ID: "tool-other", Name: "read", Input: map[string]interface{}{}},
 			},
 		},
 		"duplicate audit tool": {
 			StopReason: "tool_use",
 			Content: []ClaudeContentBlock{
 				baseTool,
-				{
-					Type: "tool_use",
-					ID:   "tool-audit-2",
-					Name: "audit",
-					Input: map[string]interface{}{
-						"status":          "complete",
-						"confidence":      float64(99),
-						"missing_actions": []interface{}{},
-					},
-				},
+				{Type: "tool_use", ID: "tool-audit-2", Name: "audit", Input: map[string]interface{}{
+					"status": "complete", "missing_actions": []interface{}{},
+				}},
 			},
 		},
 		"unsupported content block": {
 			StopReason: "tool_use",
-			Content: []ClaudeContentBlock{
-				baseTool,
-				{Type: "unknown_future_block"},
-			},
+			Content:    []ClaudeContentBlock{baseTool, {Type: "unknown_future_block"}},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -659,6 +670,39 @@ func TestParseCompletionGuardAuditDecision(t *testing.T) {
 				t.Fatalf("invalid audit response was accepted: %#v", invalid)
 			}
 		})
+	}
+}
+
+func TestParseCompletionGuardAuditVerificationDecision(t *testing.T) {
+	for _, decision := range []string{"continue_autonomously", "do_not_continue"} {
+		t.Run(decision, func(t *testing.T) {
+			response := &ClaudeResponse{
+				StopReason: "tool_use",
+				Content: []ClaudeContentBlock{{
+					Type:  "tool_use",
+					ID:    "verify-1",
+					Name:  "verify",
+					Input: map[string]interface{}{"decision": decision},
+				}},
+			}
+			parsed, diagnostics, ok := parseCompletionGuardAuditVerificationDecisionDetailed(
+				response,
+				"verify",
+			)
+			if !ok || parsed.Decision != decision || diagnostics.Reason != "ok" {
+				t.Fatalf("parsed=%#v diagnostics=%#v ok=%t", parsed, diagnostics, ok)
+			}
+		})
+	}
+	invalid := &ClaudeResponse{
+		StopReason: "tool_use",
+		Content: []ClaudeContentBlock{{
+			Type: "tool_use", ID: "verify-1", Name: "verify",
+			Input: map[string]interface{}{"decision": "continue_autonomously", "extra": true},
+		}},
+	}
+	if _, _, ok := parseCompletionGuardAuditVerificationDecisionDetailed(invalid, "verify"); ok {
+		t.Fatal("verification with extra input field was accepted")
 	}
 }
 
@@ -689,7 +733,7 @@ func TestCompletionGuardAuditParseDiagnostics(t *testing.T) {
 
 func TestCompletionGuardAuditCorrectiveRetryRequest(t *testing.T) {
 	context := completionGuardAuditContext{
-		UserRequest: "Fix the file and run tests.",
+		CurrentUserRequest: "Fix the file and run tests.",
 	}
 	first := buildCompletionGuardAuditRequestForAttempt(
 		ClaudeRequest{Model: "claude-opus-5"},
@@ -748,7 +792,7 @@ func TestCompletionGuardAuditRequestHasOnlyAuditTool(
 	auditReq := buildCompletionGuardAuditRequest(
 		original,
 		completionGuardAuditContext{
-			UserRequest: "Fix the file and run tests.",
+			CurrentUserRequest: "Fix the file and run tests.",
 			Tools: []completionGuardObservedTool{
 				{
 					ToolUseID: "read-1",
@@ -797,6 +841,85 @@ func TestCompletionGuardAuditDefaultsOff(t *testing.T) {
 	}
 }
 
+func TestCompletionGuardAuditDecisionPolicy(t *testing.T) {
+	enforce := agentCompletionGuardPlan{AuditMode: "enforce"}
+	observe := agentCompletionGuardPlan{AuditMode: "observe"}
+	needsAction := completionGuardAuditDecision{
+		Status:         "needs_action",
+		MissingActions: []string{"run tests"},
+	}
+
+	if completionGuardAuditRequiresVerification(observe, true, needsAction) {
+		t.Fatal("observe mode must never trigger autonomous verification")
+	}
+	if completionGuardAuditRequiresVerification(enforce, false, needsAction) {
+		t.Fatal("invalid audit must never trigger autonomous verification")
+	}
+	for _, status := range []string{"complete", "waiting_for_user", "uncertain"} {
+		if completionGuardAuditRequiresVerification(
+			enforce,
+			true,
+			completionGuardAuditDecision{Status: status},
+		) {
+			t.Fatalf("status %q unexpectedly triggered verification", status)
+		}
+	}
+	if !completionGuardAuditRequiresVerification(enforce, true, needsAction) {
+		t.Fatal("enforced needs_action must trigger verification")
+	}
+
+	continueDecision := completionGuardAuditVerificationDecision{Decision: "continue_autonomously"}
+	stopDecision := completionGuardAuditVerificationDecision{Decision: "do_not_continue"}
+	if completionGuardAuditContinuationApproved(enforce, true, needsAction, false, continueDecision) {
+		t.Fatal("invalid verification must fail open")
+	}
+	if completionGuardAuditContinuationApproved(enforce, true, needsAction, true, stopDecision) {
+		t.Fatal("do_not_continue must not authorize continuation")
+	}
+	if !completionGuardAuditContinuationApproved(enforce, true, needsAction, true, continueDecision) {
+		t.Fatal("verified autonomous work should authorize continuation")
+	}
+}
+
+func TestCompletionGuardAuditVerificationRequestHasOnlyVerificationTool(t *testing.T) {
+	original := ClaudeRequest{
+		Model:    "claude-opus-5",
+		Tools:    []ClaudeTool{{Name: "read"}, {Name: "edit"}},
+		Thinking: &ClaudeThinkingConfig{Type: "adaptive"},
+	}
+	context := completionGuardAuditContext{
+		CurrentUserRequest: "(b)",
+		RecentConversation: []completionGuardAuditTurn{{
+			Role: "assistant",
+			Text: "Choose (a) update the manifest or (b) find which side is stale.",
+		}},
+	}
+	req := buildCompletionGuardAuditVerificationRequestForAttempt(
+		original,
+		context,
+		"Understood. I will find which side is stale.",
+		[]string{"inspect the manifest and generated artifact"},
+		"verify",
+		1,
+	)
+	if len(req.Tools) != 1 || req.Tools[0].Name != "verify" || req.ToolChoice != nil {
+		t.Fatalf("verification request leaked client tools: %#v", req)
+	}
+	if req.Thinking != nil || req.OutputConfig != nil || req.ReasoningEffort != "" {
+		t.Fatalf("verification request must not use client reasoning fields: %#v", req)
+	}
+	system, ok := req.System.(string)
+	if !ok || !strings.Contains(system, "previous verification attempt") {
+		t.Fatalf("corrective verification prompt missing: %#v", req.System)
+	}
+	payload := fmt.Sprint(req.Messages[0].Content)
+	for _, want := range []string{"current_user_request", "recent_conversation", "primary_missing_actions"} {
+		if !strings.Contains(payload, want) {
+			t.Fatalf("verification payload missing %q: %s", want, payload)
+		}
+	}
+}
+
 func TestCompletionGuardAuditContextAfterToolResult(t *testing.T) {
 	req := ClaudeRequest{
 		Messages: []ClaudeMessage{
@@ -832,8 +955,8 @@ func TestCompletionGuardAuditContextAfterToolResult(t *testing.T) {
 
 	context := completionGuardAuditContextFromRequest(req)
 
-	if context.UserRequest != "Fix proxy/kiro.go and run tests." {
-		t.Fatalf("user request=%q", context.UserRequest)
+	if context.CurrentUserRequest != "Fix proxy/kiro.go and run tests." {
+		t.Fatalf("user request=%q", context.CurrentUserRequest)
 	}
 
 	if len(context.Tools) != 1 {
@@ -934,6 +1057,118 @@ func TestCompletionGuardAuditContextPreservesRepeatedTools(
 	resultCount, errorCount := completionGuardAuditToolStats(context.Tools)
 	if resultCount != 3 || errorCount != 1 {
 		t.Fatalf("resultCount=%d errorCount=%d", resultCount, errorCount)
+	}
+}
+
+func TestCompletionGuardAuditContextPreservesReferentialAntecedent(t *testing.T) {
+	req := ClaudeRequest{Messages: []ClaudeMessage{
+		{Role: "user", Content: "Review the digest mismatch and decide what to do."},
+		{Role: "assistant", Content: "Two choices: (a) rewrite the manifest to current bytes; (b) inspect which side became stale first. Which do you want?"},
+		{Role: "user", Content: "(b)"},
+	}}
+
+	context := completionGuardAuditContextFromRequest(req)
+	if context.CurrentUserRequest != "(b)" {
+		t.Fatalf("current request=%q", context.CurrentUserRequest)
+	}
+	if len(context.RecentConversation) != 2 {
+		t.Fatalf("recent conversation=%#v", context.RecentConversation)
+	}
+	if context.RecentConversation[0].Role != "user" ||
+		!strings.Contains(context.RecentConversation[0].Text, "digest mismatch") ||
+		context.RecentConversation[1].Role != "assistant" ||
+		!strings.Contains(context.RecentConversation[1].Text, "(b) inspect") {
+		t.Fatalf("antecedent lost: %#v", context.RecentConversation)
+	}
+}
+
+func TestCompletionGuardAuditContextIncludesAntecedentToolEvidence(t *testing.T) {
+	req := ClaudeRequest{Messages: []ClaudeMessage{
+		{Role: "user", Content: "Inspect the repository and offer two fixes."},
+		{Role: "assistant", Content: []interface{}{map[string]interface{}{
+			"type": "tool_use", "id": "read-1", "name": "read",
+			"input": map[string]interface{}{"path": "manifest.yaml"},
+		}}},
+		{Role: "user", Content: []interface{}{map[string]interface{}{
+			"type": "tool_result", "tool_use_id": "read-1", "content": "manifest contents",
+		}}},
+		{Role: "assistant", Content: "Choose (a) rewrite now or (b) verify which artifact is stale first."},
+		{Role: "user", Content: "(b)"},
+	}}
+
+	context := completionGuardAuditContextFromRequest(req)
+	if len(context.Tools) != 1 || context.Tools[0].ToolUseID != "read-1" || !context.Tools[0].HasResult {
+		t.Fatalf("antecedent tool evidence lost: %#v", context.Tools)
+	}
+}
+
+func TestCompletionGuardAuditCurrentRequestIsBounded(t *testing.T) {
+	text := strings.Repeat("x", completionGuardAuditMaxCurrentUserRunes+2048)
+	context := completionGuardAuditContextFromRequest(ClaudeRequest{Messages: []ClaudeMessage{{
+		Role: "user", Content: text,
+	}}})
+	if !context.CurrentUserRequestTruncated {
+		t.Fatal("oversized current request was not marked truncated")
+	}
+	if got := len([]rune(context.CurrentUserRequest)); got != completionGuardAuditMaxCurrentUserRunes {
+		t.Fatalf("bounded request runes=%d", got)
+	}
+	if !strings.Contains(context.CurrentUserRequest, "…") {
+		t.Fatal("bounded request does not carry a truncation marker")
+	}
+}
+
+func TestCompletionGuardAuditContextIsBounded(t *testing.T) {
+	messages := []ClaudeMessage{{Role: "user", Content: strings.Repeat("u", completionGuardAuditMaxCurrentUserRunes+1024)}}
+	for index := 0; index < completionGuardAuditMaxRecentConversationTurns+4; index++ {
+		messages = append(messages,
+			ClaudeMessage{Role: "assistant", Content: strings.Repeat("a", 4096)},
+			ClaudeMessage{Role: "user", Content: fmt.Sprintf("follow-up-%d", index)},
+		)
+	}
+	// The final short request is the current request. Add more than the tool cap
+	// in the retained conversational window so first/last evidence is preserved.
+	messages = append(messages, ClaudeMessage{Role: "assistant", Content: "Choose the next action."})
+	for index := 0; index < completionGuardAuditMaxObservedTools+8; index++ {
+		id := fmt.Sprintf("tool-%03d", index)
+		messages = append(messages,
+			ClaudeMessage{Role: "assistant", Content: []interface{}{map[string]interface{}{
+				"type": "tool_use", "id": id, "name": "execute",
+				"input": map[string]interface{}{"command": strings.Repeat("x", 8192)},
+			}}},
+			ClaudeMessage{Role: "user", Content: []interface{}{map[string]interface{}{
+				"type": "tool_result", "tool_use_id": id, "content": strings.Repeat("r", 8192),
+			}}},
+		)
+	}
+	messages = append(messages, ClaudeMessage{Role: "user", Content: "continue"})
+
+	context := completionGuardAuditContextFromRequest(ClaudeRequest{Messages: messages})
+	if context.CurrentUserRequest != "continue" {
+		t.Fatalf("current request=%q", context.CurrentUserRequest)
+	}
+	if len(context.RecentConversation) > completionGuardAuditMaxRecentConversationTurns {
+		t.Fatalf("recent turns=%d", len(context.RecentConversation))
+	}
+	conversationRunes := 0
+	for _, turn := range context.RecentConversation {
+		conversationRunes += len([]rune(turn.Text))
+	}
+	if conversationRunes > completionGuardAuditMaxRecentConversationRunes {
+		t.Fatalf("conversation runes=%d", conversationRunes)
+	}
+	if len(context.Tools) > completionGuardAuditMaxObservedTools {
+		t.Fatalf("tools=%d", len(context.Tools))
+	}
+	toolRunes := 0
+	for _, tool := range context.Tools {
+		toolRunes += len([]rune(tool.Input)) + len([]rune(tool.Result))
+	}
+	if toolRunes > completionGuardAuditMaxToolEvidenceRunes {
+		t.Fatalf("tool evidence runes=%d", toolRunes)
+	}
+	if !context.evidenceTruncated() {
+		t.Fatal("large context did not advertise truncation")
 	}
 }
 
@@ -1095,6 +1330,42 @@ func TestCompletionGuardContinuationCandidateReachesKiroHistory(t *testing.T) {
 	}
 }
 
+func TestCompletionGuardEnforcePlanConfiguresAuditAndVerifierTools(t *testing.T) {
+	t.Setenv(completionGuardEnv, "strict")
+	t.Setenv(completionGuardAuditEnv, "enforce")
+
+	plan := buildAgentCompletionGuardPlan(
+		&ClaudeRequest{
+			Model:    "claude-opus-5",
+			Messages: []ClaudeMessage{{Role: "user", Content: "Inspect and fix the file."}},
+			Tools: []ClaudeTool{
+				{Name: "read"},
+				{Name: completionGuardAuditToolBase},
+				{Name: completionGuardVerifyToolBase},
+			},
+		},
+		false,
+	)
+	if plan.AuditMode != "enforce" {
+		t.Fatalf("audit mode=%q", plan.AuditMode)
+	}
+	if plan.AuditToolName == "" || plan.AuditVerifierToolName == "" {
+		t.Fatalf("audit tools not configured: %#v", plan)
+	}
+	if plan.AuditToolName == plan.AuditVerifierToolName {
+		t.Fatalf("audit and verifier tool names collided: %#v", plan)
+	}
+	for _, clientTool := range []string{
+		"read",
+		completionGuardAuditToolBase,
+		completionGuardVerifyToolBase,
+	} {
+		if plan.AuditToolName == clientTool || plan.AuditVerifierToolName == clientTool {
+			t.Fatalf("internal audit tool collided with client tool %q: %#v", clientTool, plan)
+		}
+	}
+}
+
 func TestCompletionGuardProtocolPlanWithoutTools(t *testing.T) {
 	t.Setenv(completionGuardEnv, "strict")
 
@@ -1115,8 +1386,8 @@ func TestCompletionGuardProtocolPlanWithoutTools(t *testing.T) {
 		t.Fatal("protocol guard must remain enabled for requests without tools")
 	}
 
-	if plan.AuditToolName != "" {
-		t.Fatalf("no-tool request unexpectedly configured audit tool %q", plan.AuditToolName)
+	if plan.AuditToolName != "" || plan.AuditVerifierToolName != "" {
+		t.Fatalf("no-tool request unexpectedly configured audit tools: %#v", plan)
 	}
 }
 
@@ -1155,8 +1426,8 @@ func TestCompletionGuardObservePlan(t *testing.T) {
 		t.Fatalf("observe audit mode=%q, want off", plan.AuditMode)
 	}
 
-	if plan.AuditToolName != "" {
-		t.Fatalf("observe audit tool=%q, want empty", plan.AuditToolName)
+	if plan.AuditToolName != "" || plan.AuditVerifierToolName != "" {
+		t.Fatalf("observe audit tools unexpectedly configured: %#v", plan)
 	}
 }
 

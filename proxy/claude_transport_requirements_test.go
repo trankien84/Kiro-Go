@@ -855,7 +855,7 @@ func TestCompletionGuardAuditRequestRebuildsOuterRoutingContext(t *testing.T) {
 
 	auditReq := buildCompletionGuardAuditRequest(
 		original,
-		completionGuardAuditContext{UserRequest: "Fix the file and run tests."},
+		completionGuardAuditContext{CurrentUserRequest: "Fix the file and run tests."},
 		"The change is complete.",
 		"audit",
 	)

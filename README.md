@@ -214,7 +214,6 @@ The setting takes effect immediately without restarting.
 | `KIRO_MAX_REQUEST_BODY_BYTES` | General JSON front-door ceiling. Messages and token counting are additionally capped at 32 MiB, and the selected transport may impose a lower effective limit (for example Bedrock). | `67108864` |
 | `KIRO_NATIVE_TOOL_CHOICE` | Kiro-native forced tool choice: `never` never sends the field, `auto` uses prompt-only, `always` opts into the experimental field with prompt-only fallback on rejection | `auto` |
 | `KIRO_AGENT_COMPLETION_AUDIT` | Semantic completion audit: `off`, `observe`, or `enforce` | `off` |
-| `KIRO_AGENT_COMPLETION_AUDIT_MIN_CONFIDENCE` | Minimum confidence required before audit continuation | `95` |
 
 Completion guard delivery behavior:
 
@@ -234,7 +233,7 @@ Completion audit behavior:
 
 - `off`: prose responses are classified from their protocol stop reason only.
 - `observe`: an internal audit request is made and logged, but it never triggers a continuation.
-- `enforce`: a high-confidence `needs_action` audit may trigger one internal continuation. If that continuation fails or does not return a real tool call, Kiro-Go returns the original candidate response instead of returning a retry-exhausted error.
+- `enforce`: a `needs_action` audit is independently verified before autonomous continuation. Only `continue_autonomously` may trigger the existing internal continuation; `complete`, `waiting_for_user`, `uncertain`, verifier rejection, or audit/verifier failure all fail open to the original candidate. Audit evidence includes a bounded recent conversation slice and bounded tool evidence so short referential replies can be resolved without unbounded context growth.
 
 Diagnostic logging is disabled by default.
 

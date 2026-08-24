@@ -105,9 +105,10 @@ func TestPhase65ACompletionGuardLeavesNaturalLanguageCompletionToSemanticAudit(t
 
 func TestPhase65ACompletionAuditExplicitlyPreservesHumanWait(t *testing.T) {
 	for _, fragment := range []string{
-		"legitimately waiting for clarification, confirmation,",
-		"approval, a user choice, missing credentials",
-		"conditional on the user responding, confirming, approving",
+		"waiting_for_user",
+		"safe progress requires clarification, confirmation",
+		"approval, a user choice, credentials",
+		"from the user",
 	} {
 		if !strings.Contains(completionGuardAuditSystemPrompt, fragment) {
 			t.Fatalf("audit prompt missing human-wait rule %q", fragment)
@@ -115,8 +116,9 @@ func TestPhase65ACompletionAuditExplicitlyPreservesHumanWait(t *testing.T) {
 	}
 
 	description := completionGuardAuditTool("audit").Description
-	if !strings.Contains(description, "legitimately waits for clarification, confirmation, approval") ||
-		!strings.Contains(description, "user-provided prerequisite as complete") {
+	if !strings.Contains(description, "waiting_for_user") ||
+		!strings.Contains(description, "clarification, confirmation, approval") ||
+		!strings.Contains(description, "user-provided prerequisite") {
 		t.Fatalf("audit tool description does not preserve human wait: %q", description)
 	}
 }
