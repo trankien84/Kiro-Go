@@ -7456,9 +7456,10 @@ func (h *Handler) handleClaudeCompletionGuard(
 							continuationErr,
 						)
 					} else if completionGuardAcceptAuditContinuation(continuationOutcome) {
-						visibleResponse := completionGuardMergeBufferedVisibleResponses(
+						visibleResponse := completionGuardMergeAuditContinuationVisibleResponse(
 							candidate,
 							continuationResponse,
+							candidateText,
 						)
 
 						logger.Infof(
