@@ -389,8 +389,9 @@ type AccountPool struct {
 	errorCounts                  map[string]int             // 连续错误计数
 	modelLists                   map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
 	modelListUnavailable         map[string]bool            // accountID → expired/unsafe provider snapshot
-	reprobeBackoff               map[string]time.Duration   // accountID → next backoff interval
-	reprobeNext                  map[string]time.Time       // accountID → when to next probe
+	reprobeBackoff               map[accountRecoveryKey]time.Duration
+	reprobeNext                  map[accountRecoveryKey]time.Time
+	recoveryPending              map[accountRecoveryKey]pendingAccountRecoveryPublication
 	stopRecover                  chan struct{}
 	circuitState                 map[string]*circuitBreaker // accountID → circuit breaker state
 	healthStats                  map[string]*accountHealth  // accountID → EWMA latency + error/success counts
@@ -435,8 +436,8 @@ func GetPool() *AccountPool {
 			errorCounts:          make(map[string]int),
 			modelLists:           make(map[string]map[string]bool),
 			modelListUnavailable: make(map[string]bool),
-			reprobeBackoff:       make(map[string]time.Duration),
-			reprobeNext:          make(map[string]time.Time),
+			reprobeBackoff:       make(map[accountRecoveryKey]time.Duration),
+			reprobeNext:          make(map[accountRecoveryKey]time.Time),
 			circuitState:         make(map[string]*circuitBreaker),
 			healthStats:          make(map[string]*accountHealth),
 			apiKeyAffinity:       make(map[string]apiKeyBinding),
@@ -632,22 +633,21 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 	return p.GetNextForModelExcluding(model, nil)
 }
 
-// GetNextForModelExcluding selects an account supporting the model using
-// least-recently-used (LRU) selection: the eligible account dispatched longest
-// ago is chosen first, which interleaves requests evenly across healthy
-// accounts (replacing score-weighted random, whose EWMA-driven skew
-// concentrated load on a few "lucky" accounts and starved the rest). Health
-// score acts as a tie-breaker when several accounts share the lowest dispatch
-// sequence (cold start with several never-dispatched accounts). Skips
-// excluded, cooled-down, circuit-open, token-expiring, and quota-blocked
-// accounts. model="" means "any model".
+// GetNextSelectionForModelExcluding selects an eligible account using the
+// configured global strategy. The default round-robin strategy preserves the
+// existing LRU dispatch sequence; priority narrows to the best eligible hard
+// priority tier before that LRU step; fill-first narrows to the first account in
+// the best eligible tier. Existing model, exclusion, cooldown, circuit,
+// credential, and quota gates always run before strategy selection. model=""
+// means "any model".
 func (p *AccountPool) GetNextSelectionForModelExcluding(model string, excluded map[string]bool) *AccountSelection {
 	// Read config (takes cfgLock) BEFORE acquiring p.mu so the pool lock never
 	// nests cfgLock. Holding p.mu while blocking on cfgLock would freeze every
 	// other pool operation behind the write lock if a config writer is mid-Save
-	// (synchronous config-file publication). Keeping cfgLock a strict leaf preserves the
-	// global order tokenRefreshMu → p.mu → refreshLockFor → cfgLock.
+	// (synchronous config-file publication). Config reads stay outside p.mu;
+	// credential refresh lifecycle locks never nest the pool lock.
 	allowOverUsage := config.GetAllowOverUsage()
+	strategy := config.GetAccountSelectionStrategy()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -660,12 +660,7 @@ func (p *AccountPool) GetNextSelectionForModelExcluding(model string, excluded m
 
 	// Build candidate list: each eligible account paired with its last
 	// dispatch sequence (LRU key) and health score (tie-breaker).
-	type candidate struct {
-		acc     *config.Account
-		lastSeq uint64
-		score   float64
-	}
-	var candidates []candidate
+	var candidates []accountSelectionCandidate
 	for i := range p.accounts {
 		acc := &p.accounts[i]
 		if excluded != nil && excluded[acc.ID] {
@@ -680,13 +675,13 @@ func (p *AccountPool) GetNextSelectionForModelExcluding(model string, excluded m
 		if cb := p.circuitState[acc.ID]; cb != nil && cb.isOpen(now) {
 			continue
 		}
-		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+		if !accountCredentialDispatchable(acc, now) {
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
 			continue
 		}
-		candidates = append(candidates, candidate{
+		candidates = append(candidates, accountSelectionCandidate{
 			acc:     acc,
 			lastSeq: p.lastDispatchSeq[acc.ID],
 			score:   p.healthScore(acc.ID, effectiveWeight(acc.Weight)),
@@ -709,6 +704,10 @@ func (p *AccountPool) GetNextSelectionForModelExcluding(model string, excluded m
 		return p.selectionForAccountLocked(acc)
 	}
 
+	// Strategy is deliberately applied only after all normal eligibility gates.
+	// The degraded earliest-cooldown fallback above remains unchanged.
+	candidates = applyAccountSelectionStrategy(candidates, strategy)
+
 	// Least-recently-used: pick the candidate dispatched longest ago (lowest
 	// sequence; never-dispatched accounts share the zero value). Ties are broken
 	// by health score (higher preferred), then at random so a cold pool spreads
@@ -722,14 +721,14 @@ func (p *AccountPool) GetNextSelectionForModelExcluding(model string, excluded m
 			oldest = c.lastSeq
 		}
 	}
-	var top []candidate
+	var top []accountSelectionCandidate
 	topScore := -1.0
 	for _, c := range candidates {
 		if c.lastSeq != oldest {
 			continue
 		}
 		if len(top) == 0 || c.score > topScore {
-			top = []candidate{c}
+			top = []accountSelectionCandidate{c}
 			topScore = c.score
 		} else if c.score == topScore {
 			top = append(top, c)
@@ -792,10 +791,11 @@ func (p *AccountPool) GetNextSelectionForModelWithApiKey(model string, excluded 
 				isExcluded := excluded != nil && excluded[acc.ID]
 				cooldown, hasCooldown := p.cooldowns[acc.ID]
 				hasModel := model == "" || p.accountHasModel(acc.ID, model)
+				credentialDispatchable := accountCredentialDispatchable(acc, now)
 				quotaBlocked := isQuotaBlocked(*acc, allowOverUsage)
 				cb := p.circuitState[acc.ID]
 				circuitOpen := cb != nil && cb.isOpen(now)
-				if !isExcluded && !(hasCooldown && now.Before(cooldown)) && !circuitOpen && hasModel && !quotaBlocked {
+				if !isExcluded && !(hasCooldown && now.Before(cooldown)) && !circuitOpen && hasModel && credentialDispatchable && !quotaBlocked {
 					binding.lastUsed = now
 					p.dispatchSeq++
 					if p.lastDispatchSeq == nil {
@@ -969,10 +969,183 @@ func IsSuspensionError(err error) bool {
 		strings.Contains(lower, "no available kiro profile")
 }
 
+type accountRecoveryKey struct {
+	id         string
+	generation uint64
+}
+
+type accountRecoveryPublicationKind uint8
+
+const (
+	accountRecoveryPublicationRecover accountRecoveryPublicationKind = iota + 1
+	accountRecoveryPublicationBan
+)
+
+type pendingAccountRecoveryPublication struct {
+	kind     accountRecoveryPublicationKind
+	observed config.Account
+	status   string
+	reason   string
+}
+
+func (publication pendingAccountRecoveryPublication) publish() (bool, error) {
+	switch publication.kind {
+	case accountRecoveryPublicationRecover:
+		return config.RecoverDisabledAccountIfCredentialObserved(publication.observed)
+	case accountRecoveryPublicationBan:
+		return config.SetAccountBanStatusIfCredentialObserved(
+			publication.observed,
+			publication.status,
+			publication.reason,
+		)
+	default:
+		return false, fmt.Errorf("unknown account recovery publication kind %d", publication.kind)
+	}
+}
+
+func accountRecoveryKeyFor(account config.Account) (accountRecoveryKey, bool) {
+	key := accountRecoveryKey{id: account.ID, generation: account.DispatchGeneration}
+	if strings.TrimSpace(key.id) == "" || key.generation == 0 {
+		return accountRecoveryKey{}, false
+	}
+	return key, true
+}
+
+// accountUsesLegacyAutoRecovery identifies only failure-driven, refreshable
+// OAuth DISABLED state. Manual disable has no reason, while static credentials
+// have no OAuth refresh capability and must never be sent through token recovery.
+func accountUsesLegacyAutoRecovery(account config.Account) bool {
+	return !account.Enabled &&
+		account.SupportsKiroTokenRefresh() &&
+		strings.TrimSpace(account.RefreshToken) != "" &&
+		strings.EqualFold(strings.TrimSpace(account.BanStatus), "DISABLED") &&
+		strings.TrimSpace(account.BanReason) != ""
+}
+
+func nextRecoveryBackoff(previous time.Duration) time.Duration {
+	if previous <= 0 {
+		return time.Minute
+	}
+	next := previous * 5
+	if next > 2*time.Hour {
+		return 2 * time.Hour
+	}
+	return next
+}
+
+func (p *AccountPool) pruneRecoveryState(active map[accountRecoveryKey]struct{}) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key := range p.reprobeBackoff {
+		if _, ok := active[key]; !ok {
+			delete(p.reprobeBackoff, key)
+		}
+	}
+	for key := range p.reprobeNext {
+		if _, ok := active[key]; !ok {
+			delete(p.reprobeNext, key)
+		}
+	}
+	for key := range p.recoveryPending {
+		if _, ok := active[key]; !ok {
+			delete(p.recoveryPending, key)
+		}
+	}
+}
+
+func (p *AccountPool) clearRecoveryState(key accountRecoveryKey) {
+	p.mu.Lock()
+	delete(p.reprobeBackoff, key)
+	delete(p.reprobeNext, key)
+	delete(p.recoveryPending, key)
+	p.mu.Unlock()
+}
+
+func (p *AccountPool) pendingRecoveryPublication(key accountRecoveryKey) (pendingAccountRecoveryPublication, bool) {
+	p.mu.RLock()
+	pending, ok := p.recoveryPending[key]
+	p.mu.RUnlock()
+	return pending, ok
+}
+
+func (p *AccountPool) storePendingRecoveryPublication(key accountRecoveryKey, pending pendingAccountRecoveryPublication) {
+	p.mu.Lock()
+	if p.recoveryPending == nil {
+		p.recoveryPending = make(map[accountRecoveryKey]pendingAccountRecoveryPublication)
+	}
+	p.recoveryPending[key] = pending
+	p.mu.Unlock()
+}
+
+func (p *AccountPool) recoveryRetryReady(key accountRecoveryKey, now time.Time) bool {
+	p.mu.RLock()
+	next, ok := p.reprobeNext[key]
+	p.mu.RUnlock()
+	return !ok || !now.Before(next)
+}
+
+func (p *AccountPool) scheduleRecoveryRetry(key accountRecoveryKey, completedAt time.Time) {
+	if completedAt.IsZero() {
+		completedAt = time.Now()
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.reprobeBackoff == nil {
+		p.reprobeBackoff = make(map[accountRecoveryKey]time.Duration)
+	}
+	if p.reprobeNext == nil {
+		p.reprobeNext = make(map[accountRecoveryKey]time.Time)
+	}
+	backoff := nextRecoveryBackoff(p.reprobeBackoff[key])
+	p.reprobeBackoff[key] = backoff
+	p.reprobeNext[key] = completedAt.Add(backoff)
+}
+
+func legacyRecoveryTerminalReason(disposition auth.RefreshFailureDisposition) string {
+	switch disposition {
+	case auth.RefreshFailureCredentialTerminal:
+		return "Authentication failed - token invalid, expired, or revoked"
+	case auth.RefreshFailureConfigurationTerminal:
+		return "OAuth refresh rejected - re-authentication or configuration update required"
+	default:
+		return ""
+	}
+}
+
+// publishRecoveryPublication is the local commit stage after a network
+// observation already exists. A pre-publication storage failure is retained in
+// memory and retried locally after backoff; it must never cause another IdP POST.
+func (p *AccountPool) publishRecoveryPublication(key accountRecoveryKey, publication pendingAccountRecoveryPublication) {
+	applied, err := publication.publish()
+	completedAt := time.Now()
+	if applied {
+		// published=true is authoritative even when only the trailing durability
+		// barrier failed. Align runtime from the canonical visible image.
+		p.Reload()
+		p.clearRecoveryState(key)
+		if err != nil {
+			logger.Warnf("[AccountPool] auto-recovery local publication durability warning account=%s: %v", key.id, err)
+		}
+		return
+	}
+	if err != nil {
+		p.storePendingRecoveryPublication(key, publication)
+		p.scheduleRecoveryRetry(key, completedAt)
+		logger.Warnf("[AccountPool] auto-recovery local publication failed account=%s: %v", key.id, err)
+		return
+	}
+
+	// Lifecycle, credential, or health was superseded. The observed result no
+	// longer belongs to the canonical account, so retire it rather than retrying.
+	p.clearRecoveryState(key)
+}
 // DisableAccount marks an account as disabled (auth revoked / unrecoverable),
 // removes it from the in-memory pool so subsequent requests skip it, and
 // persists the change via config.SetAccountBanStatus.
 func (p *AccountPool) DisableAccount(id, reason string) {
+	if strings.TrimSpace(reason) == "" {
+		reason = "automatic account disable"
+	}
 	if err := config.SetAccountBanStatus(id, "DISABLED", reason); err != nil {
 		// best effort — even if persistence fails, drop it from memory
 		_ = err
@@ -1354,6 +1527,7 @@ func (p *AccountPool) healthScore(id string, weight int) float64 {
 // (or one with no cooldown at all) when no fully-healthy candidate exists.
 // model="" means "any model". Caller must hold p.mu (at least RLock).
 func (p *AccountPool) fallbackEarliestCooldown(model string, excluded map[string]bool, allowOverUsage bool) *config.Account {
+	now := time.Now()
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -1362,6 +1536,9 @@ func (p *AccountPool) fallbackEarliestCooldown(model string, excluded map[string
 			continue
 		}
 		if model != "" && !p.accountHasModel(acc.ID, model) {
+			continue
+		}
+		if !accountCredentialDispatchable(acc, now) {
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
@@ -1399,50 +1576,96 @@ func (p *AccountPool) startAutoRecover() {
 }
 
 // reprobeDisabled iterates disabled accounts whose reprobe time has arrived,
-// attempts a token refresh, and re-enables on success.
+// validates the credential at the token endpoint, and atomically publishes a
+// lifecycle/credential/health-observed recovery transition on success.
 func (p *AccountPool) reprobeDisabled() {
 	if !config.GetAutoRecoverEnabled() {
 		return
 	}
-	now := time.Now()
 	all := config.GetAccounts()
+	candidates := make([]accountRecoveryKey, 0, len(all))
+	active := make(map[accountRecoveryKey]struct{})
 	for _, acc := range all {
-		if acc.Enabled || acc.BanStatus != "DISABLED" {
+		if !accountUsesLegacyAutoRecovery(acc) {
 			continue
 		}
-		// Check backoff schedule.
-		p.mu.Lock()
-		next, ok := p.reprobeNext[acc.ID]
-		backoff := p.reprobeBackoff[acc.ID]
-		p.mu.Unlock()
-		if ok && now.Before(next) {
-			continue // not time yet
-		}
-		// Attempt refresh.
-		_, _, _, _, err := auth.RefreshToken(&acc)
-		if err == nil {
-			// Success! Re-enable.
-			config.SetAccountEnabled(acc.ID, true)
-			p.Reload()
-			p.mu.Lock()
-			delete(p.reprobeBackoff, acc.ID)
-			delete(p.reprobeNext, acc.ID)
-			p.mu.Unlock()
+		key, ok := accountRecoveryKeyFor(acc)
+		if !ok {
 			continue
 		}
-		// Failure → increase backoff: 1m → 5m → 25m → 2h max.
-		if backoff == 0 {
-			backoff = time.Minute
-		} else {
-			backoff *= 5
-			if backoff > 2*time.Hour {
-				backoff = 2 * time.Hour
+		candidates = append(candidates, key)
+		active[key] = struct{}{}
+	}
+	p.pruneRecoveryState(active)
+
+	for _, key := range candidates {
+		// Re-read the canonical account at this candidate's actual execution
+		// boundary. A prior candidate may have spent time in network I/O while an
+		// operator disabled/banned/replaced this account.
+		acc, ok := config.GetAccountByID(key.id)
+		currentKey, currentKeyOK := accountRecoveryKeyFor(acc)
+		if !ok || !currentKeyOK || currentKey != key || !accountUsesLegacyAutoRecovery(acc) {
+			p.clearRecoveryState(key)
+			continue
+		}
+		if !p.recoveryRetryReady(key, time.Now()) {
+			continue
+		}
+
+		// Once a token-endpoint result exists, storage recovery is a local commit
+		// stage. Retry it before any network work so a local filesystem failure can
+		// never turn into a second refresh-token exchange/rotation.
+		if pending, ok := p.pendingRecoveryPublication(key); ok {
+			p.publishRecoveryPublication(key, pending)
+			continue
+		}
+
+		// Keep H1 from immediately before the token round-trip. RefreshTokenForce
+		// adopts C2, but an operator/health edit racing the round-trip must still
+		// supersede successful recovery rather than being folded into H1.
+		recoveryObservation := acc.Clone()
+		_, _, _, _, refreshErr := auth.RefreshTokenForce(&acc)
+		refreshCompletedAt := time.Now()
+		if refreshErr != nil {
+			if errors.Is(refreshErr, auth.ErrAccountLifecycleChanged) ||
+				errors.Is(refreshErr, auth.ErrAccountCredentialChanged) {
+				p.clearRecoveryState(key)
+				continue
+			}
+			var persistenceErr *auth.AccountCredentialPersistenceError
+			if errors.As(refreshErr, &persistenceErr) && persistenceErr.Published {
+				logger.Warnf("[AccountPool] auto-recovery credential durability warning account=%s: %v", acc.ID, refreshErr)
+			} else {
+				disposition := auth.ClassifyRefreshFailure(refreshErr)
+				if disposition == auth.RefreshFailureRetryable {
+					p.scheduleRecoveryRetry(key, refreshCompletedAt)
+					continue
+				}
+
+				// RefreshTokenForce re-reads canonical credential state while holding
+				// the per-lifecycle refresh lock. Use the snapshot it actually attempted,
+				// not H1 captured before waiting for that lock.
+				attempted := acc.Clone()
+				p.publishRecoveryPublication(key, pendingAccountRecoveryPublication{
+					kind:     accountRecoveryPublicationBan,
+					observed: attempted,
+					status:   "BANNED",
+					reason:   legacyRecoveryTerminalReason(disposition),
+				})
+				continue
 			}
 		}
-		p.mu.Lock()
-		p.reprobeBackoff[acc.ID] = backoff
-		p.reprobeNext[acc.ID] = now.Add(backoff)
-		p.mu.Unlock()
+
+		// C2 is canonical, including after a post-publication durability warning.
+		// Pair C2 with H1 so the config primitive can reject a concurrent health edit.
+		recoveryObservation.AccessToken = acc.AccessToken
+		recoveryObservation.RefreshToken = acc.RefreshToken
+		recoveryObservation.ExpiresAt = acc.ExpiresAt
+
+		p.publishRecoveryPublication(key, pendingAccountRecoveryPublication{
+			kind:     accountRecoveryPublicationRecover,
+			observed: recoveryObservation,
+		})
 	}
 }
 

@@ -102,15 +102,27 @@ type Handler struct {
 	providerModelDeniedUntil  map[accountLifecycleKey]map[string]time.Time
 	providerSourceGenerations map[accountLifecycleKey]uint64
 
-	backgroundWG      sync.WaitGroup
-	backgroundStartMu sync.Mutex
-	closeOnce         sync.Once
-	closed            atomic.Bool
-	shutdownDone      chan struct{}
+	// backgroundTaskOwner is set only for Handler instances whose dynamic
+	// goroutines are owned by a real/test lifecycle and therefore can be joined.
+	// Zero-value/manual fixtures stay synchronous unless they explicitly opt in.
+	backgroundTaskOwner bool
+	backgroundWG        sync.WaitGroup
+	backgroundStartMu   sync.Mutex
+	backgroundCancels   map[uint64]context.CancelFunc
+	backgroundNextID    uint64
+	closeOnce           sync.Once
+	closed              atomic.Bool
+	shutdownDone        chan struct{}
 
 	promptCache        *promptCacheTracker
-	tokenRefreshMu     sync.Mutex
 	credentialImportMu sync.Mutex
+	// Process-local observed reconciler state for the live Accounts UI. This is
+	// intentionally separate from config.json: it contains ephemeral scheduling
+	// and in-flight state, not desired configuration.
+	accountRuntimeMu       sync.RWMutex
+	accountRuntimeInstance string
+	accountRuntimeRevision uint64
+	accountRuntimeAccounts []accountRuntimeView
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
@@ -184,17 +196,17 @@ func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, _ int) string 
 		if thinking.BudgetTokens < 0 {
 			return "thinking.budget_tokens must not be negative"
 		}
-	case "adaptive", "disabled":
+	case "adaptive", "disabled", "between_tools":
 		if thinking.BudgetTokens != 0 {
 			return "thinking.budget_tokens is only supported when thinking.type is enabled"
 		}
 	default:
-		return "thinking.type must be one of: enabled, adaptive, disabled"
+		return "thinking.type must be one of: enabled, adaptive, disabled, between_tools"
 	}
 
 	display := strings.ToLower(strings.TrimSpace(thinking.Display))
-	if display != "" && display != "summarized" && display != "omitted" {
-		return "thinking.display must be one of: summarized, omitted"
+	if display != "" && display != "summarized" && display != "omitted" && display != "updates" {
+		return "thinking.display must be one of: summarized, omitted, updates"
 	}
 	if kind == "disabled" && display != "" {
 		return "thinking.display is not supported when thinking.type is disabled"
@@ -384,7 +396,9 @@ func NewHandler() *Handler {
 		providerSourceGenerations: make(map[accountLifecycleKey]uint64),
 		providerExpiryWake:        make(chan struct{}, 1),
 		providerExpiryStop:        make(chan struct{}),
+		backgroundTaskOwner:       true,
 		shutdownDone:              make(chan struct{}),
+		accountRuntimeInstance:    uuid.NewString(),
 		microsoftSelections:       make(map[string]*microsoftProfileSelection),
 		microsoftCanceled:         make(map[string]time.Time),
 		microsoftDiscoveries:      make(map[string]*microsoftProfileDiscovery),
@@ -464,15 +478,37 @@ func (h *Handler) startBackgroundTask(fn func()) bool {
 	if h == nil || fn == nil {
 		return false
 	}
-	h.backgroundStartMu.Lock()
-	defer h.backgroundStartMu.Unlock()
-	if h.closed.Load() {
+	return h.startBackgroundTaskContext(func(context.Context) { fn() })
+}
+
+func (h *Handler) startBackgroundTaskContext(fn func(context.Context)) bool {
+	if h == nil || fn == nil {
 		return false
 	}
+	h.backgroundStartMu.Lock()
+	if h.closed.Load() || !h.backgroundTaskOwner {
+		h.backgroundStartMu.Unlock()
+		return false
+	}
+	if h.backgroundCancels == nil {
+		h.backgroundCancels = make(map[uint64]context.CancelFunc)
+	}
+	h.backgroundNextID++
+	taskID := h.backgroundNextID
+	taskCtx, cancel := context.WithCancel(context.Background())
+	h.backgroundCancels[taskID] = cancel
 	h.backgroundWG.Add(1)
+	h.backgroundStartMu.Unlock()
+
 	go func() {
 		defer h.backgroundWG.Done()
-		fn()
+		defer func() {
+			cancel()
+			h.backgroundStartMu.Lock()
+			delete(h.backgroundCancels, taskID)
+			h.backgroundStartMu.Unlock()
+		}()
+		fn(taskCtx)
 	}()
 	return true
 }
@@ -491,7 +527,14 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 	h.closeOnce.Do(func() {
 		h.backgroundStartMu.Lock()
 		h.closed.Store(true)
+		cancels := make([]context.CancelFunc, 0, len(h.backgroundCancels))
+		for _, cancel := range h.backgroundCancels {
+			cancels = append(cancels, cancel)
+		}
 		h.backgroundStartMu.Unlock()
+		for _, cancel := range cancels {
+			cancel()
+		}
 		h.cancelMicrosoftFlowsForShutdown()
 		if h.shutdownDone == nil {
 			h.shutdownDone = make(chan struct{})
@@ -533,36 +576,29 @@ func (h *Handler) Close() {
 	_ = h.Shutdown(context.Background())
 }
 
-// backgroundRefresh 后台定时刷新账户信息
+// backgroundRefresh owns the two independent refresh schedules introduced by
+// the account reconciler. Account credential/info work runs on its short scan
+// cadence while model discovery keeps the historical 30-minute cadence. The
+// parent waits for both children so Handler.Shutdown retains one lifecycle gate.
 func (h *Handler) backgroundRefresh() {
-	ticker := time.NewTicker(30 * time.Minute) // 每 30 分钟刷新一次
-	defer ticker.Stop()
-
-	// 启动时延迟 10 秒后执行一次，同时允许 Close 立即中断。
-	startup := time.NewTimer(10 * time.Second)
-	select {
-	case <-startup.C:
-		h.refreshModelsCache()
-		h.refreshAllAccounts()
-	case <-h.stopRefresh:
-		if !startup.Stop() {
-			select {
-			case <-startup.C:
-			default:
-			}
-		}
+	if h.stopRefresh == nil {
 		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		h.backgroundAccountReconciler(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		h.backgroundModelRefresh(ctx)
+	}()
 
-	for {
-		select {
-		case <-ticker.C:
-			h.refreshModelsCache()
-			h.refreshAllAccounts()
-		case <-h.stopRefresh:
-			return
-		}
-	}
+	<-h.stopRefresh
+	cancel()
+	wg.Wait()
 }
 
 // refreshAllAccounts 刷新所有账户信息
@@ -625,20 +661,8 @@ func (h *Handler) refreshAccountByKind(
 		return &accountRefreshOutcome{Message: "Direct Anthropic model list refreshed"}, nil
 
 	case account.IsCustomApi():
-		quota, err := probeCustomApiQuotaWithContext(ctx, account.BaseURL, account.KiroApiKey)
+		outcome, err := h.refreshObservedAccountState(ctx, account)
 		if err != nil {
-			return nil, err
-		}
-		info := quota.toAccountInfo(time.Now().Unix())
-		if account.DispatchGeneration != 0 {
-			applied, err := config.UpdateAccountInfoIfLifecycle(account.ID, account.DispatchGeneration, info)
-			if err != nil {
-				return nil, err
-			}
-			if !applied {
-				return nil, errStaleAccountSelection
-			}
-		} else if err := config.UpdateAccountInfo(account.ID, info); err != nil {
 			return nil, err
 		}
 		if mode == accountRefreshExplicit {
@@ -646,72 +670,13 @@ func (h *Handler) refreshAccountByKind(
 				logger.Warnf("[Refresh] custom_api model reload failed for %s: %v", account.ID, err)
 			}
 		}
-		return &accountRefreshOutcome{Info: info}, nil
+		return outcome, nil
 	}
 
 	if !account.SupportsKiroAccountInfo() {
 		return nil, fmt.Errorf("account kind %q does not support Kiro account refresh", account.AuthMethod)
 	}
-
-	refreshedToken := false
-	refreshKiroToken := func(force bool) error {
-		if !account.SupportsKiroTokenRefresh() || account.RefreshToken == "" {
-			return nil
-		}
-		refreshed, err := h.refreshAccountToken(account, force)
-		if err != nil {
-			return err
-		}
-		refreshedToken = refreshedToken || refreshed
-		return nil
-	}
-
-	needsTokenRefresh := account.ExpiresAt > 0 &&
-		time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds
-	if needsTokenRefresh {
-		if err := refreshKiroToken(false); err != nil {
-			return nil, err
-		}
-	}
-
-	isSuspended := func(refreshErr error) bool {
-		if refreshErr == nil {
-			return false
-		}
-		errMsg := refreshErr.Error()
-		return strings.Contains(errMsg, "TEMPORARILY_SUSPENDED") ||
-			strings.Contains(errMsg, "Account suspended")
-	}
-
-	info, err := RefreshAccountInfo(account)
-	if isSuspended(err) {
-		return &accountRefreshOutcome{Message: "Account status updated"}, nil
-	}
-	if err != nil && !refreshedToken && account.SupportsKiroTokenRefresh() &&
-		account.RefreshToken != "" && shouldRetryAccountRefreshOnError(err.Error()) {
-		if refreshErr := refreshKiroToken(true); refreshErr != nil {
-			return nil, refreshErr
-		}
-		info, err = RefreshAccountInfo(account)
-	}
-	if isSuspended(err) {
-		return &accountRefreshOutcome{Message: "Account status updated"}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if account.DispatchGeneration != 0 {
-		applied, persistErr := config.UpdateAccountInfoIfLifecycle(account.ID, account.DispatchGeneration, *info)
-		if persistErr != nil {
-			return nil, persistErr
-		}
-		if !applied {
-			return nil, errStaleAccountSelection
-		}
-	} else if err := config.UpdateAccountInfo(account.ID, *info); err != nil {
-		return nil, err
-	}
-	return &accountRefreshOutcome{Info: info}, nil
+	return h.refreshObservedAccountState(ctx, account)
 }
 
 func (h *Handler) refreshAllAccounts() {
@@ -1153,7 +1118,7 @@ func (h *Handler) fetchAndCacheAccountModelsContext(ctx context.Context, account
 	sourceGeneration := h.providerSourceGeneration(account)
 
 	if account.IsBedrock() {
-		ids, discoveryErr := h.cachedOrDiscoverBedrockModelsResult(account)
+		ids, discoveryErr := h.cachedOrDiscoverBedrockModelsResultContext(ctx, account)
 		explicitIDs := make([]string, 0, len(account.BedrockModelMap))
 		for _, value := range account.BedrockModelMap {
 			if value = strings.TrimSpace(value); value != "" {
@@ -1204,8 +1169,8 @@ func (h *Handler) fetchAndCacheAccountModelsContext(ctx context.Context, account
 	case config.AccountKindCustomRelay:
 		models, err = probeCustomApiModelsWithContext(ctx, account.BaseURL, account.KiroApiKey)
 	case config.AccountKindKiroOAuth, config.AccountKindKiroAPIKey:
-		if err = h.ensureValidToken(account); err == nil {
-			models, err = ListAvailableModels(account)
+		if err = h.ensureValidTokenContext(ctx, account); err == nil {
+			models, err = ListAvailableModelsContext(ctx, account)
 		}
 	default:
 		err = fmt.Errorf("account kind %s does not support model discovery", account.Kind())
@@ -1258,18 +1223,28 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 	// An explicit refresh should re-run Bedrock discovery, not reuse the cache, and
 	// re-learn which region each model is callable in.
 	if account.IsBedrock() {
-		clearBedrockModelCacheForLifecycle(account)
+		if _, err := clearBedrockModelCacheForLifecycleContext(r.Context(), account); err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 		clearBedrockRegionRoutesForLifecycle(account)
 		bedrockThrottle.clearForLifecycle(account)
-		// Prewarm the per-model callable region in the background (opt-in cost: one
-		// tiny invoke per model per candidate region). The response returns as soon
-		// as discovery is cached; the region map fills in shortly after.
-		h.startBackgroundTask(func() { acc := *account; h.prewarmBedrockRegions(&acc) })
 	}
 	if err := h.fetchAndCacheAccountModelsContext(r.Context(), account); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
+	}
+	if account.IsBedrock() {
+		// Prewarm only after foreground discovery has published a complete accepted
+		// catalog. This prevents a canceled/failed refresh from launching duplicate
+		// discovery or paid canary work against partial evidence.
+		acc := account.Clone()
+		h.startBackgroundTaskContext(func(ctx context.Context) { h.prewarmBedrockRegionsContext(ctx, &acc) })
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
@@ -1356,14 +1331,16 @@ func (h *Handler) warmModelsCacheAsync() {
 		return
 	}
 	atomic.StoreInt64(&h.lastWarmAttemptNanos, time.Now().UnixNano())
-	if !h.startBackgroundTask(func() {
+	if !h.startBackgroundTaskContext(func(taskCtx context.Context) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				logger.Errorf("[ModelsCache] warm goroutine panicked: %v", recovered)
 			}
 		}()
 		defer atomic.StoreInt32(&h.modelsWarming, 0)
-		h.refreshModelsCache()
+		ctx, cancel := context.WithTimeout(taskCtx, 2*time.Minute)
+		defer cancel()
+		h.refreshModelsCacheContext(ctx)
 	}) {
 		atomic.StoreInt32(&h.modelsWarming, 0)
 	}
@@ -2059,7 +2036,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		selection := candidate.Selection
 		account := candidate.Account
 		providerModelID := string(candidate.ProviderModelID)
-		if err := h.ensureValidTokenForSelection(selection); err != nil {
+		if err := h.ensureValidTokenForSelectionContext(requestContext, selection); err != nil {
 			lastErr = err
 			if errors.Is(err, errStaleAccountSelection) {
 				continue
@@ -2611,7 +2588,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = h.usageInputFromContextPercentage(account, providerModelID, model, pct)
 			},
 		}
 		if guardWriter, ok := w.(*completionGuardStreamingWriter); ok {
@@ -2678,7 +2655,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		closeActiveBlock()
 
-		if realInputTokens > 0 {
+		if realInputTokens > 0 && inputTokens <= 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
@@ -2990,7 +2967,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		selection := candidate.Selection
 		account := candidate.Account
 		providerModelID := string(candidate.ProviderModelID)
-		if err := h.ensureValidTokenForSelection(selection); err != nil {
+		if err := h.ensureValidTokenForSelectionContext(requestContext, selection); err != nil {
 			lastErr = err
 			if errors.Is(err, errStaleAccountSelection) {
 				continue
@@ -3164,7 +3141,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = h.usageInputFromContextPercentage(account, providerModelID, model, pct)
 			},
 			OnStopReason: func(reason string) { upstreamStopReason = reason },
 			CanRetry:     func() bool { return true },
@@ -3244,7 +3221,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			rawThinkingContent = ""
 		}
 
-		if realInputTokens > 0 {
+		if realInputTokens > 0 && inputTokens <= 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
@@ -3596,7 +3573,7 @@ func (h *Handler) handleOpenAIStreamProjected(w http.ResponseWriter, model, apiK
 			estimatedInputTokens = kiro.EstimatedInputTokens
 		}
 
-		if err := h.ensureValidTokenForSelection(selection); err != nil {
+		if err := h.ensureValidTokenForSelectionContext(requestContext, selection); err != nil {
 			lastErr = err
 			if errors.Is(err, errStaleAccountSelection) {
 				continue
@@ -3946,7 +3923,7 @@ func (h *Handler) handleOpenAIStreamProjected(w http.ResponseWriter, model, apiK
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = h.usageInputFromContextPercentage(account, string(providerID), model, pct)
 			},
 		}
 
@@ -3994,7 +3971,7 @@ func (h *Handler) handleOpenAIStreamProjected(w http.ResponseWriter, model, apiK
 			sendChunk("", 3)
 		}
 
-		if realInputTokens > 0 {
+		if realInputTokens > 0 && inputTokens <= 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
@@ -4135,7 +4112,7 @@ func (h *Handler) handleOpenAINonStreamProjected(w http.ResponseWriter, model, a
 			estimatedInputTokens = kiro.EstimatedInputTokens
 		}
 
-		if err := h.ensureValidTokenForSelection(selection); err != nil {
+		if err := h.ensureValidTokenForSelectionContext(requestContext, selection); err != nil {
 			lastErr = err
 			if errors.Is(err, errStaleAccountSelection) {
 				continue
@@ -4208,7 +4185,7 @@ func (h *Handler) handleOpenAINonStreamProjected(w http.ResponseWriter, model, a
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = h.usageInputFromContextPercentage(account, string(providerID), model, pct)
 			},
 			OnStopReason: func(reason string) { upstreamStopReason = reason },
 			CanRetry:     func() bool { return true },
@@ -4244,7 +4221,7 @@ func (h *Handler) handleOpenAINonStreamProjected(w http.ResponseWriter, model, a
 			reasoningContent = ""
 		}
 
-		if realInputTokens > 0 {
+		if realInputTokens > 0 && inputTokens <= 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
@@ -4326,8 +4303,18 @@ func (h *Handler) handleTokenValidationFailureForSelection(selection *pool.Accou
 // compare-and-swap. It never re-reads credentials from a newer lifecycle with
 // the same textual ID and never publishes a stale refresh result into it.
 func (h *Handler) ensureValidTokenForSelection(selection *pool.AccountSelection) error {
+	return h.ensureValidTokenForSelectionContext(context.Background(), selection)
+}
+
+func (h *Handler) ensureValidTokenForSelectionContext(ctx context.Context, selection *pool.AccountSelection) error {
 	if selection == nil {
 		return errors.New("account selection is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	account := &selection.Account
 	if !account.HasKnownKind() {
@@ -4340,10 +4327,12 @@ func (h *Handler) ensureValidTokenForSelection(selection *pool.AccountSelection)
 		account.DispatchGeneration != selection.LifecycleGeneration {
 		return errStaleAccountSelection
 	}
-	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
+	needsRefresh := strings.TrimSpace(account.AccessToken) == "" ||
+		(account.ExpiresAt > 0 && time.Now().Unix() >= account.ExpiresAt-tokenRefreshSkewSeconds)
+	if !needsRefresh {
 		return nil
 	}
-	_, err := h.refreshAccountToken(account, false)
+	_, err := h.refreshAccountTokenContext(ctx, account, false)
 	return err
 }
 
@@ -4358,8 +4347,18 @@ func (h *Handler) handleTokenValidationFailure(account *config.Account, err erro
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
+	return h.ensureValidTokenContext(context.Background(), account)
+}
+
+func (h *Handler) ensureValidTokenContext(ctx context.Context, account *config.Account) error {
 	if account == nil {
 		return errors.New("account is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if !account.HasKnownKind() {
 		return &unsupportedAccountKindError{AuthMethod: account.AuthMethod}
@@ -4368,10 +4367,12 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 	if !account.SupportsKiroTokenRefresh() {
 		return nil
 	}
-	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
+	needsRefresh := strings.TrimSpace(account.AccessToken) == "" ||
+		(account.ExpiresAt > 0 && time.Now().Unix() >= account.ExpiresAt-tokenRefreshSkewSeconds)
+	if !needsRefresh {
 		return nil
 	}
-	_, err := h.refreshAccountToken(account, false)
+	_, err := h.refreshAccountTokenContext(ctx, account, false)
 	return err
 }
 
@@ -4399,6 +4400,17 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/accounts" && r.Method == "GET":
 		h.apiGetAccounts(w, r)
+	case path == "/accounts/runtime" && r.Method == "GET":
+		h.apiGetAccountsRuntime(w, r)
+	case path == "/account-routing" && r.Method == "GET":
+		h.apiGetAccountRouting(w, r)
+	case path == "/account-routing" && r.Method == "PUT":
+		h.apiUpdateAccountRouting(w, r)
+	case path == "/accounts/order" && r.Method == "PUT":
+		h.apiReorderAccounts(w, r)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/routing") && r.Method == "PUT":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/routing")
+		h.apiUpdateAccountRoutingPriority(w, r, id)
 	case path == "/accounts" && r.Method == "POST":
 		h.apiAddAccount(w, r)
 	case path == "/accounts/batch" && r.Method == "POST":
@@ -4548,6 +4560,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 
 		result[i] = map[string]interface{}{
 			"id":                a.ID,
+			"generation":        a.DispatchGeneration,
 			"email":             a.Email,
 			"userId":            a.UserId,
 			"nickname":          a.Nickname,
@@ -4562,6 +4575,8 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"hasToken":          a.AccessToken != "",
 			"machineId":         a.MachineId,
 			"weight":            a.Weight,
+			"priority":          a.Priority,
+			"effectivePriority": config.EffectiveAccountPriority(a.Priority),
 			"overageStatus":     a.OverageStatus,
 			"overageCapability": a.OverageCapability,
 			"overageCap":        a.OverageCap,
@@ -4712,11 +4727,11 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	// 新账号若已启用且有 token，立即拉取并缓存模型列表
 	if accountReadyForModelDiscovery(&account) {
 		acc := account.Clone()
-		h.startBackgroundTask(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		h.startBackgroundTaskContext(func(taskCtx context.Context) {
+			ctx, cancel := context.WithTimeout(taskCtx, 2*time.Minute)
 			defer cancel()
 			if err := h.fetchAndCacheAccountModelsContext(ctx, &acc); err != nil {
-				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", acc.Email, err)
+				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", accountIdentityForLog(&acc), err)
 			}
 		})
 	}
@@ -4897,11 +4912,11 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	// fields that were intentionally preserved by the partial mutation.
 	if accountReadyForModelDiscovery(&after) && (!before.Enabled || lifecycleChanged) {
 		acc := after.Clone()
-		h.startBackgroundTask(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		h.startBackgroundTaskContext(func(taskCtx context.Context) {
+			ctx, cancel := context.WithTimeout(taskCtx, 2*time.Minute)
 			defer cancel()
 			if refreshErr := h.fetchAndCacheAccountModelsContext(ctx, &acc); refreshErr != nil {
-				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, refreshErr)
+				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", accountIdentityForLog(&acc), refreshErr)
 			}
 		})
 	}
@@ -5087,11 +5102,11 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		h.rebuildEnabledModelUnion()
 		for _, acc := range toRefreshModels {
 			a := acc.Clone()
-			h.startBackgroundTask(func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			h.startBackgroundTaskContext(func(taskCtx context.Context) {
+				ctx, cancel := context.WithTimeout(taskCtx, 2*time.Minute)
 				defer cancel()
 				if err := h.fetchAndCacheAccountModelsContext(ctx, &a); err != nil {
-					logger.Warnf("[ModelsCache] Auto-refresh failed for batch-enabled account %s: %v", a.Email, err)
+					logger.Warnf("[ModelsCache] Auto-refresh failed for batch-enabled account %s: %v", accountIdentityForLog(&a), err)
 				}
 			})
 		}
@@ -6706,9 +6721,11 @@ func (h *Handler) importCredential(req importCredentialRequest) (importCredentia
 		}
 		if account.Enabled && account.AccessToken != "" {
 			acc := account.Clone()
-			h.startBackgroundTask(func() {
-				if err := h.fetchAndCacheAccountModels(&acc); err != nil {
-					logger.Warnf("[ModelsCache] Auto-refresh failed for new API key account %s: %v", acc.Email, err)
+			h.startBackgroundTaskContext(func(taskCtx context.Context) {
+				ctx, cancel := context.WithTimeout(taskCtx, 2*time.Minute)
+				defer cancel()
+				if err := h.fetchAndCacheAccountModelsContext(ctx, &acc); err != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for new API key account %s: %v", accountIdentityForLog(&acc), err)
 				}
 			})
 		}

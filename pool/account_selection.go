@@ -67,8 +67,8 @@ func (p *AccountPool) GetSelectionByID(id string) *AccountSelection {
 	return nil
 }
 
-// clearRuntimeLifecycleLocked removes all ID-keyed runtime state when the same
-// textual account ID starts a new logical lifecycle. This prevents the new
+// clearRuntimeLifecycleLocked removes all runtime state associated with an ID
+// when the same textual account ID starts a new logical lifecycle. This prevents the new
 // account from inheriting cooldown/circuit/health/model/affinity state.
 func (p *AccountPool) clearRuntimeLifecycleLocked(id string) {
 	delete(p.cooldowns, id)
@@ -78,8 +78,23 @@ func (p *AccountPool) clearRuntimeLifecycleLocked(id string) {
 	delete(p.lastDispatchSeq, id)
 	delete(p.modelLists, id)
 	delete(p.modelListUnavailable, id)
-	delete(p.reprobeBackoff, id)
-	delete(p.reprobeNext, id)
+	// Recovery scheduling is lifecycle-keyed. Clearing a textual ID must retire
+	// every generation for that ID while leaving unrelated accounts untouched.
+	for key := range p.reprobeBackoff {
+		if key.id == id {
+			delete(p.reprobeBackoff, key)
+		}
+	}
+	for key := range p.reprobeNext {
+		if key.id == id {
+			delete(p.reprobeNext, key)
+		}
+	}
+	for key := range p.recoveryPending {
+		if key.id == id {
+			delete(p.recoveryPending, key)
+		}
+	}
 	for key, binding := range p.apiKeyAffinity {
 		if binding.accountID == id {
 			delete(p.apiKeyAffinity, key)

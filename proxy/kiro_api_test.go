@@ -132,6 +132,10 @@ func TestResolveProfileArnFetchesAndCachesProfile(t *testing.T) {
 }
 
 func TestResolveProfileArnSuppressesBuilderIDUnsupportedLookup(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
 	clearProfileArnResolutionCooldowns()
 	t.Cleanup(clearProfileArnResolutionCooldowns)
 
@@ -177,6 +181,11 @@ func TestResolveProfileArnSuppressesBuilderIDUnsupportedLookup(t *testing.T) {
 }
 
 func TestResolveProfileArnKeepsRefreshFallbackForBuilderIDUnsupportedLookup(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(configPath); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
 	clearProfileArnResolutionCooldowns()
 	t.Cleanup(clearProfileArnResolutionCooldowns)
 
@@ -411,6 +420,10 @@ func TestKiroProfileRegionCandidatesRejectsUnsafeAccountRegion(t *testing.T) {
 }
 
 func TestDiscoverKiroProfilesAcrossRegionsDeduplicatesAndPreservesAuthRegion(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
 	const (
 		usARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/US_PROFILE"
 		euARN = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/EU_PROFILE"
@@ -474,6 +487,10 @@ func TestDiscoverKiroProfilesAcrossRegionsDeduplicatesAndPreservesAuthRegion(t *
 }
 
 func TestDiscoverKiroProfilesReturnsPartialSuccess(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
 	const euARN = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/EU_PROFILE"
 	kiroRestHttpStore.Store(&http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -506,6 +523,10 @@ func TestDiscoverKiroProfilesReturnsPartialSuccess(t *testing.T) {
 }
 
 func TestDiscoverKiroProfilesReportsAllRegionFailures(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
 	kiroRestHttpStore.Store(&http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -533,6 +554,10 @@ func TestDiscoverKiroProfilesReportsAllRegionFailures(t *testing.T) {
 }
 
 func TestDiscoverKiroProfilesReportsEmptyDiscovery(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
 	kiroRestHttpStore.Store(&http.Client{
 		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -555,6 +580,10 @@ func TestDiscoverKiroProfilesReportsEmptyDiscovery(t *testing.T) {
 }
 
 func TestResolveProfileArnExternalIDPSkipsRefreshFallback(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
 	var authCalls int32
 	oldAuthClient := auth.SetGlobalAuthClientForTest(&http.Client{
 		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {

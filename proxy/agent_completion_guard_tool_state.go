@@ -348,6 +348,12 @@ func completionGuardValidateAndResolveUserToolResults(
 				messageIndex,
 			)
 		}
+		// Browser/computer toolset results must echo the exact originating
+		// toolset_name; member names alone are not unique across toolsets.
+		resultToolset := completionGuardMapString(block, "toolset_name")
+		if node.ServerName != resultToolset {
+			return fmt.Sprintf("messages[%d] tool_result.toolset_name does not match its tool_use", messageIndex)
+		}
 		if node.ParentID != "" &&
 			!completionGuardProgrammaticResultContentValid(block["content"]) {
 			return fmt.Sprintf(
@@ -517,6 +523,12 @@ func completionGuardBuildHistoricalToolGraph(
 				case blockType == "tool_use":
 					id := completionGuardMapString(block, "id")
 					name := completionGuardMapString(block, "name")
+					toolsetName := completionGuardMapString(block, "toolset_name")
+					if _, present := block["toolset_name"]; present {
+						if toolsetName == "" || plan.Catalog == nil || !plan.Catalog.NativeToolsets[toolsetName] {
+							return graph, fmt.Sprintf("messages[%d] references unknown toolset_name %q", messageIndex, toolsetName)
+						}
+					}
 					callerType, callerID, callerValid := completionGuardMapCaller(block)
 					if id == "" || name == "" {
 						return graph, fmt.Sprintf("messages[%d] has malformed client tool use", messageIndex)
@@ -537,6 +549,7 @@ func completionGuardBuildHistoricalToolGraph(
 						ID:           id,
 						Kind:         completionGuardToolKindClient,
 						Name:         name,
+						ServerName:   toolsetName,
 						ParentID:     callerID,
 						CallerType:   callerType,
 						Inherited:    true,
@@ -773,6 +786,7 @@ func classifyCompletionGuardResponseWithToolGraph(
 	completionGuardDiscardRefusalPartialOutput(resp)
 	out.NaturalText = completionGuardNaturalText(resp)
 	graph := historical.clone()
+	plan = completionGuardResponseMCPPlan(plan)
 	seenServerToolResultIDs := make(map[string]bool)
 	seenNonCompaction := false
 	seenSubstantive := false
@@ -815,6 +829,12 @@ func classifyCompletionGuardResponseWithToolGraph(
 
 		case blockType == "thinking" || blockType == "redacted_thinking":
 			if reason := completionGuardValidateThinkingBlock(block); reason != "" {
+				out.Reason = reason
+				return out
+			}
+
+		case blockType == "mcp_tool_listing":
+			if reason := completionGuardResponseMCPListing(block, plan); reason != "" {
 				out.Reason = reason
 				return out
 			}
@@ -968,6 +988,32 @@ func classifyCompletionGuardResponseWithToolGraph(
 					return out
 				}
 				graph.References = append(graph.References, references...)
+				if plan.Catalog != nil {
+					// Loading cannot re-offer a removed tool. Validate every
+					// reference first, then update the response-local state.
+					for _, reference := range references {
+						if reference.Resolution.Kind == completionGuardReferenceExplicitTool {
+							if state, tracked := plan.Catalog.CustomFinalState[reference.ToolName]; tracked && !state.Offered {
+								out.Reason = "tool_search_reference_to_removed_tool"
+								return out
+							}
+						}
+					}
+					for _, reference := range references {
+						if reference.Resolution.Kind == completionGuardReferenceExplicitTool && reference.Resolution.Deferred {
+							if state, tracked := plan.Catalog.CustomFinalState[reference.ToolName]; tracked {
+								state.Loaded = true
+								plan.Catalog.CustomFinalState[reference.ToolName] = state
+							}
+						}
+					}
+				}
+				if plan.Catalog != nil && plan.Catalog.MCPFinalAvailability != nil {
+					final := plan.Catalog.MCPFinalAvailability
+					for _, reference := range references {
+						claudeLoadUnambiguousMCPReference(reference.ToolName, plan.Catalog, nil, final.Active, final.Listings, final.Loaded)
+					}
+				}
 			}
 			if reason := graph.resolve(id); reason != "" {
 				out.Reason = "server_tool_parent_closed_with_pending_children"

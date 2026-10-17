@@ -438,7 +438,24 @@ func buildAgentCompletionGuardPlanForModelWithCatalogAndCapabilities(
 	if catalog != nil {
 		plan.Catalog = catalog
 	} else {
-		plan.Catalog, plan.ValidationReason = completionGuardBuildNormalizedCatalog(req)
+		// Standalone guard invocations must use the same catalog options as
+		// the request planner for mid-conversation tool changes.
+		plan.Catalog, plan.ValidationReason = completionGuardBuildNormalizedCatalogWithOptions(
+			req, completionGuardCatalogBuildOptions{
+				AllowAllDeferred: claudeRequestHasMidConversationToolChangesRaw(req.Messages),
+			},
+		)
+	}
+	if plan.ValidationReason == "" && plan.Catalog != nil &&
+		!plan.Catalog.TemporalHistoryValidated && claudeHistoryNeedsToolAvailability(req.Messages, plan.Catalog) {
+		// A guard invoked without the HTTP planner must still validate tool
+		// availability in message order. Beta/header gating belongs to the
+		// HTTP planner; this standalone guard checks temporal safety only.
+		implicitBetas := newClaudeBetaSet()
+		implicitBetas.AddValues([]string{"inline-tools-2026-09-15", "mcp-client-2026-09-15"})
+		if validation := validateClaudeInlineToolHistory(req, plan.Catalog, implicitBetas); validation != nil {
+			plan.ValidationReason = validation.Message
+		}
 	}
 	if plan.ValidationReason == "" {
 		// A forced choice targeting a code-only tool is independently invalid and
@@ -503,7 +520,7 @@ func buildAgentCompletionGuardPlanForModelWithCatalogAndCapabilities(
 }
 
 func completionGuardValidToolName(name string) bool {
-	if len(name) < 1 || len(name) > 64 {
+	if len(name) < 1 || len(name) > 128 {
 		return false
 	}
 	for _, value := range name {
@@ -1719,6 +1736,12 @@ func completionGuardValidateClientToolCaller(
 		// Isolated classifier tests deliberately omit request-catalog validation.
 		return "", ""
 	}
+	if toolset := completionGuardContentBlockExtraString(block, "toolset_name"); toolset != "" {
+		if !plan.Catalog.NativeToolsets[toolset] {
+			return "", "unknown_client_toolset"
+		}
+		return completionGuardValidateCaller(block, false, activeCodeCallers, "client_tool")
+	}
 	entry, exists := plan.Catalog.ClientEntry(strings.TrimSpace(block.Name))
 	if !exists {
 		return "", "unknown_client_tool"
@@ -1915,6 +1938,12 @@ func completionGuardValidateClientTool(
 	if plan.Catalog == nil {
 		return ""
 	}
+	if toolset := completionGuardContentBlockExtraString(block, "toolset_name"); toolset != "" {
+		if !plan.Catalog.NativeToolsets[toolset] {
+			return "unknown_client_toolset"
+		}
+		return ""
+	}
 	entry, exists := plan.Catalog.ClientEntry(name)
 	if !exists {
 		if _, declared := plan.Catalog.ExplicitEntry(name); declared {
@@ -1923,6 +1952,9 @@ func completionGuardValidateClientTool(
 		return "unknown_client_tool"
 	}
 
+	if state, tracked := plan.Catalog.CustomFinalState[name]; tracked && !state.Callable() {
+		return "client_tool_unavailable"
+	}
 	schema, ok := entry.InputSchema.(map[string]interface{})
 	if !ok || schema == nil {
 		return ""

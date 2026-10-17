@@ -156,8 +156,10 @@ type directAnthropicCapabilitySupport struct {
 }
 
 type directAnthropicThinkingTypes struct {
-	Adaptive directAnthropicCapabilitySupport `json:"adaptive"`
-	Enabled  directAnthropicCapabilitySupport `json:"enabled"`
+	Adaptive     directAnthropicCapabilitySupport  `json:"adaptive"`
+	BetweenTools directAnthropicCapabilitySupport  `json:"between_tools"`
+	Disabled     *directAnthropicCapabilitySupport `json:"disabled"`
+	Enabled      directAnthropicCapabilitySupport  `json:"enabled"`
 }
 
 type directAnthropicThinkingCapability struct {
@@ -824,17 +826,19 @@ func appendUniqueCapabilityValue(values []string, value string) []string {
 func mergeOfficialDirectAnthropicReasoningSemantics(
 	model string,
 	capability ModelReasoningCapability,
+	metadata directAnthropicModelMetadata,
 ) ModelReasoningCapability {
-	// The Models API advertises thinking modes that produce reasoning
-	// (adaptive/enabled), while `disabled` is a request-level mode documented
-	// separately. Preserve the authoritative live capability and add only the
-	// documented static `disabled` mode for the same official model deployment.
+	// Respect the live disabled support value when it is present. The pointer
+	// distinguishes explicit false from an older/partial Models API payload
+	// where disabled is absent and an exact official fallback may be used.
 	static := resolveClaudeProviderReasoningCapability(model)
-	if _, ok := matchThinkingType("disabled", static.ThinkingTypes); ok {
-		capability.ThinkingTypes = appendUniqueCapabilityValue(
-			capability.ThinkingTypes,
-			"disabled",
-		)
+	if metadata.Capabilities.Thinking.Types.Disabled == nil && !isClaudeSonnet55Model(model) {
+		if _, ok := matchThinkingType("disabled", static.ThinkingTypes); ok {
+			capability.ThinkingTypes = appendUniqueCapabilityValue(
+				capability.ThinkingTypes,
+				"disabled",
+			)
+		}
 	}
 	return capability
 }
@@ -845,6 +849,8 @@ func directAnthropicMetadataHasReasoningDetail(
 	thinking := metadata.Capabilities.Thinking.Types
 	effort := metadata.Capabilities.Effort
 	return thinking.Adaptive.Supported ||
+		thinking.BetweenTools.Supported ||
+		thinking.Disabled != nil ||
 		thinking.Enabled.Supported ||
 		effort.Low.Supported ||
 		effort.Medium.Supported ||
@@ -871,7 +877,7 @@ func (h *Handler) directAnthropicReasoningCapabilityForAccount(
 		}
 		capability := directAnthropicReasoningCapability(model, metadata)
 		if deployment.Profile == claudeProviderAnthropicOfficial {
-			capability = mergeOfficialDirectAnthropicReasoningSemantics(model, capability)
+			capability = mergeOfficialDirectAnthropicReasoningSemantics(model, capability, metadata)
 		}
 		return capability, strings.TrimSpace(capability.ModelID) != "", deployment
 	}

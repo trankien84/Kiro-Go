@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -398,47 +399,165 @@ func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
 
 // ListAvailableModels 获取可用模型列表
 func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
-	if err := ensureRestProfileArn(account); err != nil {
+	return ListAvailableModelsContext(context.Background(), account)
+}
+
+func ListAvailableModelsContext(ctx context.Context, account *config.Account) ([]ModelInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := ensureRestProfileArnContext(ctx, account); err != nil {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}
 
 	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", kiroRestAPIBase)
 	url = regionalizeURL(url, account)
 	url = withProfileArnQuery(url, account)
+	client := GetRestClientForProxy(ResolveAccountProxyURL(account))
+	return fetchKiroModelsPagesContext(ctx, url, func(req *http.Request) (*http.Response, error) {
+		setKiroHeaders(req, account)
+		return client.Do(req)
+	})
+}
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
+const (
+	maxKiroModelsPageBytes  = 4 << 20
+	maxKiroModelsErrorBytes = 64 << 10
+	maxKiroModelsPages      = 20
+	maxKiroDiscoveredModels = 1000
+)
 
-	setKiroHeaders(req, account)
-
-	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-	if err != nil {
-		return nil, err
+// fetchKiroModelsPagesContext assembles one atomic discovery result. A failed
+// page, duplicate ID, malformed body, or pagination loop returns an error;
+// callers must never publish a partial replacement catalog.
+func fetchKiroModelsPagesContext(
+	ctx context.Context, initialURL string,
+	fetch func(*http.Request) (*http.Response, error),
+) ([]ModelInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	if fetch == nil {
+		return nil, fmt.Errorf("nil model page fetcher")
 	}
-
-	var result struct {
-		Models []ModelInfo `json:"models"`
+	seenIDs := make(map[string]struct{})
+	seenTokens := make(map[string]struct{})
+	models := make([]ModelInfo, 0, 50)
+	nextToken := ""
+	for page := 0; page < maxKiroModelsPages; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		pageURL, err := neturl.Parse(initialURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Kiro models URL: %w", err)
+		}
+		query := pageURL.Query()
+		if nextToken != "" {
+			query.Set("nextToken", nextToken)
+		} else {
+			query.Del("nextToken")
+		}
+		pageURL.RawQuery = query.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := fetch(req)
+		if err != nil {
+			return nil, fmt.Errorf("Kiro model discovery page %d: %w", page+1, err)
+		}
+		if resp == nil || resp.Body == nil {
+			return nil, fmt.Errorf("Kiro model discovery page %d: empty HTTP response", page+1)
+		}
+		if resp.StatusCode != http.StatusOK {
+			content, _ := io.ReadAll(io.LimitReader(resp.Body, maxKiroModelsErrorBytes+1))
+			resp.Body.Close()
+			return nil, fmt.Errorf("Kiro model discovery page %d: HTTP %d: %s", page+1, resp.StatusCode, string(content))
+		}
+		content, readErr := io.ReadAll(io.LimitReader(resp.Body, maxKiroModelsPageBytes+1))
+		closeErr := resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("Kiro model discovery page %d: read: %w", page+1, readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("Kiro model discovery page %d: close: %w", page+1, closeErr)
+		}
+		if len(content) > maxKiroModelsPageBytes {
+			return nil, fmt.Errorf("Kiro model discovery page %d: response too large", page+1)
+		}
+		var envelope struct {
+			Models    json.RawMessage `json:"models"`
+			NextToken string          `json:"nextToken"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(content))
+		if err := decoder.Decode(&envelope); err != nil {
+			return nil, fmt.Errorf("Kiro model discovery page %d: malformed JSON: %w", page+1, err)
+		}
+		var trailing interface{}
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			return nil, fmt.Errorf("Kiro model discovery page %d: trailing JSON data", page+1)
+		}
+		if len(envelope.Models) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Models), []byte("null")) {
+			return nil, fmt.Errorf("Kiro model discovery page %d: missing models array", page+1)
+		}
+		var pageModels []ModelInfo
+		if err := json.Unmarshal(envelope.Models, &pageModels); err != nil || pageModels == nil {
+			return nil, fmt.Errorf("Kiro model discovery page %d: invalid models array: %v", page+1, err)
+		}
+		for _, m := range pageModels {
+			// Provider IDs are case sensitive; duplicates of the exact identity
+			// indicate inconsistent discovery, not an opportunity to pick a winner.
+			id := strings.TrimSpace(m.ModelId)
+			if id == "" || id != m.ModelId {
+				return nil, fmt.Errorf("Kiro model discovery page %d: invalid model ID %q", page+1, m.ModelId)
+			}
+			if _, exists := seenIDs[id]; exists {
+				return nil, fmt.Errorf("Kiro model discovery page %d: duplicate model ID %q", page+1, id)
+			}
+			seenIDs[id] = struct{}{}
+			models = append(models, m)
+			if len(models) > maxKiroDiscoveredModels {
+				return nil, fmt.Errorf("Kiro model discovery: more than %d models", maxKiroDiscoveredModels)
+			}
+		}
+		nextToken = envelope.NextToken // opaque cursor: never modify its bytes
+		if nextToken == "" {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return models, nil
+		}
+		if strings.TrimSpace(nextToken) == "" {
+			return nil, fmt.Errorf("Kiro model discovery page %d: empty pagination token", page+1)
+		}
+		if _, seen := seenTokens[nextToken]; seen {
+			return nil, fmt.Errorf("Kiro model discovery: repeated pagination token")
+		}
+		seenTokens[nextToken] = struct{}{}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	return result.Models, nil
+	return nil, fmt.Errorf("Kiro model discovery: exceeded %d pages", maxKiroModelsPages)
 }
 
 // ResolveProfileArn returns the account profile ARN, fetching and caching it
 // when it is missing. First tries ListAvailableProfiles; if that returns empty,
 // falls back to refreshing the token (which returns profileArn in the response).
 func ResolveProfileArn(account *config.Account) (string, error) {
+	return ResolveProfileArnContext(context.Background(), account)
+}
+
+func ResolveProfileArnContext(ctx context.Context, account *config.Account) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if account == nil {
 		return "", fmt.Errorf("account is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	// API Key credentials do not use IDE profile ARNs.
 	if config.IsAPIKeyAccount(account) {
@@ -471,11 +590,14 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		// drives the data-plane region via kiroRegionForProfile — no separate region
 		// persistence is needed, and Account.Region is never mutated (it stays the
 		// auth region, which can legitimately differ from the profile's region).
-		profileArn, err := resolveProfileArnAcrossRegions(account)
+		profileArn, err := resolveProfileArnAcrossRegionsContext(ctx, account)
 		if err == nil && profileArn != "" {
 			persistAccountProfileArnForRequest(account, profileArn)
 			account.ProfileArn = profileArn
 			return profileArn, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
 		}
 		profileUnsupportedErr = err
 		profileUnsupported = isBuilderIDProfileUnsupportedError(account, err)
@@ -487,11 +609,14 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	// consumes profileArn.
 	if account.RefreshToken != "" &&
 		!strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
-		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
+		_, _, _, refreshedArn, refreshErr := auth.RefreshTokenContext(ctx, account)
 		if refreshErr == nil && refreshedArn != "" {
 			persistAccountProfileArnForRequest(account, refreshedArn)
 			account.ProfileArn = refreshedArn
 			return refreshedArn, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
 		}
 	}
 	if profileLookupSuppressed {
@@ -569,6 +694,16 @@ func isProfileArnResolutionSoftError(err error) bool {
 }
 
 func ensureRestProfileArn(account *config.Account) error {
+	return ensureRestProfileArnContext(context.Background(), account)
+}
+
+func ensureRestProfileArnContext(ctx context.Context, account *config.Account) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if account == nil || strings.TrimSpace(account.ProfileArn) != "" {
 		return nil
 	}
@@ -576,7 +711,7 @@ func ensureRestProfileArn(account *config.Account) error {
 	if config.IsAPIKeyAccount(account) {
 		return nil
 	}
-	profileArn, err := ResolveProfileArn(account)
+	profileArn, err := ResolveProfileArnContext(ctx, account)
 	if err != nil {
 		if isProfileArnResolutionSoftError(err) {
 			logger.Debugf("[ProfileArn] Continuing REST request without profile ARN for %s: %v", accountEmailForLog(account), err)
@@ -599,10 +734,23 @@ func ensureRestProfileArn(account *config.Account) error {
 // per-region failures are joined, so the caller sees why every candidate failed
 // instead of only the last one.
 func resolveProfileArnAcrossRegions(account *config.Account) (string, error) {
+	return resolveProfileArnAcrossRegionsContext(context.Background(), account)
+}
+
+func resolveProfileArnAcrossRegionsContext(ctx context.Context, account *config.Account) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var probeErrors []error
 	for _, region := range kiroProfileRegionCandidates(account) {
-		profiles, err := listKiroProfilesWithRetryInRegion(account, region)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		profiles, err := listKiroProfilesWithRetryInRegionContext(ctx, account, region)
 		if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
 			if isBuilderIDProfileUnsupportedError(account, err) {
 				return "", err
 			}

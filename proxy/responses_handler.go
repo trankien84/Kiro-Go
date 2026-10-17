@@ -790,7 +790,7 @@ func (h *Handler) handleResponsesNonStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = h.usageInputFromContextPercentage(account, string(providerID), model, pct)
 			},
 			OnStopReason:  func(reason string) { upstreamStopReason = reason },
 			CanRetry:      func() bool { return true },
@@ -821,7 +821,7 @@ func (h *Handler) handleResponsesNonStream(
 		if !kiro.Thinking {
 			reasoningContent = ""
 		}
-		if realInputTokens > 0 {
+		if realInputTokens > 0 && inputTokens <= 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
 			inputTokens = kiro.EstimatedInputTokens
@@ -1402,7 +1402,7 @@ func (h *Handler) handleResponsesStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = h.usageInputFromContextPercentage(account, string(providerID), model, pct)
 			},
 			OnStopReason: func(reason string) { upstreamStopReason = reason },
 			CanRetry: func() bool {
@@ -1467,7 +1467,7 @@ func (h *Handler) handleResponsesStream(
 			}
 			finishMessage("")
 		}
-		if realInputTokens > 0 {
+		if realInputTokens > 0 && inputTokens <= 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
 			inputTokens = kiro.EstimatedInputTokens

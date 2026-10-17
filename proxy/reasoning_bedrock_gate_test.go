@@ -86,7 +86,7 @@ func TestReasoningBuildErrorDoesNotFailAnAllBedrockPool(t *testing.T) {
 			}),
 		}
 	}
-	t.Cleanup(func() { bedrockHTTPClientFor = prevBedrockClient })
+	cleanupHandlerBeforeRestore(t, h, func() { bedrockHTTPClientFor = prevBedrockClient })
 
 	reqBody := `{"model":"claude-sonnet-4.5","stream":false,"max_tokens":20000,"messages":[{"role":"user","content":"hi"}],` +
 		`"thinking":{"type":"enabled","budget_tokens":10000}}`
@@ -121,6 +121,7 @@ func TestHandleCountTokensDoesNotFailAnAllBedrockPool(t *testing.T) {
 	p := accountpool.GetPool()
 	p.Reload()
 	h := &Handler{pool: p, promptCache: newPromptCacheTracker(defaultPromptCacheTTL)}
+	t.Cleanup(h.Close)
 
 	h.cachedModels = []ModelInfo{{
 		ModelId: "claude-sonnet-4.5",

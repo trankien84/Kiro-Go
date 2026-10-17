@@ -207,6 +207,21 @@
             </div>
           </div>
 
+          <div class="account-routing-panel" id="accountRoutingPanel">
+            <div class="account-routing-copy">
+              <span class="account-routing-title" data-i18n="routing.title"></span>
+              <small id="accountRoutingHelp"></small>
+            </div>
+            <div class="account-routing-strategy">
+              <label for="accountRoutingStrategySelect" data-i18n="routing.strategy"></label>
+              <select id="accountRoutingStrategySelect" class="w-44!" disabled>
+                <option value="round-robin" data-i18n="routing.roundRobin"></option>
+                <option value="priority" data-i18n="routing.priority"></option>
+                <option value="fill-first" data-i18n="routing.fillFirst"></option>
+              </select>
+            </div>
+          </div>
+
           <div class="toolbar">
             <label class="flex items-center gap-1.5 cursor-pointer select-none shrink-0">
               <input type="checkbox" id="selectAllCheckbox" />

@@ -27,13 +27,19 @@ func TestClaudeModelCapabilitiesNormalizeProviderQualifiedIDs(t *testing.T) {
 	for _, model := range []string{
 		"claude-opus-5-0",
 		"claude-opus-5-thinking",
-		"kr/claude-opus-4.8-thinking",
+		"anthropic/claude-opus-4.8-thinking",
 		"anthropic.claude-opus-5",
 		"us.anthropic.claude-opus-4-8-20260701-v1:0",
 	} {
 		if got := resolveClaudeModelCapabilities(model).MidConversationSystem; got != claudeFeatureSupported {
 			t.Fatalf("model=%q support=%v", model, got)
 		}
+	}
+	// Arbitrary compatible provider namespaces are opaque, even when their
+	// suffix resembles an official Claude ID. Native capabilities require an
+	// exact model/provider contract, not a string heuristic.
+	if got := resolveClaudeModelCapabilities("kr/claude-opus-4.8-thinking").MidConversationSystem; got != claudeFeatureUnknown {
+		t.Fatalf("opaque kr/ model borrowed Claude capability: %v", got)
 	}
 }
 

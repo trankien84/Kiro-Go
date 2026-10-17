@@ -653,7 +653,11 @@ func exchangeExternalIdpCode(client *http.Client, tokenEndpoint, clientID, code,
 	if err != nil {
 		return "", "", 0, err
 	}
-	return token.AccessToken, token.RefreshToken, token.ExpiresIn, nil
+	expiresIn, err = oauthExpiresInInt(token.ExpiresIn)
+	if err != nil {
+		return "", "", 0, err
+	}
+	return token.AccessToken, token.RefreshToken, expiresIn, nil
 }
 
 // exchangeSocialCode exchanges a Cognito authorization code (with its PKCE
@@ -678,18 +682,40 @@ func exchangeSocialCode(client *http.Client, code, codeVerifier string) (accessT
 		return "", "", 0, "", err
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := readOAuthTokenResponseBody(resp.Body)
+	if err != nil {
+		return "", "", 0, "", oauthTokenResponseReadError(
+			resp.StatusCode,
+			resp.StatusCode >= 200 && resp.StatusCode < 300,
+			err,
+		)
+	}
+	if endpointErr := oauthEndpointErrorFromBody(resp.StatusCode, respBody); endpointErr != nil {
+		return "", "", 0, "", endpointErr
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", 0, "", newOAuthTokenEndpointError(resp.StatusCode, respBody)
+	}
 	var out struct {
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
 		ProfileArn   string `json:"profileArn"`
-		ExpiresIn    int    `json:"expiresIn"`
+		ExpiresIn    int64  `json:"expiresIn"`
 	}
-	_ = json.Unmarshal(respBody, &out)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 || out.AccessToken == "" {
-		return "", "", 0, "", fmt.Errorf("social token exchange failed (status %d): %s", resp.StatusCode, string(respBody))
+	if err := decodeOAuthTokenJSON(respBody, &out); err != nil {
+		return "", "", 0, "", err
 	}
-	return out.AccessToken, out.RefreshToken, out.ExpiresIn, out.ProfileArn, nil
+	if err := validateOAuthAccessToken(out.AccessToken); err != nil {
+		return "", "", 0, "", err
+	}
+	if _, err := oauthExpiresAt(time.Now().Unix(), out.ExpiresIn); err != nil {
+		return "", "", 0, "", err
+	}
+	expiresIn, err = oauthExpiresInInt(out.ExpiresIn)
+	if err != nil {
+		return "", "", 0, "", err
+	}
+	return out.AccessToken, out.RefreshToken, expiresIn, out.ProfileArn, nil
 }
 
 // writeKiroCallbackPage renders a minimal HTML page shown in the browser after

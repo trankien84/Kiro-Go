@@ -116,16 +116,22 @@ type claudeTransportRequirements struct {
 	// direct-only until their multi-turn server-tool semantics are proven safe.
 	RequiresKiroWebSearchMCP       bool
 	RequiresStructuredOutputFormat bool
+	RequiresStrictToolUse          bool
 	RequiresStopSequences          bool
 	StopSequences                  []string
 
 	// Reasoning intent remains the exact client request. Terminal transports
 	// must support it natively; compatibility adapters may derive a separate
 	// effective shape only after an account is selected.
-	RequestedThinkingType string
-	RequestedBudgetTokens int
-	RequestedEffort       string
-	RequestBodyBytes      int
+	RequestedThinkingType  string
+	RequestedBudgetTokens  int
+	RequestedEffort        string
+	Opus55ContractError    string
+	Sonnet55ContractError  string
+	Haiku55ContractError   string
+	UsesBrowserToolset     bool
+	UsesLegacyComputerTool bool
+	RequestBodyBytes       int
 }
 
 func newClaudeTransportRequirements() claudeTransportRequirements {
@@ -216,21 +222,23 @@ var (
 // anthropic_beta body array. Keep this registry fail-closed: each entry is backed
 // by Anthropic/AWS documentation and can be expanded together with tests.
 var claudeBedrockInvokeBetas = map[string]struct{}{
-	"compact-2026-01-12":                       {},
-	"computer-use-2024-10-22":                  {},
-	"computer-use-2025-01-24":                  {},
-	"computer-use-2025-11-24":                  {},
-	"context-1m-2025-08-07":                    {},
-	"context-management-2025-06-27":            {},
-	"dev-full-thinking-2025-05-14":             {},
-	"effort-2025-11-24":                        {},
-	"fallback-credit-2026-06-09":               {},
-	"interleaved-thinking-2025-05-14":          {},
-	"mid-conversation-tool-changes-2026-07-01": {},
-	"output-128k-2025-02-19":                   {},
-	"token-efficient-tools-2025-02-19":         {},
-	"tool-examples-2025-10-29":                 {},
-	"tool-search-tool-2025-10-19":              {},
+	"compact-2026-01-12":                          {},
+	"computer-use-2024-10-22":                     {},
+	"computer-use-2025-01-24":                     {},
+	"computer-use-2025-11-24":                     {},
+	"context-1m-2025-08-07":                       {},
+	"context-management-2025-06-27":               {},
+	"dev-full-thinking-2025-05-14":                {},
+	"effort-2025-11-24":                           {},
+	"fallback-credit-2026-06-09":                  {},
+	"interleaved-thinking-2025-05-14":             {},
+	"mid-conversation-tool-changes-2026-07-01":    {},
+	"mid-conversation-system-clear-at-2026-08-21": {},
+	"output-128k-2025-02-19":                      {},
+	"token-efficient-tools-2025-02-19":            {},
+	"tool-examples-2025-10-29":                    {},
+	"tool-search-tool-2025-10-19":                 {},
+	"thinking-display-updates-2026-08-18":         {},
 }
 
 // claudeCompatibilityDeclarationBetas are known activation/declaration markers
@@ -416,6 +424,26 @@ func claudeToolTransportRequirements(
 
 	for _, tool := range tools {
 		toolType := strings.ToLower(strings.TrimSpace(tool.Type))
+		if toolType == "computer_20251124" || toolType == "computer_20250124" {
+			requirements.UsesLegacyComputerTool = true
+		}
+		if toolType == "browser_toolset_20260801" {
+			requirements.UsesBrowserToolset = true
+			requirements.Require(
+				"browser_toolset_20260801",
+				claudeTransportMaskCustom,
+				"browser member calls and browser_state require native Claude Messages pass-through",
+			)
+			continue
+		}
+		if toolType == "computer_toolset_20260801" {
+			requirements.Require(
+				"computer_toolset_20260801",
+				claudeTransportMaskCustom,
+				"computer toolset member calls and results require native Claude Messages pass-through",
+			)
+			continue
+		}
 		definition, knownDefinition := completionGuardLookupServerToolDefinition(toolType)
 		switch {
 		case toolType == "", toolType == "function", toolType == "custom":
@@ -491,6 +519,7 @@ func claudeCatalogToolTransportRequirements(
 			"strict":                {},
 		}
 		if entry.Strict {
+			requirements.RequiresStrictToolUse = true
 			requirements.Require(
 				"strict_tool:"+entry.Name,
 				claudeTransportMaskCustom|claudeTransportMaskBedrockInvoke,
@@ -545,6 +574,9 @@ func analyzeClaudeTransportRequirementsWithInventoryAndCapabilities(
 	if req == nil {
 		return requirements, nil
 	}
+	requirements.Opus55ContractError = claudeOpus55RequestViolation(req)
+	requirements.Sonnet55ContractError = claudeSonnet55RequestViolation(req)
+	requirements.Haiku55ContractError = claudeHaiku55RequestViolation(req)
 	if req.Thinking != nil {
 		requirements.RequestedThinkingType = strings.ToLower(strings.TrimSpace(req.Thinking.Type))
 		requirements.RequestedBudgetTokens = req.Thinking.BudgetTokens
@@ -621,6 +653,13 @@ func analyzeClaudeTransportRequirementsWithInventoryAndCapabilities(
 		requirements.Require(name, allowed, reason)
 	}
 
+	if req.Thinking != nil && strings.EqualFold(strings.TrimSpace(req.Thinking.Display), "updates") {
+		requirements.Require(
+			"thinking_display_updates",
+			claudeTransportMaskCustom|claudeTransportMaskBedrockInvoke,
+			"thinking display updates require a native Messages transport with the beta header",
+		)
+	}
 	if req.Thinking != nil {
 		// Kiro and native Invoke have explicit thinking adapters. Converse does
 		// not preserve the native thinking request/response state losslessly.
@@ -697,12 +736,16 @@ func analyzeClaudeTransportRequirementsWithInventoryAndCapabilities(
 		}
 		requirements.Require(name, allowed, reason)
 	}
+	if inventory.HasInlineToolDefinition || inventory.HasMCPToolListing || inventory.HasEffortOnlySystem {
+		requirements.Require("native_inline_tools_and_message_metadata", claudeTransportMaskCustom,
+			"inline tool definitions and message-scoped native metadata require transparent Claude Messages transport")
+	}
 	if inventory.HasMidConversationToolChange {
 		requirements.RequiresMidConversationToolChange = true
 		allowed := claudeTransportMaskCustom
 		name := "mid_conversation_tool_changes_upstream_validation"
 		reason := "mid-conversation tool changes require provider-specific native validation"
-		if modelCaps.MidConversationTools == claudeFeatureSupported {
+		if modelCaps.MidConversationTools == claudeFeatureSupported && !semantic.Betas.Contains("inline-tools-2026-09-15") {
 			allowed |= claudeTransportMaskBedrockInvoke
 			name = "mid_conversation_tool_changes"
 			reason = "request contains model-supported tool additions or removals"
@@ -1068,6 +1111,65 @@ func (h *Handler) claudeAccountSupportsRequestedProtocol(
 	if account == nil {
 		return true, ""
 	}
+	// Validate against the *selected provider model*, not a public alias. A
+	// custom-compatible deployment may intentionally define different rules.
+	kind := claudeTransportKindForAccount(account)
+	if requirements.Opus55ContractError != "" && isClaudeOpus55Model(model) {
+		switch kind {
+		case claudeTransportDirectAnthropic:
+			if claudeProviderProfileForAccount(account) != claudeProviderAnthropicCompatible {
+				return false, requirements.Opus55ContractError
+			}
+		case claudeTransportBedrockInvoke, claudeTransportBedrockConverse:
+			return false, requirements.Opus55ContractError
+		}
+	}
+	if requirements.Sonnet55ContractError != "" && isClaudeSonnet55Model(model) {
+		switch kind {
+		case claudeTransportDirectAnthropic:
+			if claudeProviderProfileForAccount(account) != claudeProviderAnthropicCompatible {
+				return false, requirements.Sonnet55ContractError
+			}
+		case claudeTransportBedrockInvoke, claudeTransportBedrockConverse:
+			return false, requirements.Sonnet55ContractError
+		}
+	}
+	if requirements.Haiku55ContractError != "" && isClaudeHaiku55Model(model) {
+		switch kind {
+		case claudeTransportDirectAnthropic:
+			if claudeProviderProfileForAccount(account) != claudeProviderAnthropicCompatible {
+				return false, requirements.Haiku55ContractError
+			}
+		case claudeTransportBedrockInvoke, claudeTransportBedrockConverse:
+			return false, requirements.Haiku55ContractError
+		}
+	}
+	if requirements.UsesBrowserToolset && kind == claudeTransportDirectAnthropic &&
+		claudeProviderProfileForAccount(account) != claudeProviderAnthropicCompatible {
+		// Unknown future models are validated by Anthropic; explicitly documented
+		// older models that cannot run the browser toolset fail locally.
+		family, version, known := canonicalClaudeModelFamilyVersion(model)
+		if known && !claudeOfficialBrowserToolsetSupported(family, version) &&
+			!claudeVersionAtLeast(version, 5, 0) {
+			return false, "browser_toolset_20260801 is unavailable for this Claude model"
+		}
+	}
+	if (isClaudeOpus55Model(model) || isClaudeSonnet55Model(model) || isClaudeHaiku55Model(model)) &&
+		(kind == claudeTransportBedrockInvoke || kind == claudeTransportBedrockConverse) &&
+		(requirements.RequiresStructuredOutputFormat || requirements.RequiresStrictToolUse) {
+		return false, "Claude 5.5 on Amazon Bedrock does not support structured output format or strict tool use"
+	}
+	if requirements.UsesLegacyComputerTool && (isClaudeOpus55Model(model) || isClaudeSonnet55Model(model) || isClaudeHaiku55Model(model)) &&
+		kind == claudeTransportDirectAnthropic &&
+		claudeProviderProfileForAccount(account) != claudeProviderAnthropicCompatible {
+		if isClaudeOpus55Model(model) {
+			return false, "Claude Opus 5.5 on the Claude API requires computer_toolset_20260801 instead of legacy computer tools"
+		}
+		if isClaudeHaiku55Model(model) {
+			return false, "Claude Haiku 5.5 on the Claude API requires computer_toolset_20260801 instead of legacy computer tools"
+		}
+		return false, "Claude Sonnet 5.5 on the Claude API requires the new computer toolset instead of legacy computer tools"
+	}
 	if !requirements.RequiresAssistantPrefill &&
 		!requirements.RequiresMidConversationSystem &&
 		!requirements.RequiresMidConversationToolChange &&
@@ -1076,7 +1178,6 @@ func (h *Handler) claudeAccountSupportsRequestedProtocol(
 		return true, ""
 	}
 
-	kind := claudeTransportKindForAccount(account)
 	switch kind {
 	case claudeTransportDirectAnthropic:
 		profile := claudeProviderProfileForAccount(account)

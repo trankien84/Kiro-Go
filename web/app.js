@@ -50,6 +50,36 @@
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
 
+  let accountRoutingConfig = {
+    strategy: 'round-robin',
+    supportedStrategies: ['round-robin', 'priority', 'fill-first'],
+    defaultPriority: 100
+  };
+  let accountRoutingLoadState = 'loading'; // loading | ready | error
+  let accountsLoadSequence = 0;
+  let accountsLoadController = null;
+  let accountsLoadPromise = null;
+  let accountRoutingLoadSequence = 0;
+  let accountRoutingLoadController = null;
+  let accountRoutingLoadPromise = null;
+  let accountRoutingMutationSequence = 0;
+  let accountRoutingMutation = null;
+
+
+  // Live account-runtime state is local-only data served by Kiro-Go. Polling
+  // never triggers OAuth, quota, or model-discovery work upstream.
+  let accountRuntimeById = new Map();
+  let accountRuntimeInstance = '';
+  let accountRuntimeRevision = -1;
+  let accountRuntimeETag = '';
+  let accountRuntimeServerOffsetMs = 0;
+  let accountRuntimePollTimer = null;
+  let accountRuntimePollController = null;
+  let accountRuntimeCountdownTimer = null;
+  let accountRuntimeNeedsAccountReload = false;
+  let accountRuntimeImmediatePending = false;
+  const accountRuntimePollIntervalMs = 5000;
+
   // DOM helpers
   const $ = (id) => document.getElementById(id);
   const qsa = (sel, root) => Array.from((root || document).querySelectorAll(sel));
@@ -143,6 +173,7 @@
     localStorage.setItem('kiro_lang', lang);
     await loadLocale(lang);
     applyTranslations();
+    renderAccountRoutingPanel();
     renderVersionBadge();
     renderAccounts();
     renderPromptRules();
@@ -686,13 +717,14 @@
 
   // Data loaders
   async function loadData() {
-    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
+    await Promise.all([loadStats(), loadAccounts(), loadAccountRouting(), loadSettings(), loadVersion()]);
     renderEndpointCode('claudeEndpoint', baseUrl + '/v1/messages');
     renderEndpointCode('openaiEndpoint', baseUrl + '/v1/chat/completions');
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
     renderEndpointCode('modelsEndpoint', baseUrl + '/v1/models');
     renderEndpointCode('statsEndpoint', baseUrl + '/v1/stats');
     setTimeout(checkUpdate, 2000);
+    syncAccountRuntimePolling(true);
   }
   async function loadStats() {
     const res = await api('/status');
@@ -818,15 +850,573 @@
     }
   }
 
-  async function loadAccounts() {
-    const res = await api('/accounts');
-    accountsData = await res.json();
-    renderAccounts();
+  function isAbortError(error) {
+    return !!(error && error.name === 'AbortError');
+  }
+  function followLatestLoad(ownPromise, getCurrentPromise, result) {
+    if (!result || result.superseded !== true) return result;
+    const latest = getCurrentPromise();
+    return latest && latest !== ownPromise ? latest : result;
+  }
+  function loadAccounts() {
+    const sequence = ++accountsLoadSequence;
+    if (accountsLoadController) accountsLoadController.abort();
+    const controller = new AbortController();
+    accountsLoadController = controller;
+
+    const operation = (async () => {
+      try {
+        const res = await api('/accounts', { signal: controller.signal, cache: 'no-cache' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (controller.signal.aborted || sequence !== accountsLoadSequence) {
+          return { ok: false, superseded: true };
+        }
+        if (!Array.isArray(data)) throw new Error('Invalid account list response');
+        accountsData = data;
+        renderAccounts();
+        accountRuntimeNeedsAccountReload = false;
+        return { ok: true };
+      } catch (error) {
+        if (controller.signal.aborted || sequence !== accountsLoadSequence || isAbortError(error)) {
+          return { ok: false, superseded: true };
+        }
+        throw error;
+      } finally {
+        if (sequence === accountsLoadSequence && accountsLoadController === controller) {
+          accountsLoadController = null;
+        }
+      }
+    })();
+
+    let publishedPromise;
+    publishedPromise = operation.then(result =>
+      followLatestLoad(publishedPromise, () => accountsLoadPromise, result)
+    );
+    accountsLoadPromise = publishedPromise;
+    return publishedPromise;
+  }
+
+  function currentAccountRoutingStrategy() {
+    const strategy = String(accountRoutingConfig.strategy || 'round-robin');
+    return ['round-robin', 'priority', 'fill-first'].includes(strategy) ? strategy : 'round-robin';
+  }
+  function rawRoutingPriority(a) {
+    const value = Number(a && a.priority);
+    return Number.isSafeInteger(value) ? value : 0;
+  }
+  function effectiveRoutingPriority(a) {
+    const effective = Number(a && a.effectivePriority);
+    if (Number.isSafeInteger(effective) && effective > 0) return effective;
+    const persisted = rawRoutingPriority(a);
+    if (persisted > 0) return persisted;
+    const fallback = Number(accountRoutingConfig.defaultPriority);
+    return Number.isSafeInteger(fallback) && fallback > 0 ? fallback : 100;
+  }
+  function accountRoutingFiltersActive() {
+    return !!String(filterKeyword || '').trim() || filterStatus !== 'all';
+  }
+  function accountRoutingOrderSnapshotReady() {
+    return accountRoutingLoadState === 'ready' && Array.isArray(accountsData) && accountsData.every(item => {
+      if (!item || !String(item.id || '').trim()) return false;
+      if (!Number.isSafeInteger(Number(item.generation)) || Number(item.generation) <= 0) return false;
+      if (item.priority == null) return true;
+      return Number.isSafeInteger(Number(item.priority));
+    });
+  }
+  function accountRoutingMutationActive() {
+    return accountRoutingMutation !== null;
+  }
+  function beginAccountRoutingMutation(kind, accountId) {
+    if (accountRoutingMutationActive()) return null;
+    const token = {
+      sequence: ++accountRoutingMutationSequence,
+      kind: String(kind || ''),
+      accountId: String(accountId || '')
+    };
+    accountRoutingMutation = token;
+    renderAccountRoutingPanel();
+    if (Array.isArray(accountsData)) renderAccounts();
+    return token;
+  }
+  function endAccountRoutingMutation(token) {
+    if (!token || !accountRoutingMutation || accountRoutingMutation.sequence !== token.sequence) return;
+    accountRoutingMutation = null;
+    renderAccountRoutingPanel();
+    if (Array.isArray(accountsData)) renderAccounts();
+    refreshCustomSelects();
+  }
+
+  function sortAccountsForRouting(accounts) {
+    if (accountRoutingLoadState !== 'ready') return accounts;
+    const strategy = currentAccountRoutingStrategy();
+    if (strategy === 'round-robin') return accounts;
+    const canonicalIndex = new Map(accountsData.map((a, index) => [a.id, index]));
+    return accounts.slice().sort((left, right) => {
+      const tierDiff = effectiveRoutingPriority(left) - effectiveRoutingPriority(right);
+      if (tierDiff !== 0) return tierDiff;
+      const leftIndex = canonicalIndex.has(left.id) ? canonicalIndex.get(left.id) : Number.MAX_SAFE_INTEGER;
+      const rightIndex = canonicalIndex.has(right.id) ? canonicalIndex.get(right.id) : Number.MAX_SAFE_INTEGER;
+      return leftIndex - rightIndex;
+    });
+  }
+  function renderAccountRoutingPanel() {
+    const select = $('accountRoutingStrategySelect');
+    const help = $('accountRoutingHelp');
+    if (!select || !help) return;
+    const strategy = currentAccountRoutingStrategy();
+    select.value = strategy;
+    select.disabled = accountRoutingLoadState !== 'ready' || accountRoutingMutationActive();
+    if (accountRoutingLoadState === 'loading') {
+      help.textContent = t('routing.loading');
+      syncCustomSelect(select);
+      return;
+    }
+    if (accountRoutingLoadState === 'error') {
+      help.textContent = t('routing.loadFailed');
+      syncCustomSelect(select);
+      return;
+    }
+    let key = 'routing.roundRobinHelp';
+    if (strategy === 'priority') key = 'routing.priorityHelp';
+    else if (strategy === 'fill-first') key = 'routing.fillFirstHelp';
+    let text = t(key) + ' ' + t('routing.affinityHelp');
+    if (strategy === 'fill-first' && accountRoutingFiltersActive()) {
+      text += ' ' + t('routing.clearFiltersToReorder');
+    } else if (strategy === 'fill-first' && !accountRoutingOrderSnapshotReady()) {
+      text += ' ' + t('routing.reloadBeforeReorder');
+    }
+    help.textContent = text;
+    syncCustomSelect(select);
+  }
+  function loadAccountRouting() {
+    const sequence = ++accountRoutingLoadSequence;
+    if (accountRoutingLoadController) accountRoutingLoadController.abort();
+    const controller = new AbortController();
+    accountRoutingLoadController = controller;
+    if (accountRoutingLoadState !== 'ready') accountRoutingLoadState = 'loading';
+    renderAccountRoutingPanel();
+
+    const operation = (async () => {
+      try {
+        const res = await api('/account-routing', { signal: controller.signal, cache: 'no-cache' });
+        const data = await res.json().catch(() => ({}));
+        if (controller.signal.aborted || sequence !== accountRoutingLoadSequence) {
+          return { ok: false, superseded: true };
+        }
+        if (!res.ok || data.success === false) throw new Error(data.error || 'HTTP ' + res.status);
+        const supported = Array.isArray(data.supportedStrategies)
+          ? data.supportedStrategies.filter(value => ['round-robin', 'priority', 'fill-first'].includes(value))
+          : [];
+        accountRoutingConfig = {
+          strategy: ['round-robin', 'priority', 'fill-first'].includes(data.strategy) ? data.strategy : 'round-robin',
+          supportedStrategies: supported.length ? supported : ['round-robin', 'priority', 'fill-first'],
+          defaultPriority: Number.isSafeInteger(Number(data.defaultPriority)) && Number(data.defaultPriority) > 0
+            ? Number(data.defaultPriority) : 100
+        };
+        accountRoutingLoadState = 'ready';
+        qsa('#accountRoutingStrategySelect option').forEach(option => {
+          option.disabled = !accountRoutingConfig.supportedStrategies.includes(option.value);
+        });
+        renderAccountRoutingPanel();
+        refreshCustomSelects();
+        if (Array.isArray(accountsData)) renderAccounts();
+        return { ok: true };
+      } catch (error) {
+        if (controller.signal.aborted || sequence !== accountRoutingLoadSequence || isAbortError(error)) {
+          return { ok: false, superseded: true };
+        }
+        accountRoutingLoadState = 'error';
+        try { console.warn('[AccountRouting] load failed', error); } catch (_) { }
+        renderAccountRoutingPanel();
+        refreshCustomSelects();
+        if (Array.isArray(accountsData)) renderAccounts();
+        return { ok: false, error };
+      } finally {
+        if (sequence === accountRoutingLoadSequence && accountRoutingLoadController === controller) {
+          accountRoutingLoadController = null;
+        }
+      }
+    })();
+
+    let publishedPromise;
+    publishedPromise = operation.then(result =>
+      followLatestLoad(publishedPromise, () => accountRoutingLoadPromise, result)
+    );
+    accountRoutingLoadPromise = publishedPromise;
+    return publishedPromise;
+  }
+
+  async function refreshAccountRoutingControlPlane() {
+    const results = await Promise.allSettled([loadAccountRouting(), loadAccounts()]);
+    const failed = results.some(result =>
+      result.status === 'rejected' || (result.value && result.value.ok === false)
+    );
+    if (!failed) return true;
+    accountRoutingLoadState = 'error';
+    renderAccountRoutingPanel();
+    refreshCustomSelects();
+    if (Array.isArray(accountsData)) renderAccounts();
+    toast(t('routing.refreshFailed'), 'warning');
+    return false;
+  }
+
+  async function saveAccountRoutingStrategy() {
+    const select = $('accountRoutingStrategySelect');
+    if (!select || select.disabled || accountRoutingLoadState !== 'ready' || accountRoutingMutationActive()) return;
+    const observed = currentAccountRoutingStrategy();
+    const strategy = select.value;
+    if (strategy === observed) return;
+    const mutation = beginAccountRoutingMutation('strategy', '');
+    if (!mutation) return;
+    try {
+      const res = await api('/account-routing', {
+        method: 'PUT',
+        body: JSON.stringify({ observedStrategy: observed, strategy })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        const err = new Error(data.error || t('common.saveFailed'));
+        err.status = res.status;
+        err.published = data.published === true;
+        throw err;
+      }
+      accountRoutingConfig.strategy = data.strategy || strategy;
+      toast(t('routing.strategySaved'), 'success');
+    } catch (e) {
+      toast(e && e.status === 409 ? t('routing.stale') : ((e && e.message) || t('common.saveFailed')), 'error');
+    } finally {
+      try {
+        await refreshAccountRoutingControlPlane();
+      } finally {
+        endAccountRoutingMutation(mutation);
+      }
+    }
+  }
+  function routingMoveState(id) {
+    const filtered = accountRoutingFiltersActive();
+    const snapshotUnavailable = !accountRoutingOrderSnapshotReady();
+    const updating = accountRoutingMutationActive();
+    const locked = filtered || snapshotUnavailable || updating;
+    const account = accountsData.find(item => item.id === id);
+    if (!account) return { locked: true, filtered, snapshotUnavailable, updating, previous: null, next: null };
+    const tier = effectiveRoutingPriority(account);
+    const index = accountsData.findIndex(item => item.id === id);
+    let previous = null;
+    let next = null;
+    for (let i = index - 1; i >= 0; i--) {
+      if (effectiveRoutingPriority(accountsData[i]) === tier) {
+        previous = accountsData[i];
+        break;
+      }
+    }
+    for (let i = index + 1; i < accountsData.length; i++) {
+      if (effectiveRoutingPriority(accountsData[i]) === tier) {
+        next = accountsData[i];
+        break;
+      }
+    }
+    return { locked, filtered, snapshotUnavailable, updating, previous, next };
+  }
+  function renderAccountRoutingControls(a) {
+    if (accountRoutingLoadState !== 'ready') return '';
+    const strategy = currentAccountRoutingStrategy();
+    if (strategy === 'round-robin') return '';
+    const observedRaw = rawRoutingPriority(a);
+    const displayed = observedRaw >= 0 ? observedRaw : 0;
+    const effective = effectiveRoutingPriority(a);
+    const idAttr = escapeAttr(a.id);
+    let ordering = '';
+    if (strategy === 'fill-first') {
+      const move = routingMoveState(a.id);
+      let lockTitle = '';
+      if (move.filtered) lockTitle = t('routing.clearFiltersToReorder');
+      else if (move.snapshotUnavailable) lockTitle = t('routing.reloadBeforeReorder');
+      else if (move.updating) lockTitle = t('routing.updateInProgress');
+      ordering = '<span class="account-routing-order">' +
+        '<button type="button" class="btn btn-icon btn-xs btn-ghost" data-action="moveRoutingUp" data-id="' + idAttr + '"' +
+        ((!move.previous || move.locked) ? ' disabled' : '') + ' title="' + escapeAttr(lockTitle || t('routing.moveUp')) + '" aria-label="' + escapeAttr(t('routing.moveUp')) + '">' +
+        '<i class="fa-solid fa-chevron-up" aria-hidden="true"></i></button>' +
+        '<button type="button" class="btn btn-icon btn-xs btn-ghost" data-action="moveRoutingDown" data-id="' + idAttr + '"' +
+        ((!move.next || move.locked) ? ' disabled' : '') + ' title="' + escapeAttr(lockTitle || t('routing.moveDown')) + '" aria-label="' + escapeAttr(t('routing.moveDown')) + '">' +
+        '<i class="fa-solid fa-chevron-down" aria-hidden="true"></i></button>' +
+        '</span>';
+    }
+    const mutationLocked = accountRoutingMutationActive();
+    return '<div class="account-routing-controls">' +
+      '<label class="account-routing-priority-field">' +
+      '<span class="account-routing-priority-label">' + escapeHtml(t('routing.accountPriority')) + '</span>' +
+      '<input class="account-routing-priority-input" type="number" min="0" step="1" inputmode="numeric" value="' + escapeAttr(displayed) + '" data-routing-priority-input data-id="' + idAttr + '"' + (mutationLocked ? ' disabled' : '') + ' />' +
+      '</label>' +
+      '<button type="button" class="btn btn-outline btn-xs" data-action="savePriority" data-id="' + idAttr + '"' + (mutationLocked ? ' disabled' : '') + '>' + escapeHtml(t('routing.savePriority')) + '</button>' +
+      '<span class="account-routing-effective">' + escapeHtml(t('routing.effectivePriority')) + ': ' + effective + '</span>' +
+      ordering +
+      '</div>';
+  }
+  async function saveAccountPriority(id, btn) {
+    if (accountRoutingLoadState !== 'ready' || accountRoutingMutationActive()) return;
+    const account = accountsData.find(item => item.id === id);
+    const controls = btn && btn.closest('.account-routing-controls');
+    const input = controls && controls.querySelector('[data-routing-priority-input]');
+    if (!account || !input || btn.disabled) return;
+    const raw = String(input.value || '').trim();
+    const priority = raw === '' ? 0 : Number(raw);
+    if (!Number.isSafeInteger(priority) || priority < 0) {
+      toast(t('routing.invalidPriority'), 'warning');
+      return;
+    }
+    const observedPriority = rawRoutingPriority(account);
+    if (priority === observedPriority) return;
+    const mutation = beginAccountRoutingMutation('priority', id);
+    if (!mutation) return;
+    try {
+      const res = await api('/accounts/' + encodeURIComponent(id) + '/routing', {
+        method: 'PUT',
+        body: JSON.stringify({
+          generation: Number(account.generation) || 0,
+          observedPriority,
+          priority
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        const err = new Error(data.error || t('common.saveFailed'));
+        err.status = res.status;
+        err.published = data.published === true;
+        throw err;
+      }
+      toast(t('routing.prioritySaved'), 'success');
+    } catch (e) {
+      toast(e && e.status === 409 ? t('routing.stale') : ((e && e.message) || t('common.saveFailed')), 'error');
+    } finally {
+      try {
+        await refreshAccountRoutingControlPlane();
+      } finally {
+        endAccountRoutingMutation(mutation);
+      }
+    }
+  }
+  async function moveAccountWithinPriority(id, direction, btn) {
+    if (accountRoutingLoadState !== 'ready' || currentAccountRoutingStrategy() !== 'fill-first' || accountRoutingMutationActive()) return;
+    const state = routingMoveState(id);
+    if (state.filtered) {
+      toast(t('routing.clearFiltersToReorder'), 'warning');
+      return;
+    }
+    if (state.snapshotUnavailable) {
+      toast(t('routing.reloadBeforeReorder'), 'warning');
+      return;
+    }
+    const target = direction < 0 ? state.previous : state.next;
+    if (!target || state.locked) return;
+    const from = accountsData.findIndex(item => item.id === id);
+    const to = accountsData.findIndex(item => item.id === target.id);
+    if (from < 0 || to < 0) return;
+    const observedStrategy = currentAccountRoutingStrategy();
+    const observed = accountsData.map(item => ({
+      id: item.id,
+      generation: Number(item.generation) || 0,
+      priority: rawRoutingPriority(item)
+    }));
+    const desired = observed.map(item => ({ ...item }));
+    const tmp = desired[from];
+    desired[from] = desired[to];
+    desired[to] = tmp;
+    const mutation = beginAccountRoutingMutation('order', id);
+    if (!mutation) return;
+    try {
+      const res = await api('/accounts/order', {
+        method: 'PUT',
+        body: JSON.stringify({ observedStrategy, observed, accounts: desired })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        const err = new Error(data.error || t('common.saveFailed'));
+        err.status = res.status;
+        err.published = data.published === true;
+        throw err;
+      }
+      toast(t('routing.orderSaved'), 'success');
+    } catch (e) {
+      toast(e && e.status === 409 ? t('routing.stale') : ((e && e.message) || t('common.saveFailed')), 'error');
+    } finally {
+      try {
+        await refreshAccountRoutingControlPlane();
+      } finally {
+        endAccountRoutingMutation(mutation);
+      }
+    }
+  }
+
+  function accountRuntimeNowSeconds() {
+    return Math.floor((Date.now() + accountRuntimeServerOffsetMs) / 1000);
+  }
+  function formatRuntimeDuration(seconds) {
+    seconds = Math.max(0, Math.ceil(Number(seconds) || 0));
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    if (days > 0) return days + 'd ' + hours + 'h';
+    if (hours > 0) return hours + 'h ' + minutes + 'm';
+    if (minutes > 0) return minutes + 'm ' + secs + 's';
+    return secs + 's';
+  }
+  function runtimeCountdownText(timestamp) {
+    timestamp = Number(timestamp) || 0;
+    if (!timestamp) return '';
+    const remaining = timestamp - accountRuntimeNowSeconds();
+    return remaining <= 0 ? t('runtime.due') : formatRuntimeDuration(remaining);
+  }
+  function runtimeAgeText(timestamp) {
+    timestamp = Number(timestamp) || 0;
+    if (!timestamp) return '';
+    return formatRuntimeDuration(accountRuntimeNowSeconds() - timestamp);
+  }
+  function refreshAccountRuntimeCountdowns(root) {
+    qsa('[data-runtime-countdown]', root || document).forEach(el => {
+      el.textContent = runtimeCountdownText(el.dataset.runtimeCountdown);
+    });
+    qsa('[data-runtime-age]', root || document).forEach(el => {
+      el.textContent = runtimeAgeText(el.dataset.runtimeAge);
+    });
+  }
+  function runtimeLaneHtml(label, lane) {
+    if (!lane || lane.supported !== true) return '';
+    const now = accountRuntimeNowSeconds();
+    let stateClass = '';
+    let detail = t('runtime.ready');
+    if (lane.refreshing) {
+      stateClass = ' is-refreshing';
+      detail = t('runtime.refreshing');
+    } else if (lane.retryAt && lane.retryAt > now) {
+      stateClass = lane.stale ? ' is-stale' : '';
+      detail = t('runtime.retry') + ' <span data-runtime-countdown="' + escapeAttr(lane.retryAt) + '">' +
+        escapeHtml(runtimeCountdownText(lane.retryAt)) + '</span>';
+    } else if (lane.stale) {
+      stateClass = ' is-stale';
+      detail = t('runtime.stale');
+    } else if (lane.nextRefreshAt) {
+      detail = t('runtime.next') + ' <span data-runtime-countdown="' + escapeAttr(lane.nextRefreshAt) + '">' +
+        escapeHtml(runtimeCountdownText(lane.nextRefreshAt)) + '</span>';
+    }
+    return '<span class="account-runtime-lane' + stateClass + '">' +
+      '<strong>' + escapeHtml(label) + '</strong><span>' + detail + '</span></span>';
+  }
+  function renderAccountRuntime(a) {
+    const runtime = accountRuntimeById.get(a.id);
+    if (!runtime || Number(runtime.generation) !== Number(a.generation)) return '';
+    const credential = runtime.credential || {};
+    const accountInfo = runtime.accountInfo || {};
+    const lanes = runtimeLaneHtml(t('runtime.token'), credential) +
+      runtimeLaneHtml(t('runtime.quota'), accountInfo);
+    const expiresAt = Number(runtime.expiresAt) || 0;
+    const expiry = expiresAt
+      ? '<span class="account-runtime-expiry">' + escapeHtml(t('runtime.expires')) + ' <span data-runtime-countdown="' +
+        escapeAttr(expiresAt) + '">' + escapeHtml(runtimeCountdownText(expiresAt)) + '</span></span>'
+      : '';
+    if (!lanes && !expiry) return '';
+    const updatedAt = Math.max(Number(a.lastRefresh) || 0, Number(accountInfo.lastSuccessAt) || 0);
+    const errors = Array.from(new Set([credential.lastError, accountInfo.lastError].filter(Boolean)));
+    return '<div class="account-runtime" data-runtime-account="' + escapeAttr(a.id) + '">' +
+      lanes + expiry +
+      (updatedAt ? '<span class="account-runtime-updated">' + escapeHtml(t('runtime.updated')) + ' <span data-runtime-age="' +
+        escapeAttr(updatedAt) + '">' + escapeHtml(runtimeAgeText(updatedAt)) + '</span></span>' : '') +
+      errors.map(message => '<span class="account-runtime-error" title="' + escapeAttr(message) + '">' + escapeHtml(message) + '</span>').join('') +
+      '</div>';
+  }
+  function accountsRuntimePollingAllowed() {
+    const main = $('mainPage');
+    const tab = $('tabAccounts');
+    return document.visibilityState !== 'hidden' && main && !main.classList.contains('hidden') &&
+      tab && !tab.classList.contains('hidden');
+  }
+  function stopAccountRuntimeTimers() {
+    if (accountRuntimePollTimer) {
+      clearTimeout(accountRuntimePollTimer);
+      accountRuntimePollTimer = null;
+    }
+    if (accountRuntimeCountdownTimer) {
+      clearInterval(accountRuntimeCountdownTimer);
+      accountRuntimeCountdownTimer = null;
+    }
+    accountRuntimeImmediatePending = false;
+    if (accountRuntimePollController) {
+      // Keep the controller registered until fetch unwinds in finally. This
+      // preserves the one-request-at-a-time invariant across fast visibility
+      // transitions while a canceled request is still settling.
+      accountRuntimePollController.abort();
+    }
+  }
+  function scheduleAccountRuntimePoll(delay) {
+    if (!accountsRuntimePollingAllowed() || accountRuntimePollTimer || accountRuntimePollController) return;
+    accountRuntimePollTimer = setTimeout(() => {
+      accountRuntimePollTimer = null;
+      pollAccountRuntime();
+    }, Math.max(0, delay || 0));
+  }
+  function syncAccountRuntimePolling(immediate) {
+    if (!accountsRuntimePollingAllowed()) {
+      stopAccountRuntimeTimers();
+      return;
+    }
+    if (!accountRuntimeCountdownTimer) {
+      accountRuntimeCountdownTimer = setInterval(() => refreshAccountRuntimeCountdowns($('accountsList')), 1000);
+    }
+    if (immediate && accountRuntimePollController) accountRuntimeImmediatePending = true;
+    if (immediate && accountRuntimePollTimer) {
+      clearTimeout(accountRuntimePollTimer);
+      accountRuntimePollTimer = null;
+    }
+    scheduleAccountRuntimePoll(immediate ? 0 : accountRuntimePollIntervalMs);
+  }
+  async function pollAccountRuntime() {
+    if (!accountsRuntimePollingAllowed() || accountRuntimePollController) return;
+    const controller = new AbortController();
+    accountRuntimePollController = controller;
+    try {
+      const headers = {};
+      if (accountRuntimeETag) headers['If-None-Match'] = accountRuntimeETag;
+      const res = await api('/accounts/runtime', { headers, signal: controller.signal, cache: 'no-cache' });
+      if (res.status === 304) {
+        if (accountRuntimeNeedsAccountReload) await loadAccounts();
+        return;
+      }
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (controller.signal.aborted) return;
+      const instance = String(data.instance || '');
+      const revision = Number(data.revision) || 0;
+      const changed = instance !== accountRuntimeInstance || revision !== accountRuntimeRevision;
+      accountRuntimeInstance = instance;
+      accountRuntimeRevision = revision;
+      accountRuntimeETag = res.headers.get('ETag') || accountRuntimeETag;
+      if (Number.isFinite(Number(data.serverTime)) && Number(data.serverTime) > 0) {
+        accountRuntimeServerOffsetMs = Number(data.serverTime) * 1000 - Date.now();
+      }
+      accountRuntimeById = new Map((Array.isArray(data.accounts) ? data.accounts : [])
+        .filter(item => item && item.id)
+        .map(item => [item.id, item]));
+      if (changed) accountRuntimeNeedsAccountReload = true;
+      if (accountRuntimeNeedsAccountReload) await loadAccounts();
+      else refreshAccountRuntimeCountdowns($('accountsList'));
+    } catch (e) {
+      if (!(e && e.name === 'AbortError')) {
+        try { console.warn('[AccountRuntime] poll failed', e); } catch (_) { }
+      }
+    } finally {
+      if (accountRuntimePollController === controller) accountRuntimePollController = null;
+      if (accountsRuntimePollingAllowed()) {
+        const immediate = accountRuntimeImmediatePending;
+        accountRuntimeImmediatePending = false;
+        scheduleAccountRuntimePoll(immediate ? 0 : accountRuntimePollIntervalMs);
+      }
+    }
   }
 
   // Account list
   function getFilteredAccounts() {
-    return accountsData.filter(a => {
+    const filtered = accountsData.filter(a => {
       if (filterStatus === 'enabled' && !a.enabled) return false;
       if (filterStatus === 'disabled' && (a.enabled || (a.banStatus && a.banStatus !== 'ACTIVE'))) return false;
       if (filterStatus === 'banned' && (!a.banStatus || a.banStatus === 'ACTIVE')) return false;
@@ -836,10 +1426,12 @@
       }
       return true;
     });
+    return sortAccountsForRouting(filtered);
   }
   function onFilterChange() {
     filterKeyword = $('filterSearch').value;
     filterStatus = $('filterStatusSelect').value;
+    renderAccountRoutingPanel();
     renderAccounts();
   }
   function toggleSelectAll(checked) {
@@ -1016,6 +1608,7 @@
         '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
         '</div>' +
         '</div>' +
+        renderAccountRoutingControls(a) +
         (a.usageLimit > 0 ?
           '<div class="account-usage">' +
           '<div class="usage-label">' + escapeHtml(t('accounts.mainQuota')) + '</div>' +
@@ -1028,6 +1621,7 @@
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
+        renderAccountRuntime(a) +
         // Compact account cards: no per-account stats row. Requests/Tokens/Credits
         // and token expiry are intentionally omitted here (usage still shown per
         // API key) so cards stay small enough to pack 2-3 per row.
@@ -3656,6 +4250,7 @@
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
     if (tab === 'logs') loadLogs();
+    syncAccountRuntimePolling(tab === 'accounts');
   }
 
   // Event wiring
@@ -3691,6 +4286,9 @@
     });
     window.addEventListener('resize', positionOpenCustomSelects);
     window.addEventListener('scroll', positionOpenCustomSelects, true);
+    document.addEventListener('visibilitychange', () => syncAccountRuntimePolling(true));
+    window.addEventListener('pagehide', () => stopAccountRuntimeTimers());
+    window.addEventListener('pageshow', () => syncAccountRuntimePolling(true));
 
     $('loginThemeToggle').addEventListener('click', toggleTheme);
     $('mainThemeToggle').addEventListener('click', toggleTheme);
@@ -3740,6 +4338,7 @@
     $('exportBtn').addEventListener('click', showExportModal);
     $('refreshAllModelsBtn').addEventListener('click', refreshAllModels);
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
+    $('accountRoutingStrategySelect').addEventListener('change', saveAccountRoutingStrategy);
 
     $('selectAllCheckbox').addEventListener('change', e => toggleSelectAll(e.target.checked));
     qsa('[data-batch]').forEach(b => b.addEventListener('click', () => {
@@ -3751,6 +4350,14 @@
 
     $('filterSearch').addEventListener('input', onFilterChange);
     $('filterStatusSelect').addEventListener('change', onFilterChange);
+
+    $('accountsList').addEventListener('keydown', e => {
+      if (e.key !== 'Enter' || !e.target.matches('[data-routing-priority-input]')) return;
+      e.preventDefault();
+      const controls = e.target.closest('.account-routing-controls');
+      const save = controls && controls.querySelector('button[data-action="savePriority"]');
+      if (save) save.click();
+    });
 
     $('accountsList').addEventListener('click', e => {
       const cb = e.target.closest('.account-checkbox');
@@ -3770,6 +4377,9 @@
       else if (action === 'toggle') toggleAccount(id, btn.dataset.enabled === 'true');
       else if (action === 'test') testAccount(id);
       else if (action === 'switchProfile') openSwitchProfileModal(id, btn);
+      else if (action === 'savePriority') saveAccountPriority(id, btn);
+      else if (action === 'moveRoutingUp') moveAccountWithinPriority(id, -1, btn);
+      else if (action === 'moveRoutingDown') moveAccountWithinPriority(id, 1, btn);
       else if (action === 'delete') deleteAccount(id);
     });
   }

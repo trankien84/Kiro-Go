@@ -361,8 +361,9 @@ func completionGuardValidateSemanticHeaders(
 		return "advisor_20260301 requires anthropic-beta token advisor-tool-2026-03-01"
 	}
 	if completionGuardCatalogHasMCP(catalog) &&
-		!completionGuardHeaderHasBetaToken(headers, "mcp-client-2025-11-20") {
-		return "mcp_toolset requires anthropic-beta token mcp-client-2025-11-20"
+		!completionGuardHeaderHasBetaToken(headers, "mcp-client-2025-11-20") &&
+		!completionGuardHeaderHasBetaToken(headers, "mcp-client-2026-09-15") {
+		return "mcp_toolset requires anthropic-beta token mcp-client-2025-11-20 or mcp-client-2026-09-15"
 	}
 	return ""
 }

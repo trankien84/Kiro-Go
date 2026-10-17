@@ -155,25 +155,10 @@ func TestApiImportCredentialsApiKey(t *testing.T) {
 	// network: the stub serves exactly the region this record was exported with.
 	stubProbeKiroApiKey(t, "eu-west-1")
 
-	// apiImportCredentials fires an un-awaited background goroutine
-	// (fetchAndCacheAccountModels) for enabled accounts with a non-empty
-	// AccessToken — which an api_key import always has. Left on the default
-	// kiroRestHttpStore, that goroutine's Transport.RoundTrip would call the
-	// real http.ProxyFromEnvironment on a live host, and that function caches
-	// env vars in a process-wide sync.Once on first call — permanently
-	// poisoning any later test (e.g. TestBuildKiroTransportFallsBackToEnvironmentProxy)
-	// that relies on t.Setenv("HTTPS_PROXY", ...) actually taking effect.
-	// Stub the REST client so the goroutine hits this instead, and restore an
-	// equally inert stub afterward (never the real ProxyFromEnvironment-backed
-	// client) since the goroutine may still be in flight after this test returns.
-	kiroRestHttpStore.Store(&http.Client{
-		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return nil, errTest("network disabled in test")
-		}),
-	})
-	t.Cleanup(func() {
-		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
-	})
+	// The successful import schedules model discovery. Keep the REST client
+	// isolated, then join the Handler before restoring the exact prior client.
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 
 	r := httptest.NewRequest(http.MethodPost, "/admin/api/auth/credentials",
 		strings.NewReader(`{"authMethod":"api_key","kiroApiKey":"ksk_restore","region":"eu-west-1"}`))
@@ -389,6 +374,8 @@ func TestApiImportCredentialsApiKeyDiscoversRegion(t *testing.T) {
 	p.Reload()
 	h := &Handler{pool: p}
 	stubProbeKiroApiKey(t, "eu-central-1")
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 
 	r := httptest.NewRequest(http.MethodPost, "/admin/api/auth/credentials",
 		strings.NewReader(`{"authMethod":"api_key","kiroApiKey":"ksk_importeu"}`))

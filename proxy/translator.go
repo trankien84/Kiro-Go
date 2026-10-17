@@ -33,16 +33,12 @@ var modelAliases = []modelMapping{
 	{"claude-3-opus", "claude-sonnet-4.5"},
 	{"claude-3-sonnet", "claude-sonnet-4"},
 	{"claude-3-haiku", "claude-haiku-4.5"},
-	{"gpt-4-turbo", "claude-sonnet-4.5"},
-	{"gpt-4o", "claude-sonnet-4.5"},
-	{"gpt-4", "claude-sonnet-4.5"},
-	{"gpt-3.5-turbo", "claude-sonnet-4.5"},
 }
 
 // claudeVersionPattern normalizes "claude-{family}-N-M" to "claude-{family}-N.M".
-// Minor is capped at 1-2 digits with a \b boundary so dated snapshots
-// (claude-sonnet-4-20250514) are not accidentally rewritten.
-var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
+// Only whole, unqualified legacy IDs qualify. Opaque provider IDs with extra
+// suffixes (including -private) and dated snapshots must not be rewritten.
+var claudeVersionPattern = regexp.MustCompile(`^claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})$`)
 
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
@@ -149,22 +145,36 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 
 	// Strip the configured thinking suffix (e.g. "-thinking") if present.
 	suffixLower := strings.ToLower(thinkingSuffix)
-	if strings.HasSuffix(lower, suffixLower) {
+	if thinkingSuffix != "" && strings.HasSuffix(lower, suffixLower) {
 		thinking = true
 		model = model[:len(model)-len(thinkingSuffix)]
 		lower = strings.ToLower(model)
 	}
 
-	// 1) Explicit aliases: dated snapshots, cross-family legacy IDs, non-Anthropic fallbacks.
+	// Opus 5.5 uses a fixed, hyphenated official API ID. Preserve it on the
+	// wire instead of applying the legacy N-M -> N.M Kiro normalization.
+	if lower == "claude-opus-5-5" {
+		return "claude-opus-5-5", thinking
+	}
+
+	// 1) Only exact legacy aliases are eligible for translation. A substring
+	// match can shadow a real opaque provider ID (e.g. prefixed gpt-4o).
+	// Live provider IDs are resolved before mapped aliases by the candidate registry.
 	for _, m := range modelAliases {
-		if strings.Contains(lower, m.key) {
+		if lower == m.key {
 			return m.value, thinking
 		}
 	}
 
-	// 2) Format normalization: claude-{family}-N-M → claude-{family}-N.M.
-	//    New versions (claude-opus-4-8, etc.) flow through here without code changes.
-	if claudeVersionPattern.MatchString(lower) {
+	// 2) Preserve official 5.5 identities (and their Bedrock qualified forms)
+	// byte-for-byte. Their contracts differ from major version 5 and the
+	// provider registry must see the exact requested ID.
+	if isClaudeSonnet55Model(model) || isClaudeOpus55Model(model) || isClaudeHaiku55Model(model) {
+		return model, thinking
+	}
+	// Legacy dashed Claude versions can still be translated for older Kiro
+	// adapters, but never modify slash-qualified or opaque provider IDs.
+	if model == lower && strings.HasPrefix(lower, "claude-") && claudeVersionPattern.MatchString(lower) {
 		return claudeVersionPattern.ReplaceAllString(lower, "claude-$1-$2.$3"), thinking
 	}
 
@@ -186,7 +196,7 @@ func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
 		return false
 	}
 	kind := strings.ToLower(strings.TrimSpace(thinkingCfg.Type))
-	return kind == "enabled" || kind == "adaptive"
+	return kind == "enabled" || kind == "adaptive" || kind == "between_tools"
 }
 
 func claudeToolChoiceIsNone(choice interface{}) bool {
@@ -1195,28 +1205,107 @@ func claudeMessageEndsWithServerToolResult(message ClaudeMessage) bool {
 	return false
 }
 
+func claudeSystemEffortOnly(message ClaudeMessage) bool {
+	if strings.ToLower(strings.TrimSpace(message.Role)) != "system" {
+		return false
+	}
+	raw := message.Extra["output_config"]
+	if len(raw) == 0 {
+		return false
+	}
+	var fields map[string]interface{}
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return false
+	}
+	effort, ok := fields["effort"].(string)
+	if !ok || strings.TrimSpace(effort) == "" {
+		return false
+	}
+	if text, ok := message.Content.(string); ok {
+		return strings.TrimSpace(text) == ""
+	}
+	return len(claudeContentBlocks(message.Content)) == 0
+}
+
+// Retained for existing internal callers with no beta-header context.
 func validateClaudeMidConversationSystemMessages(messages []ClaudeMessage) string {
+	return validateClaudeMidConversationSystemMessagesWithBetas(messages, newClaudeBetaSet())
+}
+
+func validateClaudeMidConversationSystemMessagesWithBetas(messages []ClaudeMessage, betas claudeBetaSet) string {
+	for index, message := range messages {
+		if !strings.EqualFold(strings.TrimSpace(message.Role), "system") {
+			continue
+		}
+		if raw, present := message.Extra["output_config"]; present {
+			if !betas.Contains("mid-conversation-output-config-2026-07-01") {
+				return "messages role=system output_config requires anthropic-beta mid-conversation-output-config-2026-07-01"
+			}
+			var fields map[string]interface{}
+			if json.Unmarshal(raw, &fields) != nil || fields == nil {
+				return fmt.Sprintf("messages[%d].output_config must be an object", index)
+			}
+			effort, ok := fields["effort"].(string)
+			if !ok || strings.TrimSpace(effort) == "" {
+				return fmt.Sprintf("messages[%d].output_config.effort must be non-empty", index)
+			}
+		}
+		if raw, present := message.Extra["clear_at"]; present {
+			if !betas.Contains("mid-conversation-system-clear-at-2026-08-21") {
+				return "messages clear_at requires anthropic-beta mid-conversation-system-clear-at-2026-08-21"
+			}
+			var value string
+			if json.Unmarshal(raw, &value) != nil || (value != "never" && value != "next_user_message") {
+				return fmt.Sprintf("messages[%d].clear_at is invalid", index)
+			}
+			if value == "next_user_message" {
+				if _, present := message.Extra["output_config"]; present {
+					return fmt.Sprintf("messages[%d].output_config is not permitted on turn-scoped messages", index)
+				}
+				for _, block := range claudeContentBlocks(message.Content) {
+					if block["type"] != "text" {
+						return fmt.Sprintf("messages[%d] turn-scoped system message supports text only", index)
+					}
+					if _, present := block["cache_control"]; present {
+						return fmt.Sprintf("messages[%d] turn-scoped text cannot carry cache_control", index)
+					}
+				}
+			}
+		}
+	}
 	for index := 0; index < len(messages); {
 		if !strings.EqualFold(strings.TrimSpace(messages[index].Role), "system") {
 			index++
 			continue
 		}
-
 		start := index
+		allEffortOnly, hasToolChange := true, false
 		for index < len(messages) && strings.EqualFold(strings.TrimSpace(messages[index].Role), "system") {
+			if !claudeSystemEffortOnly(messages[index]) {
+				allEffortOnly = false
+			}
+			for _, block := range claudeContentBlocks(messages[index].Content) {
+				if block["type"] == "tool_addition" || block["type"] == "tool_removal" {
+					hasToolChange = true
+				}
+			}
 			index++
 		}
-
+		if allEffortOnly {
+			continue
+		}
 		if start == 0 {
 			return "messages role=system cannot be the first message; use the top-level system field"
 		}
-
 		previous := messages[start-1]
 		previousRole := strings.ToLower(strings.TrimSpace(previous.Role))
-		if previousRole != "user" && !(previousRole == "assistant" && claudeMessageEndsWithServerToolResult(previous)) {
+		pausedTurn := previousRole == "assistant" && claudeMessageEndsWithServerToolResult(previous)
+		if previousRole != "user" && !pausedTurn {
 			return "messages role=system must immediately follow a user turn or an assistant turn ending in a server tool result"
 		}
-
+		if pausedTurn && hasToolChange {
+			return "tool changes cannot immediately follow a paused assistant server-tool turn"
+		}
 		if index < len(messages) && !strings.EqualFold(strings.TrimSpace(messages[index].Role), "assistant") {
 			return "messages role=system must be the final message or be immediately followed by an assistant turn"
 		}

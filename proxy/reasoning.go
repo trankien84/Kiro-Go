@@ -252,9 +252,10 @@ func modelHasAnyPrefix(modelID string, prefixes ...string) bool {
 }
 
 func modelCapsDisabledThinkingAtHigh(modelID string) bool {
-	// Do not generalize this to all Claude 5 models. The current public
-	// restriction is specific to Claude Opus 5.
-	return modelHasAnyPrefix(modelID, "claude-opus-5")
+	// Opus 5.5 cannot disable thinking at *any* effort. This restriction
+	// belongs only to Opus 5.0, not a broad 5.x prefix.
+	family, version, ok := canonicalClaudeModelFamilyVersion(modelID)
+	return ok && (family == "opus" && version == "5" || family == "haiku" && version == "5.5")
 }
 
 func validateThinkingEffortCombination(
@@ -296,6 +297,7 @@ func claudeThinkingEnabledByDefault(
 		modelID,
 		"claude-opus-5",
 		"claude-sonnet-5",
+		"claude-haiku-5-5",
 		"claude-fable-5",
 		"claude-mythos-5",
 	)
@@ -315,6 +317,7 @@ func claudeDefaultThinkingDisplay(
 		modelID,
 		"claude-opus-5",
 		"claude-sonnet-5",
+		"claude-haiku-5-5",
 		"claude-fable-5",
 		"claude-mythos-5",
 		"claude-opus-4.8",
@@ -359,7 +362,34 @@ func fallbackClaudeReasoningCapability(modelID string) ModelReasoningCapability 
 	// Prefer the live Kiro schema whenever it is available. These fallbacks only
 	// cover stable public Claude contracts so
 	// requests can still be translated while the model cache is cold or stale.
-	if modelHasAnyPrefix(modelID, "claude-opus-5", "claude-sonnet-5") {
+	if isClaudeOpus55Model(modelID) {
+		capability.SupportsThinking = true
+		capability.ThinkingTypes = []string{"adaptive"}
+		capability.SupportsDisplay = true
+		capability.ThinkingDisplays = []string{"summarized", "omitted"}
+		capability.DefaultThinkingType = "adaptive"
+		capability.DefaultThinkingDisplay = "omitted"
+		capability.EffortPath = ReasoningSchemaOutputConfig
+		capability.Efforts = []string{"low", "medium", "high", "xhigh", "max"}
+	} else if isClaudeSonnet55Model(modelID) {
+		capability.SupportsThinking = true
+		capability.ThinkingTypes = []string{"adaptive", "between_tools"}
+		capability.SupportsDisplay = true // adaptive only; between_tools forbids display
+		capability.ThinkingDisplays = []string{"summarized", "omitted"}
+		capability.DefaultThinkingType = "adaptive"
+		capability.DefaultThinkingDisplay = "omitted"
+		capability.EffortPath = ReasoningSchemaOutputConfig
+		capability.Efforts = []string{"low", "medium", "high", "xhigh", "max"}
+	} else if isClaudeHaiku55Model(modelID) {
+		capability.SupportsThinking = true
+		capability.ThinkingTypes = []string{"adaptive", "disabled"}
+		capability.SupportsDisplay = true
+		capability.ThinkingDisplays = []string{"summarized", "omitted"}
+		capability.DefaultThinkingType = "adaptive"
+		capability.DefaultThinkingDisplay = "omitted"
+		capability.EffortPath = ReasoningSchemaOutputConfig
+		capability.Efforts = []string{"low", "medium", "high", "xhigh", "max"}
+	} else if modelHasAnyPrefix(modelID, "claude-opus-5", "claude-sonnet-5") {
 		capability.SupportsThinking = true
 		capability.ThinkingTypes = []string{"adaptive", "disabled"}
 		capability.SupportsDisplay = true

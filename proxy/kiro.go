@@ -1138,6 +1138,12 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 // on to decide when to compact; an undersized window under-reports tokens and
 // prevents clients from compacting in time.
 func getContextWindowSize(model string) int {
+	// Conservative, name-based fallback only. Selected-account live token limits
+	// are preferred by usageInputFromContextPercentage.
+	base := strings.ToLower(strings.TrimSpace(model))
+	if base == "gpt-5.6" || base == "gpt-5.6-sol" || base == "gpt-5.6-terra" || base == "gpt-5.6-luna" {
+		return 1_000_000
+	}
 	if isLargeContextModel(model) {
 		return 1_000_000
 	}

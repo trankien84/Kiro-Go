@@ -27,10 +27,8 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -78,6 +76,7 @@ type bedrockInferenceProfilesResponse struct {
 		InferenceProfileID string `json:"inferenceProfileId"`
 		Status             string `json:"status"`
 	} `json:"inferenceProfileSummaries"`
+	NextToken string `json:"nextToken"`
 }
 
 // --- pure helpers (unit-tested) --------------------------------------------
@@ -230,15 +229,8 @@ func clearBedrockModelCache(accountID string) {
 }
 
 func clearBedrockModelCacheForLifecycle(account *config.Account) bool {
-	if account == nil || strings.TrimSpace(account.ID) == "" || account.DispatchGeneration == 0 {
-		return false
-	}
-	key := accountLifecycleKey{accountID: account.ID, generation: account.DispatchGeneration}
-	bedrockDiscoveryMu.Lock()
-	delete(bedrockDiscoveryCache, key)
-	bedrockDiscoveryMu.Unlock()
-	bedrockDiscoveryInflight.Delete(key)
-	return true
+	cleared, _ := clearBedrockModelCacheForLifecycleContext(context.Background(), account)
+	return cleared
 }
 
 // setCachedBedrockModelsTTL stores a COPY of models with an explicit TTL (a short
@@ -337,6 +329,13 @@ func setCachedBedrockDiscoveryFailure(accountID string, err error, ttl time.Dura
 // signedBedrockControlGet performs a SigV4-signed GET against a control-plane path
 // (e.g. "/foundation-models") and returns the status and body.
 func (h *Handler) signedBedrockControlGet(account *config.Account, path string) (int, []byte, error) {
+	return h.signedBedrockControlGetContext(context.Background(), account, path)
+}
+
+func (h *Handler) signedBedrockControlGetContext(ctx context.Context, account *config.Account, path string) (int, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	region := bedrockRegionFor(account)
 	req, err := newBedrockRequestForURL(bedrockControlPlaneBase(region)+path, nil)
 	if err != nil {
@@ -347,21 +346,23 @@ func (h *Handler) signedBedrockControlGet(account *config.Account, path string) 
 	req.ContentLength = 0
 	req.Header.Set("Accept", "application/json")
 	// Bound the call so a hung control plane cannot pin the caller for the invoke
-	// client's long timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), bedrockControlPlaneTimeout)
+	// client's long timeout, while still inheriting Handler/request cancellation.
+	opCtx, cancel := context.WithTimeout(ctx, bedrockControlPlaneTimeout)
 	defer cancel()
-	req = req.WithContext(ctx)
+	req = req.WithContext(opCtx)
 	// GET has no body: authorize over the empty payload (bearer token or SigV4).
 	if err := authorizeBedrockRequest(account, req, []byte{}, region); err != nil {
 		return 0, nil, err
 	}
-	resp, err := bedrockHTTPClient(account).Do(req)
+	resp, err := bedrockHTTPClientFor(account).Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	// Control-plane responses are small; cap defensively.
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, readErr := readBedrockControlPlaneBody(resp.Body)
+	if readErr != nil {
+		return resp.StatusCode, nil, fmt.Errorf("bedrock control-plane HTTP %d response body: %w", resp.StatusCode, readErr)
+	}
 	return resp.StatusCode, body, nil
 }
 
@@ -371,80 +372,88 @@ func (h *Handler) signedBedrockControlGet(account *config.Account, path string) 
 // GetFoundationModelAvailability — availability reports AVAILABLE even in regions
 // where the same key gets HTTP 400 "Operation not allowed" on invoke, so it cannot
 // gate callability (see the file header). Actual callability is decided at invoke
-// time by the request path's failover. Two control-plane calls (ListFoundationModels
-// + ListInferenceProfiles); the profiles call is best-effort. Runs on cold cache /
-// explicit refresh only (30-min TTL). A list-models error is returned so the caller
-// falls back to static config.
+// time by the request path's failover. Discovery performs one foundation list plus
+// a paginated ListInferenceProfiles enumeration. Missing profile-list permission
+// degrades to foundation-only evidence; partial/transient profile enumeration fails
+// rather than publishing an incomplete catalog. Runs on cold cache / explicit refresh
+// only (30-min success TTL). A discovery error lets the caller retain stale/static
+// evidence instead of treating partial results as fresh.
 func (h *Handler) discoverBedrockModels(account *config.Account) ([]string, error) {
-	code, body, err := h.signedBedrockControlGet(account, "/foundation-models")
+	return h.discoverBedrockModelsContext(context.Background(), account)
+}
+
+func (h *Handler) discoverBedrockModelsContext(ctx context.Context, account *config.Account) ([]string, error) {
+	evidence, err := h.discoverBedrockModelEvidenceContext(ctx, account)
 	if err != nil {
 		return nil, err
 	}
-	if code != http.StatusOK {
-		return nil, fmt.Errorf("bedrock discovery: list models HTTP %d: %s", code, strings.TrimSpace(string(body)))
-	}
-	var list bedrockListModelsResponse
-	if err := json.Unmarshal(body, &list); err != nil {
-		return nil, fmt.Errorf("bedrock discovery: parse list: %w", err)
-	}
-	foundation := onDemandTextModelIDs(list)
-
-	// Inference profiles are the invocable ids for on-demand cross-region models
-	// (Claude 4.x, etc.). Best-effort: a failure here doesn't sink discovery.
-	var profiles []string
-	if pc, pb, pe := h.signedBedrockControlGet(account, "/inference-profiles"); pe == nil && pc == http.StatusOK {
-		var pr bedrockInferenceProfilesResponse
-		if json.Unmarshal(pb, &pr) == nil {
-			profiles = inferenceProfileIDs(pr)
-		}
-	}
-
-	all := dedupeSortedModelIDs(foundation, profiles)
-	// An empty result usually means a scoped key that can list nothing; cache it
-	// only briefly so recovery is fast rather than pinned for the full success TTL.
-	ttl := bedrockDiscoveryTTL
-	if len(all) == 0 {
-		ttl = bedrockDiscoveryNegativeTTL
-	}
-	setCachedBedrockModelsTTLForAccount(account, all, ttl)
-	logger.Infof("[Bedrock] discovered %d models for account %s in %s (%d on-demand text foundation + %d inference profiles)",
-		len(all), account.ID, bedrockRegionFor(account), len(foundation), len(profiles))
-	return all, nil
+	return evidence.models, nil
 }
 
 // cachedOrDiscoverBedrockModelsResult returns the cached/discovered callable set
 // and preserves discovery failures so provider snapshot freshness cannot be
 // renewed by a negative cache entry.
 func (h *Handler) cachedOrDiscoverBedrockModelsResult(account *config.Account) ([]string, error) {
+	return h.cachedOrDiscoverBedrockModelsResultContext(context.Background(), account)
+}
+
+func (h *Handler) cachedOrDiscoverBedrockModelsResultContext(ctx context.Context, account *config.Account) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if account == nil {
 		return nil, errors.New("bedrock account is nil")
 	}
 	if models, cached, err := getCachedBedrockModelsResultForAccount(account); cached {
 		return models, err
 	}
-	// Singleflight per account: serialize concurrent cold-cache callers so only one
-	// runs the control-plane list calls; the rest read the freshly populated cache.
-	lk := bedrockDiscoveryLockForAccount(account)
-	lk.Lock()
-	defer lk.Unlock()
+
+	key := lifecycleOrLegacyKeyForAccount(account)
+	release, err := acquireBedrockDiscoveryGateContext(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if models, cached, err := getCachedBedrockModelsResultForAccount(account); cached {
 		return models, err
 	}
-	models, err := h.discoverBedrockModels(account)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	evidence, err := h.discoverBedrockModelEvidenceContext(ctx, account)
 	if err != nil {
-		// Negative-cache the failure briefly so a key lacking
-		// bedrock:ListFoundationModels doesn't pay a round-trip on every call.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		logger.Warnf("[Bedrock] model discovery failed for account %s: %v", account.ID, err)
 		setCachedBedrockDiscoveryFailureForAccount(account, err, bedrockDiscoveryNegativeTTL)
 		return nil, err
 	}
-	return models, nil
+	// Cancellation is not provider evidence. Re-check immediately before cache
+	// publication so a cancel that races with the final successful response cannot
+	// turn into a fresh success entry.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+
+	setCachedBedrockModelsTTLForAccount(account, evidence.models, evidence.cacheTTL)
+	if evidence.profilesRestricted {
+		logger.Warnf("[Bedrock] inference-profile listing denied for account %s; caching foundation-only discovery for %s", account.ID, evidence.cacheTTL)
+	}
+	logger.Infof("[Bedrock] discovered %d models for account %s in %s (%d on-demand text foundation + %d inference profiles)",
+		len(evidence.models), account.ID, bedrockRegionFor(account), evidence.foundationCount, evidence.profileCount)
+	return evidence.models, nil
 }
 
 // cachedOrDiscoverBedrockModels is retained for resolver/admin callers that only
 // need the current evidence set. Snapshot publication uses the error-aware form.
 func (h *Handler) cachedOrDiscoverBedrockModels(account *config.Account) []string {
-	models, _ := h.cachedOrDiscoverBedrockModelsResult(account)
+	return h.cachedOrDiscoverBedrockModelsContext(context.Background(), account)
+}
+
+func (h *Handler) cachedOrDiscoverBedrockModelsContext(ctx context.Context, account *config.Account) []string {
+	models, _ := h.cachedOrDiscoverBedrockModelsResultContext(ctx, account)
 	return models
 }
 

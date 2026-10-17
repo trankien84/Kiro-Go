@@ -499,11 +499,11 @@ func TestParseModelAndThinking(t *testing.T) {
 		{"claude 3 sonnet", "claude-3-sonnet", "claude-sonnet-4", false},
 		{"claude 3 haiku", "claude-3-haiku", "claude-haiku-4.5", false},
 
-		// Non-Anthropic fallbacks.
-		{"gpt-4-turbo", "gpt-4-turbo", "claude-sonnet-4.5", false},
-		{"gpt-4o", "gpt-4o", "claude-sonnet-4.5", false},
-		{"gpt-4", "gpt-4", "claude-sonnet-4.5", false},
-		{"gpt-3.5-turbo", "gpt-3.5-turbo", "claude-sonnet-4.5", false},
+		// Non-Anthropic IDs are opaque and must not be remapped to Claude.
+		{"gpt-4-turbo exact", "gpt-4-turbo", "gpt-4-turbo", false},
+		{"gpt-4o exact", "gpt-4o", "gpt-4o", false},
+		{"gpt-4 exact", "gpt-4", "gpt-4", false},
+		{"gpt-3.5-turbo exact", "gpt-3.5-turbo", "gpt-3.5-turbo", false},
 
 		// Thinking suffix is stripped before mapping.
 		{"thinking suffix on dash form", "claude-opus-4-8-thinking", "claude-opus-4.8", true},

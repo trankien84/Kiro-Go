@@ -84,7 +84,9 @@ func TestImportWatcherProcessesValidFile(t *testing.T) {
 	dir := t.TempDir()
 	writeHelperFile(t, dir, "CLIProxyAPI_user.json", idp.URL, "rt-watch", "user@example.com")
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 	h.scanImportDir(dir)
 
 	accs := config.GetAccounts()
@@ -164,7 +166,9 @@ func TestImportWatcherTruncatedFileRoutesToFailed(t *testing.T) {
 	}
 	backdateForWatcher(t, path)
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 	h.scanImportDir(dir)
 
 	// The first credential DID import — that part of the fix must not regress

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"kiro-go/config"
 )
@@ -130,9 +131,6 @@ func buildClaudeRequestPlanWithResolver(
 			Message: "messages must not be empty",
 		}
 	}
-	if reason := validateClaudeMidConversationSystemMessages(plan.Request.Messages); reason != "" {
-		return plan, &claudeTransportValidationError{Code: "invalid_request_error", Message: reason}
-	}
 	if reason := validateClaudeThinkingConfig(plan.Request.Thinking, plan.Request.MaxTokens); reason != "" {
 		return plan, &claudeTransportValidationError{Code: "invalid_request_error", Message: reason}
 	}
@@ -140,6 +138,23 @@ func buildClaudeRequestPlanWithResolver(
 	semantic, reason := buildClaudeSemanticRequest(&plan.Request, headers, rawBody)
 	if reason != "" {
 		return plan, &claudeTransportValidationError{Code: "invalid_request_error", Message: reason}
+	}
+	if reason := validateClaudeMidConversationSystemMessagesWithBetas(plan.Request.Messages, semantic.Betas); reason != "" {
+		return plan, &claudeTransportValidationError{Code: "invalid_request_error", Message: reason}
+	}
+	if plan.Request.Thinking != nil && strings.EqualFold(strings.TrimSpace(plan.Request.Thinking.Display), "updates") {
+		if !semantic.Betas.Contains("thinking-display-updates-2026-08-18") {
+			return plan, &claudeTransportValidationError{
+				Code:    "invalid_request_error",
+				Message: "thinking.display updates requires anthropic-beta thinking-display-updates-2026-08-18",
+			}
+		}
+		if !strings.EqualFold(strings.TrimSpace(plan.Request.Thinking.Type), "adaptive") {
+			return plan, &claudeTransportValidationError{
+				Code:    "invalid_request_error",
+				Message: "thinking.display updates requires adaptive thinking",
+			}
+		}
 	}
 
 	modelThinking, validationErr := normalizeClaudeModelAndThinking(
@@ -172,6 +187,12 @@ func buildClaudeRequestPlanWithResolver(
 		},
 	)
 	if reason != "" {
+		return plan, &claudeTransportValidationError{Code: "invalid_request_error", Message: reason}
+	}
+	if validationErr := validateClaudeInlineToolHistory(&plan.Request, plan.Catalog, semantic.Betas); validationErr != nil {
+		return plan, validationErr
+	}
+	if reason := validateNativeToolsetHistory(&plan.Request, plan.Catalog); reason != "" {
 		return plan, &claudeTransportValidationError{Code: "invalid_request_error", Message: reason}
 	}
 	logClaudeToolFeatures(plan.Catalog)

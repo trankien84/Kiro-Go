@@ -41,11 +41,14 @@ var claudeProgrammaticToolCallingModels = map[string]struct{}{
 	"fable-5":    {},
 	"mythos-5":   {},
 	"opus-5":     {},
+	"opus-5.5":   {},
 	"opus-4.8":   {},
 	"opus-4.7":   {},
 	"opus-4.6":   {},
 	"sonnet-5":   {},
 	"sonnet-4.6": {},
+	"sonnet-5.5": {},
+	"haiku-5.5":  {},
 	"opus-4.5":   {},
 	"sonnet-4.5": {},
 }
@@ -54,10 +57,13 @@ var claudeToolSearchModels = map[string]struct{}{
 	"fable-5":    {},
 	"mythos-5":   {},
 	"opus-5":     {},
+	"opus-5.5":   {},
 	"opus-4.8":   {},
 	"opus-4.7":   {},
 	"opus-4.6":   {},
 	"sonnet-4.6": {},
+	"sonnet-5.5": {},
+	"haiku-5.5":  {},
 	"opus-4.5":   {},
 	"sonnet-4.5": {},
 	"haiku-4.5":  {},
@@ -70,8 +76,13 @@ func canonicalClaudeModelFamilyVersion(model string) (family, version string, ok
 	// Keep the capability registry behavior-compatible so every consumer sees
 	// the same canonical family instead of treating the suffixed ID as private.
 	model = strings.TrimSuffix(model, "-thinking")
-	if slash := strings.LastIndex(model, "/"); slash >= 0 {
-		model = model[slash+1:]
+	// Slash-qualified IDs belong to their own provider namespace. Removing the
+	// prefix would incorrectly apply official Claude capabilities to an opaque
+	// route such as vendor/claude-haiku-5-5.
+	if strings.HasPrefix(model, "anthropic/") {
+		model = strings.TrimPrefix(model, "anthropic/")
+	} else if strings.Contains(model, "/") {
+		return "", "", false
 	}
 	// Bedrock and other providers commonly add a version suffix after a colon.
 	if colon := strings.Index(model, ":"); colon >= 0 {
@@ -79,7 +90,7 @@ func canonicalClaudeModelFamilyVersion(model string) (family, version string, ok
 	}
 	// Accept the bare Anthropic ID and known Bedrock provider-qualified IDs,
 	// but do not classify arbitrary private aliases merely because they contain
-	// the substring "claude-". Slash-qualified IDs were reduced above; Bedrock
+	// the substring "claude-". Only known Anthropic-qualified IDs were reduced above; Bedrock
 	// IDs use prefixes such as anthropic. or us.anthropic.
 	if index := strings.Index(model, "claude-"); index > 0 {
 		prefix := model[:index]
@@ -111,6 +122,37 @@ func canonicalClaudeModelFamilyVersion(model string) (family, version string, ok
 		return "legacy", version, true
 	}
 	return "", "", false
+}
+
+// isClaudeOpus55Model is intentionally an exact canonical family/version
+// check. Prefix matching would accidentally give Opus 5.0 semantics to 5.5.
+func isClaudeOpus55Model(model string) bool {
+	family, version, ok := canonicalClaudeModelFamilyVersion(model)
+	return ok && family == "opus" && version == "5.5"
+}
+
+// isClaudeHaiku55Model matches only the official 5.5 family/version,
+// including canonical Bedrock-qualified IDs.
+func isClaudeHaiku55Model(model string) bool {
+	family, version, ok := canonicalClaudeModelFamilyVersion(model)
+	return ok && family == "haiku" && version == "5.5"
+}
+
+// isClaudeSonnet55Model is exact, including canonical Bedrock-qualified IDs.
+func isClaudeSonnet55Model(model string) bool {
+	family, version, ok := canonicalClaudeModelFamilyVersion(model)
+	return ok && family == "sonnet" && version == "5.5"
+}
+
+// Documented native browser toolset model families. Unknown future versions
+// are left to the terminal provider to validate rather than guessed supported.
+func claudeOfficialBrowserToolsetSupported(family, version string) bool {
+	switch family + "-" + version {
+	case "fable-5", "fable-5.1", "mythos-5", "mythos-5.1",
+		"opus-4.8", "opus-5", "opus-5.5", "sonnet-5", "sonnet-5.5", "haiku-5.5":
+		return true
+	}
+	return false
 }
 
 func claudeVersionAtLeast(version string, major, minor int) bool {
@@ -178,7 +220,7 @@ func resolveClaudeModelCapabilities(model string) claudeModelCapabilities {
 	}
 
 	switch family + "-" + version {
-	case "fable-5", "mythos-5", "opus-4.8", "opus-5":
+	case "fable-5", "mythos-5", "opus-4.8", "opus-5", "opus-5.5", "sonnet-5.5", "haiku-5.5":
 		caps.MidConversationSystem = claudeFeatureSupported
 		caps.MidConversationTools = claudeFeatureSupported
 	case "sonnet-5":
@@ -236,9 +278,15 @@ func directAnthropicReasoningCapability(model string, metadata directAnthropicMo
 	}
 	thinking := metadata.Capabilities.Thinking
 	capability.SupportsThinking = thinking.Supported
+	if thinking.Types.Disabled != nil && thinking.Types.Disabled.Supported {
+		capability.ThinkingTypes = append(capability.ThinkingTypes, "disabled")
+	}
 	if thinking.Supported {
 		if thinking.Types.Adaptive.Supported {
 			capability.ThinkingTypes = append(capability.ThinkingTypes, "adaptive")
+		}
+		if thinking.Types.BetweenTools.Supported {
+			capability.ThinkingTypes = append(capability.ThinkingTypes, "between_tools")
 		}
 		if thinking.Types.Enabled.Supported {
 			capability.ThinkingTypes = append(capability.ThinkingTypes, "enabled")

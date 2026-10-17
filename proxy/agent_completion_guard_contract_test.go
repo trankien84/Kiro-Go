@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestPhase65AObservedCopilotBenignProjectionIsReplaySafe(t *testing.T) {
+func TestCompletionGuardContractObservedCopilotBenignProjectionIsReplaySafe(t *testing.T) {
 	body := []byte(`{
 		"model":"claude-opus-5",
 		"max_tokens":4096,
@@ -34,7 +34,7 @@ func TestPhase65AObservedCopilotBenignProjectionIsReplaySafe(t *testing.T) {
 	}
 }
 
-func TestPhase65AProjectionReplaySafetyAllowsBenignEmulation(t *testing.T) {
+func TestCompletionGuardContractProjectionReplaySafetyAllowsBenignEmulation(t *testing.T) {
 	projection := newClaudeKiroProjection()
 	for _, feature := range []string{
 		"thinking_effort",
@@ -51,7 +51,7 @@ func TestPhase65AProjectionReplaySafetyAllowsBenignEmulation(t *testing.T) {
 	}
 }
 
-func TestPhase65AProjectionReplaySafetyRejectsHistoryDependentEmulation(t *testing.T) {
+func TestCompletionGuardContractProjectionReplaySafetyRejectsHistoryDependentEmulation(t *testing.T) {
 	for _, feature := range []string{"mid_conversation_system", "context_management", "future_emulation"} {
 		t.Run(feature, func(t *testing.T) {
 			projection := newClaudeKiroProjection()
@@ -66,7 +66,7 @@ func TestPhase65AProjectionReplaySafetyRejectsHistoryDependentEmulation(t *testi
 	}
 }
 
-func TestPhase65AProjectionReplaySafetyExactAndUnsupported(t *testing.T) {
+func TestCompletionGuardContractProjectionReplaySafetyExactAndUnsupported(t *testing.T) {
 	exact := newClaudeKiroProjection()
 	if safety, reason := completionGuardClaudeProjectionReplaySafety(exact); safety != completionGuardProjectionReplayExact || reason != "" {
 		t.Fatalf("exact safety=%s reason=%q", safety.String(), reason)
@@ -79,7 +79,7 @@ func TestPhase65AProjectionReplaySafetyExactAndUnsupported(t *testing.T) {
 	}
 }
 
-func TestPhase65ACompletionGuardLeavesNaturalLanguageCompletionToSemanticAudit(t *testing.T) {
+func TestCompletionGuardContractNaturalLanguageCompletionDelegatesToSemanticAudit(t *testing.T) {
 	plan := completionGuardTestPlanWithTools("auto", ClaudeTool{Name: "run_in_terminal"})
 
 	cases := []string{
@@ -103,7 +103,7 @@ func TestPhase65ACompletionGuardLeavesNaturalLanguageCompletionToSemanticAudit(t
 	}
 }
 
-func TestPhase65ACompletionAuditExplicitlyPreservesHumanWait(t *testing.T) {
+func TestCompletionGuardContractAuditPreservesHumanWait(t *testing.T) {
 	for _, fragment := range []string{
 		"waiting_for_user",
 		"safe progress requires clarification, confirmation",

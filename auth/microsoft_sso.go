@@ -366,7 +366,7 @@ func continueMicrosoftProviderLeg(session *microsoftSSOSession, rawURL string) (
 		Scopes:        leg.Scopes,
 		Email:         metadata.Email,
 		UserID:        userID,
-		ExpiresAt:     time.Now().Unix() + int64(token.ExpiresIn),
+		ExpiresAt:     token.ExpiresAt,
 	}
 	retireMicrosoftSSOSessionLocked(session)
 	return &MicrosoftSSOProgress{Result: result}, nil
@@ -610,10 +610,11 @@ func validateMicrosoftDiscoveredEndpoint(raw string, issuer *url.URL, tenant, su
 type externalIdpTokenResponse struct {
 	AccessToken      string `json:"access_token"`
 	RefreshToken     string `json:"refresh_token"`
-	ExpiresIn        int    `json:"expires_in"`
+	ExpiresIn        int64  `json:"expires_in"`
 	TokenType        string `json:"token_type"`
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
+	ExpiresAt        int64  `json:"-"`
 }
 
 func exchangeMicrosoftAuthorizationCode(client *http.Client, leg *microsoftProviderLeg, code string) (*externalIdpTokenResponse, error) {
@@ -664,7 +665,7 @@ func IsMicrosoftValidationShapeError(err error) bool {
 
 func refreshExternalIdpToken(refreshToken, clientID, tokenEndpoint, issuerURL, scopes string, client *http.Client) (string, string, int64, string, error) {
 	if strings.TrimSpace(refreshToken) == "" || strings.TrimSpace(clientID) == "" || strings.TrimSpace(tokenEndpoint) == "" {
-		return "", "", 0, "", fmt.Errorf("external IdP refresh requires refreshToken, clientId, and tokenEndpoint")
+		return "", "", 0, "", newRefreshConfigurationError(fmt.Errorf("external IdP refresh requires refreshToken, clientId, and tokenEndpoint"))
 	}
 	normalizedScopes, err := NormalizeExternalIdpScopes(scopes, clientID)
 	if err != nil {
@@ -682,28 +683,26 @@ func refreshExternalIdpToken(refreshToken, clientID, tokenEndpoint, issuerURL, s
 	if err != nil {
 		return "", "", 0, "", err
 	}
-	if token.RefreshToken == "" {
-		token.RefreshToken = refreshToken
-	}
-	return token.AccessToken, token.RefreshToken, time.Now().Unix() + int64(token.ExpiresIn), "", nil
+	token.RefreshToken = oauthOptionalReplacement(token.RefreshToken, refreshToken)
+	return token.AccessToken, token.RefreshToken, token.ExpiresAt, "", nil
 }
 
 func postExternalIdpToken(client *http.Client, tokenEndpoint, issuerURL string, form url.Values) (*externalIdpTokenResponse, error) {
 	if err := ValidateExternalIdpEndpoint(tokenEndpoint); err != nil {
-		return nil, fmt.Errorf("external IdP token endpoint rejected: %w", err)
+		return nil, newRefreshConfigurationError(fmt.Errorf("external IdP token endpoint rejected: %w", err))
 	}
 	if strings.TrimSpace(issuerURL) != "" {
 		issuer, tenant, err := parseMicrosoftIssuer(issuerURL)
 		if err != nil {
-			return nil, fmt.Errorf("external IdP issuer rejected: %w", err)
+			return nil, newRefreshConfigurationError(fmt.Errorf("external IdP issuer rejected: %w", err))
 		}
 		if err := validateMicrosoftDiscoveredEndpoint(tokenEndpoint, issuer, tenant, "/oauth2/v2.0/token"); err != nil {
-			return nil, fmt.Errorf("external IdP token endpoint rejected: %w", err)
+			return nil, newRefreshConfigurationError(fmt.Errorf("external IdP token endpoint rejected: %w", err))
 		}
 	}
 	request, err := http.NewRequest(http.MethodPost, tokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("build external IdP token request: %w", err)
+		return nil, newRefreshConfigurationError(fmt.Errorf("build external IdP token request: %w", err))
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept", "application/json")
@@ -713,25 +712,30 @@ func postExternalIdpToken(client *http.Client, tokenEndpoint, issuerURL string, 
 		return nil, fmt.Errorf("external IdP token request failed: %w", err)
 	}
 	defer response.Body.Close()
-	body, err := readBoundedBody(response.Body, microsoftSSOMaxResponse)
+	body, err := readOAuthTokenResponseBody(response.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read external IdP token response: %w", err)
+		err = oauthTokenResponseReadError(response.StatusCode, response.StatusCode >= 200 && response.StatusCode < 300, err)
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			return nil, fmt.Errorf("read external IdP token response: %w", err)
+		}
+		return nil, err
 	}
-	var token externalIdpTokenResponse
-	if err := json.Unmarshal(body, &token); err != nil {
-		return nil, fmt.Errorf("parse external IdP token response: %w", err)
+	if endpointErr := oauthEndpointErrorFromBody(response.StatusCode, body); endpointErr != nil {
+		return nil, endpointErr
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		if token.Error != "" {
-			return nil, fmt.Errorf("HTTP %d: %s%s", response.StatusCode, token.Error, formatOAuthDescription(token.ErrorDescription))
-		}
-		return nil, fmt.Errorf("external IdP token endpoint returned HTTP %d", response.StatusCode)
+		return nil, newOAuthTokenEndpointError(response.StatusCode, body)
 	}
-	if strings.TrimSpace(token.AccessToken) == "" {
-		return nil, fmt.Errorf("external IdP token response is missing access_token")
+	var token externalIdpTokenResponse
+	if err := decodeOAuthTokenJSON(body, &token); err != nil {
+		return nil, fmt.Errorf("parse external IdP token response: %w", err)
 	}
-	if token.ExpiresIn <= 0 {
-		return nil, fmt.Errorf("external IdP token response has invalid expires_in")
+	if err := validateOAuthAccessToken(token.AccessToken); err != nil {
+		return nil, fmt.Errorf("external IdP token response is missing access_token: %w", err)
+	}
+	token.ExpiresAt, err = oauthExpiresAt(time.Now().Unix(), token.ExpiresIn)
+	if err != nil {
+		return nil, fmt.Errorf("external IdP token response has invalid expires_in: %w", err)
 	}
 	return &token, nil
 }

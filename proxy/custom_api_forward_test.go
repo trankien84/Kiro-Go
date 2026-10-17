@@ -65,7 +65,9 @@ func newCustomApiTestHandler(t *testing.T, acc config.Account) *Handler {
 	p := accountpool.GetPool()
 	p.Reload()
 	t.Cleanup(p.WaitForPendingStats)
-	return &Handler{pool: p, customApiLedger: newCustomApiCreditLedger()}
+	h := &Handler{pool: p, customApiLedger: newCustomApiCreditLedger()}
+	t.Cleanup(h.Close)
+	return h
 }
 
 // A live upstream key with remaining credits passes the quota gate.

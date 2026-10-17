@@ -61,6 +61,10 @@ type claudeContentInventory struct {
 	HasFinalClientToolUse        bool
 	HasMidConversationSystemText bool
 	HasMidConversationToolChange bool
+	HasInlineToolDefinition      bool
+	HasInlineMCPToolset          bool
+	HasMCPToolListing            bool
+	HasEffortOnlySystem          bool
 	UsesFileReferences           bool
 	SearchCitationsEnabled       bool
 	SearchCitationsDisabled      bool
@@ -650,51 +654,34 @@ func inspectClaudeToolResultContent(
 	return nil
 }
 
-func validateClaudeMidConversationToolReference(
-	block map[string]interface{},
-	path string,
-	catalog *completionGuardNormalizedCatalog,
-) *claudeTransportValidationError {
+// Structural validation is provider-neutral. Resolution against the declaration
+// state at *this* point in history happens in validateClaudeInlineToolHistory.
+func validateClaudeMidConversationToolReference(block map[string]interface{}, path string, _ *completionGuardNormalizedCatalog) *claudeTransportValidationError {
 	tool, ok := block["tool"].(map[string]interface{})
 	if !ok || tool == nil {
 		return &claudeTransportValidationError{Code: "invalid_request_error", Message: path + ".tool must be an object"}
 	}
-	refType, _ := tool["type"].(string)
-	refType = strings.ToLower(strings.TrimSpace(refType))
-	name, _ := tool["name"].(string)
-	name = strings.TrimSpace(name)
-	serverName, _ := tool["server_name"].(string)
-	serverName = strings.TrimSpace(serverName)
-
-	switch refType {
-	case "tool_reference":
-		if name == "" {
-			return &claudeTransportValidationError{Code: "invalid_request_error", Message: path + ".tool.name must be a non-empty string"}
+	kind, _ := tool["type"].(string)
+	switch kind {
+	case "tool_reference", "mcp_tool_reference":
+		name, _ := tool["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			return &claudeTransportValidationError{Code: "invalid_request_error", Message: path + ".tool.name must be non-empty"}
 		}
-		if catalog == nil {
-			return nil
-		}
-		if _, exists := catalog.ExplicitToolsByName[name]; !exists {
-			return &claudeTransportValidationError{Code: "invalid_request_error", Message: fmt.Sprintf("%s references undeclared tool %q", path, name)}
-		}
-	case "mcp_tool_reference":
-		if serverName == "" || name == "" {
-			return &claudeTransportValidationError{Code: "invalid_request_error", Message: path + ".tool requires non-empty server_name and name"}
-		}
-		if catalog != nil && !completionGuardMCPToolAllowed(catalog, serverName, name) {
-			return &claudeTransportValidationError{Code: "invalid_request_error", Message: fmt.Sprintf("%s references undeclared or disabled MCP tool %q on server %q", path, name, serverName)}
-		}
+		fallthrough
 	case "mcp_toolset_reference":
-		if serverName == "" {
-			return &claudeTransportValidationError{Code: "invalid_request_error", Message: path + ".tool.server_name must be a non-empty string"}
-		}
-		if catalog != nil {
-			if _, exists := catalog.MCPToolsetsByName[serverName]; !exists {
-				return &claudeTransportValidationError{Code: "invalid_request_error", Message: fmt.Sprintf("%s references undeclared MCP toolset %q", path, serverName)}
+		if kind == "mcp_toolset_reference" || kind == "mcp_tool_reference" {
+			server, _ := tool["server_name"].(string)
+			if strings.TrimSpace(server) == "" {
+				return &claudeTransportValidationError{Code: "invalid_request_error", Message: path + ".tool.server_name must be non-empty"}
 			}
 		}
+	case "tool_definition":
+		if _, ok := tool["definition"].(map[string]interface{}); !ok {
+			return &claudeTransportValidationError{Code: "invalid_request_error", Message: path + ".tool.definition must be an object"}
+		}
 	default:
-		return &claudeTransportValidationError{Code: "invalid_request_error", Message: path + ".tool.type must be tool_reference, mcp_tool_reference, or mcp_toolset_reference"}
+		return &claudeTransportValidationError{Code: "invalid_request_error", Message: path + ".tool.type is unsupported"}
 	}
 	return nil
 }
@@ -802,6 +789,11 @@ func buildClaudeContentInventory(
 				Message: fmt.Sprintf("messages[%d].role must be user, assistant, or system", messageIndex),
 			}
 		}
+		if role == "system" && message.Extra != nil {
+			if raw, ok := message.Extra["output_config"]; ok && claudeRawMeaningful(raw) {
+				inventory.HasEffortOnlySystem = true
+			}
+		}
 		if len(message.Extra) > 0 {
 			keys := make([]string, 0, len(message.Extra))
 			for key, raw := range message.Extra {
@@ -811,11 +803,15 @@ func buildClaudeContentInventory(
 			}
 			sort.Strings(keys)
 			for _, key := range keys {
+				kind := claudeContentTransparentMetadata
+				if role == "system" && key == "clear_at" {
+					kind = claudeContentNativeMetadata
+				}
 				inventory.add(claudeContentFeature{
 					MessageIndex: messageIndex,
 					Path:         fmt.Sprintf("messages[%d].%s", messageIndex, key),
 					Role:         role,
-					Kind:         claudeContentTransparentMetadata,
+					Kind:         kind,
 					SourceType:   key,
 				})
 			}
@@ -862,6 +858,16 @@ func buildClaudeContentInventory(
 					if blockType == "tool_removal" {
 						kind = claudeContentMidConversationToolDrop
 					}
+					if blockType == "tool_addition" {
+						tool, _ := block["tool"].(map[string]interface{})
+						if tool["type"] == "tool_definition" {
+							inventory.HasInlineToolDefinition = true
+							definition, _ := tool["definition"].(map[string]interface{})
+							if definition["type"] == "mcp_toolset" {
+								inventory.HasInlineMCPToolset = true
+							}
+						}
+					}
 					inventory.add(claudeContentFeature{MessageIndex: messageIndex, Path: path, Role: role, Kind: kind})
 					inspectClaudeContentBlockMetadata(&inventory, messageIndex, path, role, block, []string{"type", "tool"}, []string{"cache_control"})
 				default:
@@ -871,6 +877,21 @@ func buildClaudeContentInventory(
 			}
 
 			if role == "assistant" {
+				if blockType == "mcp_tool_listing" {
+					server, _ := block["mcp_server_name"].(string)
+					_, ok := block["tools"].([]interface{})
+					if strings.TrimSpace(server) == "" || !ok {
+						return inventory, &claudeTransportValidationError{Code: "invalid_request_error", Message: path + " must contain mcp_server_name and tools array"}
+					}
+					if catalog != nil {
+						if _, known := catalog.MCPServersByName[server]; !known {
+							return inventory, &claudeTransportValidationError{Code: "invalid_request_error", Message: path + " references undeclared MCP server"}
+						}
+					}
+					inventory.HasMCPToolListing = true
+					inventory.add(claudeContentFeature{MessageIndex: messageIndex, Path: path, Role: role, Kind: claudeContentNativeMetadata, SourceType: "mcp_tool_listing"})
+					continue
+				}
 				switch blockType {
 				case "text":
 					if _, validationErr := validateClaudeTextBlock(block, path); validationErr != nil {
@@ -1018,11 +1039,20 @@ func validateClaudeContentBetas(
 			Message: "file_id content sources require anthropic-beta files-api-2025-04-14",
 		}
 	}
-	if inventory.HasMidConversationToolChange && !semantic.Betas.Contains("mid-conversation-tool-changes-2026-07-01") {
+	if inventory.HasMidConversationToolChange && !semantic.Betas.Contains("mid-conversation-tool-changes-2026-07-01") && !semantic.Betas.Contains("inline-tools-2026-09-15") {
 		return &claudeTransportValidationError{
 			Code:    "invalid_request_error",
-			Message: "tool_addition and tool_removal require anthropic-beta mid-conversation-tool-changes-2026-07-01",
+			Message: "tool_addition and tool_removal require anthropic-beta mid-conversation-tool-changes-2026-07-01 or inline-tools-2026-09-15",
 		}
+	}
+	if inventory.HasInlineToolDefinition && !semantic.Betas.Contains("inline-tools-2026-09-15") {
+		return &claudeTransportValidationError{Code: "invalid_request_error", Message: "tool_definition requires anthropic-beta inline-tools-2026-09-15"}
+	}
+	if inventory.HasInlineMCPToolset && !semantic.Betas.Contains("mcp-client-2026-09-15") {
+		return &claudeTransportValidationError{Code: "invalid_request_error", Message: "inline mcp_toolset requires anthropic-beta mcp-client-2026-09-15"}
+	}
+	if inventory.HasMCPToolListing && !semantic.Betas.Contains("mcp-client-2026-09-15") {
+		return &claudeTransportValidationError{Code: "invalid_request_error", Message: "mcp_tool_listing requires anthropic-beta mcp-client-2026-09-15"}
 	}
 	return nil
 }

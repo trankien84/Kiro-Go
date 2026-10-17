@@ -2,11 +2,61 @@ package proxy
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"kiro-go/config"
 )
+
+func TestSignedBedrockControlGetUsesSharedHTTPClientSeam(t *testing.T) {
+	previous := bedrockHTTPClientFor
+	t.Cleanup(func() { bedrockHTTPClientFor = previous })
+
+	calls := 0
+	bedrockHTTPClientFor = func(*config.Account) *http.Client {
+		return &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.Method != http.MethodGet {
+					t.Fatalf("control-plane method = %s, want GET", req.Method)
+				}
+				if req.URL.Host != "bedrock.us-east-1.amazonaws.com" || req.URL.Path != "/foundation-models" {
+					t.Fatalf("control-plane request = %s, want us-east-1 /foundation-models", req.URL.String())
+				}
+				if got := req.Header.Get("Authorization"); got != "Bearer ABSK-test" {
+					t.Fatalf("Authorization = %q, want Bedrock API-key bearer", got)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"modelSummaries":[]}`)),
+					Request:    req,
+				}, nil
+			}),
+		}
+	}
+
+	h := &Handler{}
+	code, body, err := h.signedBedrockControlGet(&config.Account{
+		ID:            "bedrock-control-seam",
+		AuthMethod:    "bedrock",
+		Enabled:       true,
+		Region:        "us-east-1",
+		BedrockAPIKey: "ABSK-test",
+	}, "/foundation-models")
+	if err != nil {
+		t.Fatalf("signedBedrockControlGet: %v", err)
+	}
+	if code != http.StatusOK || string(body) != `{"modelSummaries":[]}` {
+		t.Fatalf("response = status %d body %q", code, body)
+	}
+	if calls != 1 {
+		t.Fatalf("bedrockHTTPClientFor calls = %d, want 1", calls)
+	}
+}
 
 func TestOnDemandTextModelIDs(t *testing.T) {
 	// Shapes taken from a real ListFoundationModels response.

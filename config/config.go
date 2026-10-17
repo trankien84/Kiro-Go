@@ -46,6 +46,11 @@ type Account struct {
 	UserId             string `json:"userId,omitempty"`   // Kiro user ID
 	Nickname           string `json:"nickname,omitempty"` // Display name for admin panel
 
+	// AccountInfoRevision is a process-local publication fence stamped into
+	// account snapshots. It is never persisted; the authoritative counter lives
+	// beside lifecycle bookkeeping and orders asynchronous account-info results.
+	AccountInfoRevision uint64 `json:"-"`
+
 	// Custom API (pool-linking) fields. Present only when AuthMethod == "custom_api":
 	// the account is a transparent proxy to ANOTHER Kiro-Go pool rather than a direct
 	// Kiro credential. The upstream bearer token is stored in KiroApiKey (its existing
@@ -111,8 +116,14 @@ type Account struct {
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
 
-	// Priority weight for load balancing (higher = more requests)
-	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
+	// Weight is a soft health/load factor used as a tie-breaker inside an
+	// already-selected routing tier. It never bypasses account eligibility or
+	// the hard Priority tier.
+	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher soft weight
+
+	// Priority is a hard routing tier. Lower positive values are preferred.
+	// Zero/unset uses DefaultAccountPriority for backward-compatible configs.
+	Priority int `json:"priority,omitempty"`
 
 	// Upstream Overages state (mirrored from AWS Q `setUserPreference` / `getUsageLimits`).
 	// OverageStatus is the only switch that decides whether to keep dispatching once UsageLimit is reached.
@@ -357,6 +368,11 @@ type Config struct {
 	// SessionAffinityEnabled binds consecutive requests from the same API key to
 	// the same account (sticky routing) for a TTL window. Default false.
 	SessionAffinityEnabled bool `json:"sessionAffinityEnabled,omitempty"`
+
+	// AccountSelectionStrategy controls routing after the existing eligibility
+	// gates and session-affinity lookup. Values: "round-robin" (default),
+	// "priority", or "fill-first".
+	AccountSelectionStrategy string `json:"accountSelectionStrategy,omitempty"`
 
 	// AgentToolSteering injects extra instructions (a system-prompt addendum
 	// plus a per-turn reminder, see proxy/translator.go's
@@ -907,7 +923,10 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 func UpdateAccountInfo(id string, info AccountInfo) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	_, _, err := publishAccountByIDLocked(id, false, func(account *Account) error { applyAccountInfo(account, info); return nil })
+	found, published, err := publishAccountByIDLocked(id, false, func(account *Account) error { applyAccountInfo(account, info); return nil })
+	if found && published {
+		bumpAccountInfoRevisionLocked(id)
+	}
 	return err
 }
 

@@ -4549,7 +4549,7 @@ func TestCompletionGuardMCPServerAndToolNameValidation(t *testing.T) {
 		t.Fatalf("MCP outcome=%#v", mcpOutcome)
 	}
 
-	for _, name := range []string{"bad name", strings.Repeat("a", 65), "tool!"} {
+	for _, name := range []string{"bad name", strings.Repeat("a", 129), "tool!"} {
 		plan := buildAgentCompletionGuardPlan(&ClaudeRequest{
 			Tools: []ClaudeTool{{Name: name}},
 		}, false)

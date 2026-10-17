@@ -170,7 +170,9 @@ func TestApiImportIdeCacheIgnoresRequestBodyPath(t *testing.T) {
 	// sent upstream instead of envPath's.
 	attackerPath := writeTempCache(t, `{"accessToken":"at-attacker","refreshToken":"rt-attacker-should-never-be-used"}`)
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 	reqBody, err := json.Marshal(map[string]string{"path": attackerPath})
 	if err != nil {
 		t.Fatalf("marshal request body: %v", err)

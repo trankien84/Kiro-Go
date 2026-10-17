@@ -7,6 +7,7 @@ import (
 	"kiro-go/auth"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,15 +17,53 @@ import (
 )
 
 // installCleanAuthClient replaces the global auth HTTP client with one whose
-// Transport does not consult http.ProxyFromEnvironment — that function caches
-// env vars on first call and would otherwise poison TestBuildKiroTransport*
-// when tests run in the default order. Returns a cleanup that restores the
-// previous client.
+// Transport does not consult http.ProxyFromEnvironment and only permits
+// loopback destinations. Import tests intentionally use httptest servers for
+// token exchange; every other destination is test leakage and must fail fast.
 func installCleanAuthClient(t *testing.T) func() {
 	t.Helper()
-	c := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{}}
+	transport := &http.Transport{}
+	c := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			host := req.URL.Hostname()
+			ip := net.ParseIP(host)
+			loopback := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+			if !loopback {
+				return nil, fmt.Errorf("network disabled in test: %s", req.URL.Host)
+			}
+			return transport.RoundTrip(req)
+		}),
+	}
 	prev := auth.SetGlobalAuthClientForTest(c)
-	return func() { auth.SetGlobalAuthClientForTest(prev) }
+	return func() {
+		transport.CloseIdleConnections()
+		auth.SetGlobalAuthClientForTest(prev)
+	}
+}
+
+func TestInstallCleanAuthClientAllowsLoopbackAndBlocksExternal(t *testing.T) {
+	restore := installCleanAuthClient(t)
+	t.Cleanup(restore)
+
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer local.Close()
+
+	resp, err := auth.GetAuthClientForProxy("").Get(local.URL)
+	if err != nil {
+		t.Fatalf("loopback request was blocked: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("loopback status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	_, err = auth.GetAuthClientForProxy("").Get("https://example.invalid/should-not-leave-test")
+	if err == nil || !strings.Contains(err.Error(), "network disabled in test") {
+		t.Fatalf("external request was not blocked by the test client: %v", err)
+	}
 }
 
 // TestApiImportCredentialsRejectsWhenRefreshFails verifies the regression:
@@ -100,7 +139,9 @@ func TestApiImportCredentialsUsesUpstreamExpiresAt(t *testing.T) {
 	auth.SetOIDCTokenURLForTest(func(string) string { return fake.URL })
 	defer auth.SetOIDCTokenURLForTest(oldOIDC)
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 
 	before := time.Now().Unix()
 	body := `{"refreshToken":"rt-good","clientId":"c","clientSecret":"s","authMethod":"idc","region":"us-east-1"}`
@@ -211,7 +252,9 @@ func TestApiImportCredentialsExternalIdpHappyPath(t *testing.T) {
 	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
 	defer auth.SetExternalIdpValidatorForTest(restore)
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 
 	body := fmt.Sprintf(`{"authMethod":"external_idp","refreshToken":"rt-ext","clientId":"ext-client","tokenEndpoint":%q,"issuerUrl":"https://login.microsoftonline.com/t/v2.0","scopes":"api://x/codewhisperer:conversations offline_access","region":"eu-central-1"}`, fake.URL)
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
@@ -349,7 +392,9 @@ func TestApiImportCredentialsExternalIdpPreservesFullRecordIdentity(t *testing.T
 	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
 	defer auth.SetExternalIdpValidatorForTest(restore)
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 
 	const providedID = "11111111-2222-3333-4444-555555555555"
 	// Account-ID segment must be a real 12-digit AWS account id (kiroAccountPattern);
@@ -394,7 +439,9 @@ func TestApiImportCredentialsExternalIdpDerivesEndpointsFromUserId(t *testing.T)
 	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
 	defer auth.SetExternalIdpValidatorForTest(restore)
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 
 	// userId points at the fake so the derived tokenEndpoint hits it.
 	userID := fake.URL + "/5fbc183e-3d09-4043-b36f-0c49d3665977/v2.0.8db0e2eb-d491-4a1a-98f1-cbdc12bb60a0"
@@ -455,7 +502,9 @@ func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) 
 	jwt := "eyJhbGciOiJub25lIn0." +
 		base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"iss":%q,"exp":%d}`, fake.URL+"/"+tenant+"/v2.0", exp))) + "."
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 
 	body := fmt.Sprintf(`{"clientId":"fa6d79bf-cdaa-495e-8359-78aab7c7cd9b","accessToken":%q,"refreshToken":"rt","region":"eu-central-1"}`, jwt)
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
@@ -493,23 +542,13 @@ func TestApiImportCredentialsAPIKeySuccess(t *testing.T) {
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
-	// The import handler spawns a background, un-awaited model-list refresh
-	// for enabled accounts. Route it through a stub transport with no Proxy
-	// configured (rather than the real http.ProxyFromEnvironment-backed
-	// client) and restore to an equally inert stub afterward — never back to
-	// the real client — since the goroutine may still be in flight after this
-	// test returns and would otherwise poison TestBuildKiroTransport*, which
-	// relies on http.ProxyFromEnvironment reading env vars for the first time.
-	kiroRestHttpStore.Store(&http.Client{
-		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return nil, fmt.Errorf("network disabled in test")
-		}),
-	})
-	t.Cleanup(func() {
-		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
-	})
+	// apiImportCredentials schedules model discovery for enabled API-key
+	// accounts. Keep that worker on an inert REST client, then join the Handler
+	// before restoring the exact previous global client.
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 	body := `{"kiroApiKey":"ksk_test_import|eu-central-1","authMethod":"api_key","nickname":"cli-key"}`
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -560,7 +599,9 @@ func TestApiImportCredentialsBareApiKeyFieldNoAuthMethodDiscoversRegion(t *testi
 	}
 	stubProbeKiroApiKey(t, "eu-central-1")
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 	// Deliberately NO authMethod field — the whole point of this regression.
 	body := `{"kiroApiKey":"ksk_noauthmethod|eu-central-1"}`
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
@@ -593,7 +634,9 @@ func TestApiImportCredentialsBareAccessTokenApiKeyNoAuthMethodDiscoversRegion(t 
 	}
 	stubProbeKiroApiKey(t, "eu-central-1")
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 	body := `{"accessToken":"ksk_bareaccesstoken|eu-central-1"}`
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -619,19 +662,10 @@ func TestApiImportCredentialsAPIKeyDuplicateRejected(t *testing.T) {
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
-	// See TestApiImportCredentialsAPIKeySuccess: avoid ever restoring the real
-	// http.ProxyFromEnvironment-backed client, since the background model
-	// refresh goroutine may still be in flight after this test returns.
-	kiroRestHttpStore.Store(&http.Client{
-		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return nil, fmt.Errorf("network disabled in test")
-		}),
-	})
-	t.Cleanup(func() {
-		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
-	})
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 	body := `{"kiroApiKey":"ksk_dup_import","authMethod":"api_key"}`
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -668,16 +702,10 @@ func TestApiImportCredentialsAPIKeyDropsUnverifiedIdentityOnProbeFailure(t *test
 	}
 	// Network disabled → resolveApiKeyRegion's probe fails for every candidate
 	// region, exactly like TestApiImportCredentialsAPIKeySuccess.
-	kiroRestHttpStore.Store(&http.Client{
-		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return nil, fmt.Errorf("network disabled in test")
-		}),
-	})
-	t.Cleanup(func() {
-		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
-	})
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 	body := `{"kiroApiKey":"ksk_unverified|eu-central-1","authMethod":"api_key","email":"real-owner@example.com","userId":"real-owner-uid"}`
 	req := httptest.NewRequest("POST", "/auth/credentials", strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -775,7 +803,9 @@ func TestApiImportCliJsonBatch(t *testing.T) {
 	restore := auth.SetExternalIdpValidatorForTest(func(string) error { return nil })
 	defer auth.SetExternalIdpValidatorForTest(restore)
 
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
 	h := &Handler{pool: accountpool.GetPool()}
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 
 	body := `[
 	  {"auth_method":"external_idp","client_id":"c1","refresh_token":"rt1","token_endpoint":"` + idp.URL + `","email":"a@example.com","type":"kiro"},

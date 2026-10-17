@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"kiro-go/auth"
 	"kiro-go/config"
@@ -19,13 +21,49 @@ func copyRefreshCredentialState(dst *config.Account, src config.Account) {
 	dst.DispatchGeneration = src.DispatchGeneration
 }
 
-// refreshAccountToken serializes the complete Kiro OAuth rotation lifecycle.
-// It always refreshes from the authoritative persisted credential, commits the
-// access token + rotated refresh token + expiry + profile ARN as one state
-// transition, and only then rebuilds the runtime pool. Generation-aware callers
-// are fenced so an in-flight refresh can never publish into a delete/recreated
-// account that reused the same textual ID.
+func refreshCredentialStateChanged(before, after config.Account) bool {
+	return before.AccessToken != after.AccessToken ||
+		before.RefreshToken != after.RefreshToken ||
+		before.ExpiresAt != after.ExpiresAt ||
+		before.ProfileArn != after.ProfileArn
+}
+
 func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool, error) {
+	return h.refreshAccountTokenContext(context.Background(), account, force)
+}
+
+func (h *Handler) refreshAccountTokenContext(ctx context.Context, account *config.Account, force bool) (bool, error) {
+	return h.refreshAccountTokenWithPolicyContext(
+		ctx,
+		account,
+		force,
+		time.Duration(tokenRefreshSkewSeconds)*time.Second,
+		true,
+	)
+}
+
+func (h *Handler) refreshAccountTokenIfExpiringWithin(account *config.Account, minValidity time.Duration, reloadPool bool) (bool, error) {
+	return h.refreshAccountTokenIfExpiringWithinContext(context.Background(), account, minValidity, reloadPool)
+}
+
+func (h *Handler) refreshAccountTokenIfExpiringWithinContext(ctx context.Context, account *config.Account, minValidity time.Duration, reloadPool bool) (bool, error) {
+	return h.refreshAccountTokenWithPolicyContext(ctx, account, false, minValidity, reloadPool)
+}
+
+// refreshAccountTokenWithPolicy delegates the authoritative OAuth rotation
+// transaction to auth.RefreshToken. The auth package owns per-lifecycle
+// serialization and the lifecycle-CAS persistence boundary; this layer only
+// validates account kind, maps stale-lifecycle errors into request semantics,
+// and optionally republishes the committed config image into the runtime pool.
+// Background reconciliation batches pool publication by passing reloadPool=false.
+func (h *Handler) refreshAccountTokenWithPolicy(account *config.Account, force bool, minValidity time.Duration, reloadPool bool) (bool, error) {
+	return h.refreshAccountTokenWithPolicyContext(context.Background(), account, force, minValidity, reloadPool)
+}
+
+func (h *Handler) refreshAccountTokenWithPolicyContext(ctx context.Context, account *config.Account, force bool, minValidity time.Duration, reloadPool bool) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if account == nil || strings.TrimSpace(account.ID) == "" {
 		return false, fmt.Errorf("account is required for token refresh")
 	}
@@ -35,9 +73,6 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool
 	if !account.SupportsKiroTokenRefresh() {
 		return false, nil
 	}
-
-	h.tokenRefreshMu.Lock()
-	defer h.tokenRefreshMu.Unlock()
 
 	latest, ok := config.GetAccountByID(account.ID)
 	if !ok {
@@ -57,10 +92,14 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool
 		return false, nil
 	}
 
-	// A concurrent request may already have refreshed this same lifecycle while
-	// we waited for tokenRefreshMu. Adopt that complete persisted state and avoid
-	// another IdP request unless the caller explicitly requested a force refresh.
-	if !force && (working.ExpiresAt == 0 || time.Now().Unix() < working.ExpiresAt-tokenRefreshSkewSeconds) {
+	// Adopt a concurrent winner before entering auth. The auth layer repeats this
+	// check under its lifecycle lock, so a race between here and there still
+	// collapses to one IdP exchange.
+	if minValidity < 0 {
+		minValidity = 0
+	}
+	if !force && strings.TrimSpace(working.AccessToken) != "" &&
+		(working.ExpiresAt == 0 || time.Now().Before(time.Unix(working.ExpiresAt, 0).Add(-minValidity))) {
 		copyRefreshCredentialState(account, working)
 		return false, nil
 	}
@@ -68,60 +107,63 @@ func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool
 		return false, fmt.Errorf("account %s has no refresh token", working.ID)
 	}
 
-	refreshFn := auth.RefreshToken
+	before := working.Clone()
+	var err error
 	if force {
-		refreshFn = auth.RefreshTokenForce
+		_, _, _, _, err = auth.RefreshTokenForceContext(ctx, &working)
+	} else {
+		_, _, _, _, err = auth.RefreshTokenIfExpiringWithinContext(ctx, &working, minValidity)
 	}
-	accessToken, refreshToken, expiresAt, profileArn, err := refreshFn(&working)
 	if err != nil {
-		return false, &accountTokenRefreshError{err: err}
-	}
-	if strings.TrimSpace(refreshToken) == "" {
-		refreshToken = working.RefreshToken
-	}
-	if strings.TrimSpace(profileArn) == "" {
-		profileArn = working.ProfileArn
-	}
-
-	if generation != 0 {
-		applied, persistErr := config.UpdateAccountCredentialStateIfLifecycle(
-			working.ID,
-			generation,
-			accessToken,
-			refreshToken,
-			expiresAt,
-			profileArn,
-		)
-		if persistErr != nil {
-			return false, fmt.Errorf("persist refreshed token for account %s: %w", working.ID, persistErr)
-		}
-		if !applied {
+		if errors.Is(err, auth.ErrAccountLifecycleChanged) || errors.Is(err, auth.ErrAccountCredentialChanged) {
 			return false, errStaleAccountSelection
 		}
-	} else if err := config.UpdateAccountCredentialState(
-		working.ID,
-		accessToken,
-		refreshToken,
-		expiresAt,
-		profileArn,
-	); err != nil {
-		return false, fmt.Errorf("persist refreshed token for account %s: %w", working.ID, err)
+		var persistenceErr *auth.AccountCredentialPersistenceError
+		if errors.As(err, &persistenceErr) {
+			// A post-publication durability error is not a rollback: config already
+			// exposes C2. Re-read/adopt C2 and align the pool before propagating the
+			// durability error. A pre-publication failure keeps C1 canonical and the
+			// auth lifecycle entry retains C2 for a local-only retry.
+			if persistenceErr.Published {
+				persisted, ok := config.GetAccountByID(working.ID)
+				if !ok {
+					return false, errStaleAccountSelection
+				}
+				effectiveGeneration := generation
+				if effectiveGeneration == 0 {
+					effectiveGeneration = working.DispatchGeneration
+				}
+				if effectiveGeneration == 0 || persisted.DispatchGeneration != effectiveGeneration {
+					return false, errStaleAccountSelection
+				}
+				changed := refreshCredentialStateChanged(before, persisted)
+				copyRefreshCredentialState(account, persisted)
+				if reloadPool && changed && h.pool != nil {
+					h.pool.Reload()
+				}
+				return changed, fmt.Errorf("persist refreshed token for account %s: %w", working.ID, persistenceErr)
+			}
+			return false, fmt.Errorf("persist refreshed token for account %s: %w", working.ID, persistenceErr)
+		}
+		return false, &accountTokenRefreshError{err: err}
 	}
 
-	// Publication order is deliberate: the config transaction above is the
-	// authoritative commit. Runtime snapshots are rebuilt only after that commit
-	// succeeds, so no request can observe a new access token paired with an old
-	// rotated refresh token/profile ARN.
-	if h.pool != nil {
-		h.pool.Reload()
-	}
 	persisted, ok := config.GetAccountByID(working.ID)
 	if !ok {
 		return false, errStaleAccountSelection
 	}
-	if generation != 0 && persisted.DispatchGeneration != generation {
+	effectiveGeneration := generation
+	if effectiveGeneration == 0 {
+		effectiveGeneration = working.DispatchGeneration
+	}
+	if effectiveGeneration == 0 || persisted.DispatchGeneration != effectiveGeneration {
 		return false, errStaleAccountSelection
 	}
+
+	changed := refreshCredentialStateChanged(before, persisted)
 	copyRefreshCredentialState(account, persisted)
-	return true, nil
+	if reloadPool && changed && h.pool != nil {
+		h.pool.Reload()
+	}
+	return changed, nil
 }

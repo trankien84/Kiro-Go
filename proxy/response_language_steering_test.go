@@ -11,9 +11,9 @@ import (
 	"testing"
 )
 
-const phase65bLanguageMarker = "[Response language policy]"
+const responseLanguagePolicyMarker = "[Response language policy]"
 
-func initPhase65BConfig(t *testing.T) {
+func initResponseLanguageSteeringConfig(t *testing.T) {
 	t.Helper()
 	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatal(err)
@@ -35,8 +35,8 @@ func firstKiroPrimingContent(t *testing.T, payload *KiroPayload) string {
 	return first.Content
 }
 
-func TestPhase65BPreserveModeDoesNotInjectLanguageSteering(t *testing.T) {
-	initPhase65BConfig(t)
+func TestResponseLanguageSteeringPreserveModeDoesNotInjectLanguageSteering(t *testing.T) {
+	initResponseLanguageSteeringConfig(t)
 	if err := config.UpdateResponseLanguageConfig(config.ResponseLanguagePolicyPreserve, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestPhase65BPreserveModeDoesNotInjectLanguageSteering(t *testing.T) {
 	}
 	payload := ClaudeToKiro(req, false)
 	priming := firstKiroPrimingContent(t, payload)
-	if strings.Contains(priming, phase65bLanguageMarker) {
+	if strings.Contains(priming, responseLanguagePolicyMarker) {
 		t.Fatalf("preserve mode injected language steering: %q", priming)
 	}
 	if !strings.Contains(priming, "CLIENT_SYSTEM_RULE") {
@@ -58,8 +58,8 @@ func TestPhase65BPreserveModeDoesNotInjectLanguageSteering(t *testing.T) {
 	}
 }
 
-func TestPhase65BMatchUserSteeringAppliesToClaudeAndOpenAIKiroProjection(t *testing.T) {
-	initPhase65BConfig(t)
+func TestResponseLanguageSteeringMatchUserSteeringAppliesToClaudeAndOpenAIKiroProjection(t *testing.T) {
+	initResponseLanguageSteeringConfig(t)
 	if err := config.UpdateResponseLanguageConfig(config.ResponseLanguagePolicyMatchUser, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestPhase65BMatchUserSteeringAppliesToClaudeAndOpenAIKiroProjection(t *test
 	claudePayload := ClaudeToKiro(claudeReq, false)
 	claudePriming := firstKiroPrimingContent(t, claudePayload)
 	for _, want := range []string{
-		phase65bLanguageMarker,
+		responseLanguagePolicyMarker,
 		"latest substantive human user request",
 		"not from tool results, logs, source code, quoted material, metadata, assistant-generated text, or proxy-injected execution reminders",
 		"explicitly requests a response language",
@@ -94,7 +94,7 @@ func TestPhase65BMatchUserSteeringAppliesToClaudeAndOpenAIKiroProjection(t *test
 	}
 	openAIPayload := OpenAIToKiro(openAIReq, false)
 	openAIPriming := firstKiroPrimingContent(t, openAIPayload)
-	if !strings.Contains(openAIPriming, phase65bLanguageMarker) || !strings.Contains(openAIPriming, "latest substantive human user request") {
+	if !strings.Contains(openAIPriming, responseLanguagePolicyMarker) || !strings.Contains(openAIPriming, "latest substantive human user request") {
 		t.Fatalf("OpenAI Kiro projection missing match-user steering: %q", openAIPriming)
 	}
 	if got := extractOpenAIMessageText(openAIReq.Messages[0].Content); got != "Hãy tiếp tục công việc." {
@@ -102,8 +102,8 @@ func TestPhase65BMatchUserSteeringAppliesToClaudeAndOpenAIKiroProjection(t *test
 	}
 }
 
-func TestPhase65BMatchUserPolicyDoesNotTreatToolOutputAsLanguageSource(t *testing.T) {
-	initPhase65BConfig(t)
+func TestResponseLanguageSteeringMatchUserPolicyDoesNotTreatToolOutputAsLanguageSource(t *testing.T) {
+	initResponseLanguageSteeringConfig(t)
 	if err := config.UpdateResponseLanguageConfig(config.ResponseLanguagePolicyMatchUser, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -131,8 +131,8 @@ func TestPhase65BMatchUserPolicyDoesNotTreatToolOutputAsLanguageSource(t *testin
 	}
 }
 
-func TestPhase65BFixedLanguageUsesValidatedTagWithoutTranslatingTechnicalLiterals(t *testing.T) {
-	initPhase65BConfig(t)
+func TestResponseLanguageSteeringFixedLanguageUsesValidatedTagWithoutTranslatingTechnicalLiterals(t *testing.T) {
+	initResponseLanguageSteeringConfig(t)
 	if err := config.UpdateResponseLanguageConfig(config.ResponseLanguagePolicyFixed, "vi"); err != nil {
 		t.Fatal(err)
 	}
@@ -145,8 +145,8 @@ func TestPhase65BFixedLanguageUsesValidatedTagWithoutTranslatingTechnicalLiteral
 	}
 }
 
-func TestPhase65BSettingsAPIValidatesAndPersistsLanguagePolicy(t *testing.T) {
-	initPhase65BConfig(t)
+func TestResponseLanguageSteeringSettingsAPIValidatesAndPersistsLanguagePolicy(t *testing.T) {
+	initResponseLanguageSteeringConfig(t)
 	h := &Handler{}
 
 	badBody := []byte(`{"requireApiKey":true,"responseLanguagePolicy":"fixed","responseLanguage":"../../vi"}`)

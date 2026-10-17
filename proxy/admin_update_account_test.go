@@ -32,9 +32,12 @@ func TestApiUpdateAccountPersistsBedrockRegionChange(t *testing.T) {
 		t.Fatalf("add account: %v", err)
 	}
 
+	restoreBedrockClient := installNoNetworkBedrockHTTPClientForTest()
+
 	p := accountpool.GetPool()
 	p.Reload()
 	h := &Handler{pool: p}
+	cleanupHandlerBeforeRestore(t, h, restoreBedrockClient)
 
 	body := bytes.NewBufferString(`{"region":"eu-west-1"}`)
 	req := httptest.NewRequest(http.MethodPut, "/accounts/bedrock-1", body)

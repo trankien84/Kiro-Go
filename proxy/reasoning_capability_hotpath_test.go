@@ -51,6 +51,7 @@ func TestReasoningCapabilityForModelDoesNotRefreshInline(t *testing.T) {
 	// never reach the real ProxyFromEnvironment-backed client (that would cache
 	// env vars in a process-wide sync.Once and poison later proxy tests).
 	release := make(chan struct{})
+	previousRestClient := kiroRestHttpStore.Load()
 	kiroRestHttpStore.Store(&http.Client{
 		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			<-release
@@ -59,11 +60,11 @@ func TestReasoningCapabilityForModelDoesNotRefreshInline(t *testing.T) {
 	})
 	p := accountpool.GetPool()
 	p.Reload()
-	h := &Handler{pool: p}
+	h := &Handler{pool: p, backgroundTaskOwner: true}
 	t.Cleanup(func() {
 		close(release)
-		waitForWarmToFinish(t, h)
-		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+		h.Close()
+		kiroRestHttpStore.Store(previousRestClient)
 	})
 
 	// Empty cachedModels = the cold-cache path under test.
@@ -109,6 +110,7 @@ func TestWarmModelsCacheAsyncSingleFlights(t *testing.T) {
 	// refresh and the count would be racy rather than wrong.
 	release := make(chan struct{})
 	var calls int32
+	previousRestClient := kiroRestHttpStore.Load()
 	kiroRestHttpStore.Store(&http.Client{
 		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			atomic.AddInt32(&calls, 1)
@@ -118,11 +120,11 @@ func TestWarmModelsCacheAsyncSingleFlights(t *testing.T) {
 	})
 	p := accountpool.GetPool()
 	p.Reload()
-	h := &Handler{pool: p}
+	h := &Handler{pool: p, backgroundTaskOwner: true}
 	t.Cleanup(func() {
 		close(release)
-		waitForWarmToFinish(t, h)
-		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
+		h.Close()
+		kiroRestHttpStore.Store(previousRestClient)
 	})
 
 	for i := 0; i < 8; i++ {
@@ -181,19 +183,21 @@ func TestWarmModelsCacheAsyncIsRateLimited(t *testing.T) {
 	}
 
 	var calls int32
+	previousRestClient := kiroRestHttpStore.Load()
 	kiroRestHttpStore.Store(&http.Client{
 		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			atomic.AddInt32(&calls, 1)
 			return nil, errTest("network disabled in test")
 		}),
 	})
-	t.Cleanup(func() {
-		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
-	})
 
 	p := accountpool.GetPool()
 	p.Reload()
-	h := &Handler{pool: p}
+	h := &Handler{pool: p, backgroundTaskOwner: true}
+	t.Cleanup(func() {
+		h.Close()
+		kiroRestHttpStore.Store(previousRestClient)
+	})
 
 	h.warmModelsCacheAsync()
 	waitForWarmToFinish(t, h)

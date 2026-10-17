@@ -24,6 +24,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -43,6 +44,10 @@ const (
 	bedrockRegionNegativeTTL = 3 * time.Minute
 	bedrockCanaryConcurrency = 6
 )
+
+// bedrockCanaryTimeout bounds a single one-token prewarm probe independently of
+// the five-minute streaming client timeout. Tests may shorten it.
+var bedrockCanaryTimeout = 30 * time.Second
 
 // bedrockRegionRoute is a learned routing verdict for one (account, model).
 type bedrockRegionRoute struct {
@@ -341,7 +346,17 @@ type BedrockRegionModel struct {
 // background off an explicit refresh, so its per-model token cost (max_tokens 1) is
 // paid only when the operator asks.
 func (h *Handler) prewarmBedrockRegions(account *config.Account) []BedrockRegionModel {
-	models := h.cachedOrDiscoverBedrockModels(account)
+	return h.prewarmBedrockRegionsContext(context.Background(), account)
+}
+
+func (h *Handler) prewarmBedrockRegionsContext(ctx context.Context, account *config.Account) []BedrockRegionModel {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	models := h.cachedOrDiscoverBedrockModelsContext(ctx, account)
+	if ctx.Err() != nil {
+		return nil
+	}
 	cands := candidateRegions(account)
 	rows := make([]BedrockRegionModel, len(models))
 
@@ -349,15 +364,23 @@ func (h *Handler) prewarmBedrockRegions(account *config.Account) []BedrockRegion
 	var wg sync.WaitGroup
 	for i, modelID := range models {
 		i, modelID := i, modelID
-		wg.Add(1)
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+			wg.Add(1)
+		case <-ctx.Done():
+			wg.Wait()
+			return rows
+		}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			winner := ""
 			anyReached := false
 			for _, region := range cands {
-				callable, reached := h.canaryBedrockRegion(account, modelID, region)
+				if ctx.Err() != nil {
+					return
+				}
+				callable, reached := h.canaryBedrockRegionContext(ctx, account, modelID, region)
 				if reached {
 					anyReached = true
 				}
@@ -394,6 +417,13 @@ func (h *Handler) prewarmBedrockRegions(account *config.Account) []BedrockRegion
 // real request would. 200/429 and any non-access error mean "access ok"; an
 // access/region error means not callable here.
 func (h *Handler) canaryBedrockRegion(account *config.Account, modelID, region string) (callable, reached bool) {
+	return h.canaryBedrockRegionContext(context.Background(), account, modelID, region)
+}
+
+func (h *Handler) canaryBedrockRegionContext(ctx context.Context, account *config.Account, modelID, region string) (callable, reached bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var req *http.Request
 	var payload []byte
 	var err error
@@ -407,11 +437,14 @@ func (h *Handler) canaryBedrockRegion(account *config.Account, modelID, region s
 	if err != nil {
 		return false, false
 	}
+	opCtx, cancel := context.WithTimeout(ctx, bedrockCanaryTimeout)
+	defer cancel()
+	req = req.WithContext(opCtx)
 	req.Header.Set("Accept", "application/json")
 	if err := authorizeBedrockRequest(account, req, payload, region); err != nil {
 		return false, false
 	}
-	resp, err := bedrockHTTPClient(account).Do(req)
+	resp, err := bedrockHTTPClientFor(account).Do(req)
 	if err != nil {
 		return false, false // transport error: couldn't determine
 	}

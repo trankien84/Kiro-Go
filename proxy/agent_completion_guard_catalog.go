@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"sort"
 	"strings"
 )
 
@@ -27,6 +26,8 @@ type completionGuardMCPServer struct {
 }
 
 type completionGuardMCPToolset struct {
+	// Nil means dynamic; a non-nil empty map means explicitly pinned to zero tools.
+	PinnedMembers map[string]bool
 	ServerName    string
 	DefaultConfig completionGuardMCPToolConfig
 	Configs       map[string]completionGuardMCPToolConfig
@@ -55,19 +56,56 @@ type completionGuardVisibility struct {
 	DeferredEnabledCount    int
 }
 
+// The final MCP availability snapshot is checked for *new* response tool calls.
+// Historical tool calls are validated during temporal replay, not against this
+// final snapshot, so later removal cannot invalidate earlier completed uses.
+type completionGuardMCPFinalAvailability struct {
+	Active   map[string]bool
+	Members  map[string]bool
+	Loaded   map[string]bool
+	Listings map[string]map[string]bool
+}
+
+// A tool's lifecycle is not a single availability flag. Search only changes
+// Loaded, while tool_removal revokes Offered. Epoch changes when its definition
+// is replaced, so historical references cannot activate a later definition.
+type completionGuardCustomToolState struct {
+	Offered  bool
+	Loaded   bool
+	Deferred bool
+	Epoch    uint64
+}
+
+func (state completionGuardCustomToolState) Callable() bool {
+	return state.Offered && state.Loaded
+}
+
+type completionGuardHistoricalCustomReference struct {
+	Deferred bool
+	Epoch    uint64
+}
+
 type completionGuardNormalizedCatalog struct {
-	Entries                  []completionGuardCatalogTool
-	ExplicitToolsByName      map[string]completionGuardCatalogTool
-	ClientToolsByName        map[string]completionGuardCatalogTool
-	ServerCapabilitiesByName map[string]completionGuardServerToolCapability
-	MCPServersByName         map[string]completionGuardMCPServer
-	MCPToolsetsByName        map[string]completionGuardMCPToolset
-	DeclaredToolCount        int
-	HasToolSearch            bool
-	HasAdvisor               bool
-	ProgrammaticToolCalling  bool
-	ProgrammaticRequested    bool
-	Visibility               completionGuardVisibility
+	// Per-search-call identities recorded during temporal replay. Historical
+	// references must not be re-resolved against the final tool catalog.
+	HistoricalMCPReferences    map[string]map[string]claudeMCPReferenceIdentity
+	HistoricalCustomReferences map[string]map[string]completionGuardHistoricalCustomReference
+	MCPFinalAvailability       *completionGuardMCPFinalAvailability
+	Entries                    []completionGuardCatalogTool
+	ExplicitToolsByName        map[string]completionGuardCatalogTool
+	ClientToolsByName          map[string]completionGuardCatalogTool
+	ServerCapabilitiesByName   map[string]completionGuardServerToolCapability
+	MCPServersByName           map[string]completionGuardMCPServer
+	MCPToolsetsByName          map[string]completionGuardMCPToolset
+	NativeToolsets             map[string]bool                           // browser/computer member calls are provider-defined
+	TemporalHistoryValidated   bool                                      // history already replayed against this request-local catalog
+	CustomFinalState           map[string]completionGuardCustomToolState // independent offered/loaded/definition-epoch snapshot
+	DeclaredToolCount          int
+	HasToolSearch              bool
+	HasAdvisor                 bool
+	ProgrammaticToolCalling    bool
+	ProgrammaticRequested      bool
+	Visibility                 completionGuardVisibility
 }
 
 func completionGuardParseOptionalBool(
@@ -209,8 +247,18 @@ func completionGuardMCPToolAllowed(
 	if !exists {
 		return false
 	}
+	if final := catalog.MCPFinalAvailability; final != nil {
+		if !final.Active[serverName] || claudeMCPMemberExplicitlyRemoved(final.Members, serverName, toolName) {
+			return false
+		}
+		if !claudeMCPMemberAllowed(toolset, final.Listings[serverName], toolName) {
+			return false
+		}
+		_, deferred, _ := completionGuardMCPConfigEffective(toolset, toolName)
+		return !deferred || final.Loaded[serverName+"\x00"+toolName]
+	}
 	enabled, _, _ := completionGuardMCPConfigEffective(toolset, toolName)
-	return enabled
+	return enabled && (toolset.PinnedMembers == nil || toolset.PinnedMembers[toolName])
 }
 
 type completionGuardCatalogBuildOptions struct {
@@ -239,11 +287,50 @@ func completionGuardBuildNormalizedCatalogWithOptions(
 		ServerCapabilitiesByName: make(map[string]completionGuardServerToolCapability),
 		MCPServersByName:         make(map[string]completionGuardMCPServer),
 		MCPToolsetsByName:        make(map[string]completionGuardMCPToolset),
+		NativeToolsets:           make(map[string]bool),
 	}
 	if req == nil {
 		return catalog, ""
 	}
 	catalog.DeclaredToolCount = len(req.Tools)
+
+	// Native toolset members use the same short names as ordinary tools.
+	// toolset_name disambiguates them, so reserve only the toolset name itself.
+	modernComputer, legacyComputer := false, false
+	browserToolsets := 0
+	computerToolsets := 0
+	for _, tool := range req.Tools {
+		kind := strings.ToLower(strings.TrimSpace(tool.Type))
+		name := strings.TrimSpace(tool.Name)
+		switch kind {
+		case "computer_toolset_20260801":
+			modernComputer = true
+			computerToolsets++
+		case "browser_toolset_20260801":
+			browserToolsets++
+		case "computer_20251124", "computer_20250124":
+			legacyComputer = true
+		}
+		if strings.EqualFold(name, "computer") && kind != "computer_toolset_20260801" {
+			legacyComputer = true
+		}
+	}
+	if computerToolsets > 1 {
+		return catalog, "computer_toolset_20260801 must be declared only once"
+	}
+	if browserToolsets > 1 {
+		return catalog, "browser_toolset_20260801 must be declared only once"
+	}
+	if modernComputer && legacyComputer {
+		return catalog, "computer_toolset_20260801 cannot be combined with the legacy computer tool or another tool named computer"
+	}
+	if browserToolsets > 0 {
+		for _, tool := range req.Tools {
+			if strings.EqualFold(strings.TrimSpace(tool.Name), "browser") {
+				return catalog, "browser_toolset_20260801 cannot be combined with a tool named browser"
+			}
+		}
+	}
 
 	servers, reason := completionGuardBuildMCPServers(req)
 	if reason != "" {
@@ -255,6 +342,50 @@ func completionGuardBuildNormalizedCatalogWithOptions(
 	for index, tool := range req.Tools {
 		name := strings.TrimSpace(tool.Name)
 		toolType := strings.ToLower(strings.TrimSpace(tool.Type))
+		if toolType == "browser_toolset_20260801" {
+			if name != "" {
+				return catalog, fmt.Sprintf("tools[%d].name is not allowed on browser_toolset_20260801", index)
+			}
+			for _, forbidden := range []string{"strict", "defer_loading", "input_examples", "display_width_px", "display_height_px", "allowed_callers"} {
+				if _, exists := tool.Extra[forbidden]; exists {
+					return catalog, fmt.Sprintf("tools[%d].%s is not allowed on browser_toolset_20260801", index, forbidden)
+				}
+			}
+			if raw, exists := tool.Extra["configs"]; exists {
+				var configs map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &configs); err != nil || configs == nil {
+					return catalog, fmt.Sprintf("tools[%d].configs must be an object", index)
+				}
+				for memberName, rawConfig := range configs {
+					var config map[string]json.RawMessage
+					if strings.TrimSpace(memberName) == "" || json.Unmarshal(rawConfig, &config) != nil || config == nil {
+						return catalog, fmt.Sprintf("tools[%d].configs[%q] must be an object", index, memberName)
+					}
+					if enabled, exists := config["enabled"]; exists {
+						var value bool
+						if json.Unmarshal(enabled, &value) != nil {
+							return catalog, fmt.Sprintf("tools[%d].configs[%q].enabled must be boolean", index, memberName)
+						}
+					}
+				}
+			}
+			catalog.NativeToolsets["browser"] = true
+			continue
+		}
+		if toolType == "computer_toolset_20260801" {
+			if name != "" {
+				return catalog, fmt.Sprintf("tools[%d].name is not allowed on computer_toolset_20260801", index)
+			}
+			for _, forbidden := range []string{"strict", "defer_loading", "input_examples", "display_width_px", "display_height_px", "display_number", "enable_zoom"} {
+				if _, exists := tool.Extra[forbidden]; exists {
+					return catalog, fmt.Sprintf("tools[%d].%s is not allowed on computer_toolset_20260801", index, forbidden)
+				}
+			}
+			// Member names and configs belong to the terminal provider. We do
+			// not synthesize fixed-name tools or execute computer actions here.
+			catalog.NativeToolsets["computer"] = true
+			continue
+		}
 		if toolType == "mcp_toolset" {
 			for _, forbidden := range []string{"name", "strict", "allowed_callers", "defer_loading"} {
 				if forbidden == "name" {
@@ -309,7 +440,12 @@ func completionGuardBuildNormalizedCatalogWithOptions(
 					configs[configName] = config
 				}
 			}
+			pinned, pinnedErr := completionGuardParseMCPPinnedMembers(tool.Extra, fmt.Sprintf("tools[%d]", index))
+			if pinnedErr != nil {
+				return catalog, pinnedErr.Error()
+			}
 			toolset := completionGuardMCPToolset{
+				PinnedMembers: pinned,
 				ServerName:    serverName,
 				DefaultConfig: defaultConfig,
 				Configs:       configs,
@@ -365,7 +501,7 @@ func completionGuardBuildNormalizedCatalogWithOptions(
 		}
 		if !completionGuardValidToolName(name) {
 			return catalog, fmt.Sprintf(
-				"tools[%d].name %q must match ^[a-zA-Z0-9_-]{1,64}$",
+				"tools[%d].name %q must match ^[a-zA-Z0-9_-]{1,128}$",
 				index,
 				name,
 			)
@@ -486,7 +622,7 @@ func completionGuardBuildNormalizedCatalogWithOptions(
 	}
 
 	for serverName := range servers {
-		if _, exists := catalog.MCPToolsetsByName[serverName]; !exists {
+		if _, exists := catalog.MCPToolsetsByName[serverName]; !exists && !claudeHasInlineMCPDefinition(req.Messages, serverName) {
 			return catalog, fmt.Sprintf("MCP server %q must be referenced by exactly one mcp_toolset", serverName)
 		}
 	}
@@ -656,46 +792,4 @@ func (catalog *completionGuardNormalizedCatalog) HasMCPToolset(name string) bool
 	}
 	_, exists := catalog.MCPToolsetsByName[strings.TrimSpace(name)]
 	return exists
-}
-
-type completionGuardMCPToolSearchCandidate struct {
-	ServerName     string
-	Enabled        bool
-	Deferred       bool
-	ExplicitConfig bool
-	DynamicDefault bool
-}
-
-func completionGuardCatalogMCPToolSearchCandidates(
-	catalog *completionGuardNormalizedCatalog,
-	toolName string,
-) []completionGuardMCPToolSearchCandidate {
-	if catalog == nil {
-		return nil
-	}
-	toolName = strings.TrimSpace(toolName)
-	if toolName == "" {
-		return nil
-	}
-	names := make([]string, 0, len(catalog.MCPToolsetsByName))
-	for serverName := range catalog.MCPToolsetsByName {
-		names = append(names, serverName)
-	}
-	sort.Strings(names)
-	candidates := make([]completionGuardMCPToolSearchCandidate, 0, len(names))
-	for _, serverName := range names {
-		toolset := catalog.MCPToolsetsByName[serverName]
-		enabled, deferred, explicit := completionGuardMCPConfigEffective(toolset, toolName)
-		if !enabled || !deferred {
-			continue
-		}
-		candidates = append(candidates, completionGuardMCPToolSearchCandidate{
-			ServerName:     serverName,
-			Enabled:        enabled,
-			Deferred:       deferred,
-			ExplicitConfig: explicit,
-			DynamicDefault: !explicit,
-		})
-	}
-	return candidates
 }

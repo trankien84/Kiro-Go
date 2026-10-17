@@ -54,6 +54,7 @@ func markAccountLifecycleDeletedLocked(id string) {
 		accountLifecycleGenerationByID[id] = generation
 	}
 	accountLifecyclePresentByID[id] = false
+	forgetAccountInfoRevisionLocked(id)
 }
 
 // accountDispatchIdentityChanged reports whether an UpdateAccount/Load replaced
@@ -160,6 +161,7 @@ func GetAccountLifecycleGeneration(id string) (uint64, bool) {
 func cloneAccountWithLifecycleLocked(account Account) Account {
 	out := account.Clone()
 	out.DispatchGeneration = accountLifecycleGenerationLocked(account.ID)
+	out.AccountInfoRevision = accountInfoRevisionLocked(account.ID)
 	return out
 }
 
@@ -257,7 +259,11 @@ func UpdateAccountInfoIfLifecycle(id string, generation uint64, info AccountInfo
 		return false, nil
 	}
 	found, published, err := publishAccountByIDLocked(id, false, func(account *Account) error { applyAccountInfo(account, info); return nil })
-	return found && published, err
+	applied := found && published
+	if applied {
+		bumpAccountInfoRevisionLocked(id)
+	}
+	return applied, err
 }
 
 // UpdateAccountRegionIfLifecycle persists a validated region only if the

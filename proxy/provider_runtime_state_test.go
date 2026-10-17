@@ -7,6 +7,13 @@ import (
 	"kiro-go/config"
 )
 
+func initProviderRuntimeTestConfig(t *testing.T) {
+	t.Helper()
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+}
+
 func freshProviderSnapshot(models []ModelInfo, metadata map[string]directAnthropicModelMetadata) accountModelSnapshot {
 	now := time.Now()
 	return accountModelSnapshot{
@@ -111,6 +118,7 @@ func TestBuildEnabledModelUnionExpiresStaleSnapshots(t *testing.T) {
 }
 
 func TestProviderCooldownAndVerifiedModelDenialAreScoped(t *testing.T) {
+	initProviderRuntimeTestConfig(t)
 	h := &Handler{
 		providerCooldownUntil:    make(map[accountLifecycleKey]time.Time),
 		providerModelDeniedUntil: make(map[accountLifecycleKey]map[string]time.Time),
@@ -536,6 +544,7 @@ func TestProviderRuntimeDiagnosticsDoesNotExposeExpiredBlocks(t *testing.T) {
 }
 
 func TestDirectAnthropicDiscoveryFailureUsesProviderPolicy(t *testing.T) {
+	initProviderRuntimeTestConfig(t)
 	h := &Handler{
 		providerCooldownUntil:    make(map[accountLifecycleKey]time.Time),
 		providerModelDeniedUntil: make(map[accountLifecycleKey]map[string]time.Time),
@@ -562,6 +571,7 @@ func TestDirectAnthropicDiscoveryFailureUsesProviderPolicy(t *testing.T) {
 }
 
 func TestRebuildEnabledModelUnionPrunesExpiredProviderBlocks(t *testing.T) {
+	initProviderRuntimeTestConfig(t)
 	h := &Handler{
 		accountModelSnapshots:     make(map[accountLifecycleKey]accountModelSnapshot),
 		providerCooldownUntil:     testRuntimeCooldowns(map[string]time.Time{"account-a": time.Now().Add(-time.Minute)}),
@@ -575,6 +585,7 @@ func TestRebuildEnabledModelUnionPrunesExpiredProviderBlocks(t *testing.T) {
 }
 
 func TestCredentialFailureDropsLearnedModelSnapshot(t *testing.T) {
+	initProviderRuntimeTestConfig(t)
 	h := &Handler{
 		accountModelSnapshots: testRuntimeSnapshots(map[string]accountModelSnapshot{
 			"account-a": {Models: []ModelInfo{{ModelId: "claude-a"}}},
