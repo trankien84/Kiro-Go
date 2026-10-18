@@ -18,7 +18,35 @@ Các chính sách tenant Microsoft 365 như MFA và Conditional Access là lý d
 
 **Mã nguồn:** [`auth/microsoft_sso.go`](../../../auth/microsoft_sso.go), [`auth/oidc.go`](../../../auth/oidc.go), [`auth/kiro_sso.go`](../../../auth/kiro_sso.go), [`config/account_credentials.go`](../../../config/account_credentials.go), [`proxy/handler.go`](../../../proxy/handler.go). **Kiểm thử:** [`auth/microsoft_sso_test.go`](../../../auth/microsoft_sso_test.go), [`proxy/microsoft_lifecycle_test.go`](../../../proxy/microsoft_lifecycle_test.go).
 
-## 2. Mọi đường import đều dùng chung classifier
+## 2. Hai luồng SSO trên trình duyệt và nơi nhận callback
+
+Kiro-Go có **hai cách đăng nhập khác nhau**. Cả hai đều dùng cổng redirect cố định `http://localhost:3128`, nhưng chỉ một cách cần tiến trình lắng nghe cổng này.
+
+| Luồng | Lựa chọn trên Admin / API | Cách nhận callback | Có cần tunnel khi dùng máy từ xa? |
+| --- | --- | --- | --- |
+| **Microsoft Enterprise SSO thủ công** | Microsoft Enterprise SSO; `/admin/api/auth/microsoft-sso/start`, `/complete`, `/select-profile`, `/cancel` | Trình duyệt chuyển tới localhost và có thể báo không kết nối được. **Người dùng sao chép nguyên URL dán vào Admin hai lần** (bước Kiro Portal và bước Microsoft). Backend không mở listener `3128` cho luồng này. | **Không.** Dùng trình duyệt trên máy cá nhân; không cần public cổng callback hay SSH tunnel. |
+| **Kiro Hosted SSO có listener** | Kiro Hosted SSO; `/admin/api/auth/kiro-sso/start`, `/poll`, `/select-profile`, `/cancel` | Backend mở listener HTTP tạm thời ở `3128`, tự nhận redirect và Admin poll trạng thái. | Thường phải mở trình duyệt ngay trên máy host chạy server, hoặc chủ động cấu hình tunnel/network phù hợp. `localhost` của máy cá nhân không tự trỏ tới VPS. |
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"nodeSpacing": 75, "rankSpacing": 85, "wrappingWidth": 320, "minNodeWidth": 260, "curve": "linear"}}}%%
+flowchart TD
+    Choose{"Chọn cách đăng nhập SSO"}
+    Choose -->|"Microsoft thủ công"| Manual["Mở trang đăng nhập trên<br/>trình duyệt máy bất kỳ"]
+    Manual --> Paste1["Sao chép URL callback Kiro Portal<br/>rồi dán vào Admin"]
+    Paste1 --> Paste2["Đăng nhập Microsoft và MFA<br/>dán URL callback thứ hai"]
+    Paste2 --> Exchange["Server kiểm tra session và PKCE<br/>đổi authorization code lấy token"]
+    Choose -->|"Kiro Hosted"| Hosted["Server mở listener tạm<br/>trên cổng 3128"]
+    Hosted --> Browser["Dùng trình duyệt có localhost:3128<br/>truy cập được listener"]
+    Browser --> Poll["Server nhận redirect<br/>Admin poll trạng thái"]
+```
+
+**Cách dùng Microsoft thủ công:** Trong Admin, bắt đầu đăng nhập và mở URL Kiro được trả về. Sau khi đăng nhập Kiro Portal, sao chép **nguyên** `http://localhost:3128/signin/callback?...` trên thanh địa chỉ, kể cả khi trình duyệt báo không kết nối được localhost, rồi dán vào Admin. Tiếp tục với URL đăng nhập Microsoft mà Admin cung cấp, hoàn tất MFA nếu được yêu cầu. Sau đó sao chép **nguyên** `http://localhost:3128/oauth/callback?...` và dán lần thứ hai. Backend kiểm tra `state`, PKCE, đổi code lấy token và có thể yêu cầu chọn Kiro profile. Không chia sẻ URL callback vì chúng chứa dữ liệu đăng nhập tạm thời. Phiên có hạn **10 phút**; hết hạn phải bắt đầu lại.
+
+**Vì sao Compose vẫn có cổng 3128?** File Compose giữ `127.0.0.1:3128:3128` cùng `KIRO_SSO_CALLBACK_BIND=0.0.0.0` để phục vụ **Kiro Hosted SSO**, không phải Microsoft thủ công. Host chỉ publish loopback nhưng listener bind toàn interface **bên trong container** có thể bị container khác cùng mạng truy cập trong lúc đăng nhập. Hãy cô lập mạng Docker hoặc dùng luồng thủ công. Không xóa cấu hình này khi còn cần luồng Hosted.
+
+**Mã nguồn:** [`auth/microsoft_sso.go`](../../../auth/microsoft_sso.go), [`auth/kiro_sso.go`](../../../auth/kiro_sso.go), [`proxy/handler.go`](../../../proxy/handler.go), [`docker-compose.yml`](../../../docker-compose.yml). **Kiểm thử:** [`auth/microsoft_sso_test.go`](../../../auth/microsoft_sso_test.go), [`auth/kiro_sso_test.go`](../../../auth/kiro_sso_test.go), [`proxy/microsoft_handler_test.go`](../../../proxy/microsoft_handler_test.go).
+
+## 3. Mọi đường import đều dùng chung classifier
 
 ```mermaid
 %%{init: {"htmlLabels": false, "flowchart": {"nodeSpacing": 75, "rankSpacing": 90, "wrappingWidth": 270, "minNodeWidth": 220, "curve": "linear"}}}%%
@@ -61,7 +89,7 @@ flowchart TD
 
 **Mã nguồn:** [`docker-compose.yml`](../../../docker-compose.yml), [`proxy/import_watcher.go`](../../../proxy/import_watcher.go).
 
-## 3. Lỗi refresh OAuth không chỉ có một loại ban
+## 4. Lỗi refresh OAuth không chỉ có một loại ban
 
 Refresh error được phân thành **retryable**, **credential-terminal** và **configuration-terminal**. `OAuthTokenEndpointError` giữ error code chuẩn tách khỏi lời mô tả; không được suy chính sách chỉ từ HTTP 400 hoặc prose. Rotated refresh token rất nhạy cảm: nếu IdP đã rotate thành công nhưng persist local thất bại, không được âm thầm bỏ token mới.
 
@@ -95,13 +123,13 @@ Worker bất đồng bộ dùng snapshot credential hiện tại để gọi tok
 
 Code dùng structured failure disposition thay vì coi mọi HTTP 400 là credential hỏng vĩnh viễn. Lỗi mạng/rate-limit có thể retry; invalid credential và sai client config đòi hành động xử lý khác nhau.
 
-## 4. Dò lại region cho Kiro API Key
+## 5. Dò lại region cho Kiro API Key
 
 Region reprobe chỉ dành cho một số lỗi xác thực **Kiro API Key** và có giới hạn lần thử; không chạy cho mọi provider hoặc mọi lỗi. Các candidate region phải được validate. Probe thành công ở REST/control plane **chưa đủ** để persist region runtime mới: phải retry thành công trên Kiro runtime thực tế. Nếu retry thất bại, khôi phục region trước đó. Sau khi đã emit output cho client thì không reprobe/replay original request nhằm tránh trùng kết quả.
 
 **Mã nguồn:** [`proxy/kiro_api.go`](../../../proxy/kiro_api.go) (`reprobeApiKeyRegion`), [`config/account_lifecycle_generation.go`](../../../config/account_lifecycle_generation.go), [`proxy/kiro.go`](../../../proxy/kiro.go). **Kiểm thử:** [`proxy/kiro_apikey_region_test.go`](../../../proxy/kiro_apikey_region_test.go).
 
-## 5. Diagnostics chỉ đọc và an toàn vận hành
+## 6. Diagnostics chỉ đọc và an toàn vận hành
 
 - Xem dữ liệu trong `data/` và các cache mount là secret; bảo vệ file permissions và Docker volume.
 - Không log JWT, access/refresh token, toàn bộ `Authorization` header hoặc file CLI JSON có credential thật.

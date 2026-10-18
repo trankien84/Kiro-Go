@@ -51,9 +51,9 @@ KIRO_PORT=127.0.0.1:8080 docker compose up -d --build
 curl -fsS http://localhost:8080/health
 ```
 
-Compose **builds from this checkout**, mounts `./data` at `/app/data`, exposes the API on host port `8080` by default (the example restricts it to loopback with `KIRO_PORT=127.0.0.1:8080`), and binds the Microsoft SSO browser callback to host loopback `127.0.0.1:3128`. To change the published API port, use `KIRO_PORT=127.0.0.1:9090 docker compose up -d --build` for local-only access; the service still listens on container port `8080`. These commands explicitly clone the **`main` branch**.
+Compose **builds from this checkout**, mounts `./data` at `/app/data`, exposes the API on host port `8080` by default (the example restricts it to loopback with `KIRO_PORT=127.0.0.1:8080`), and publishes `127.0.0.1:3128` for the **listener-based Kiro Hosted SSO** flow. The separate **manual Microsoft SSO** flow needs no listener or SSH tunnel. To change the published API port, use `KIRO_PORT=127.0.0.1:9090 docker compose up -d --build` for local-only access; the service still listens on container port `8080`. These commands explicitly clone the **`main` branch**.
 
-> **Security:** The supplied Compose file does **not** forward a host `ADMIN_PASSWORD` environment variable. The Compose default without this loopback override exposes the API on all host interfaces. On the first local start, sign in with the fresh-config password `changeme` and change it immediately in the admin UI **before allowing network access**; alternatively use a private Compose override that explicitly sets `ADMIN_PASSWORD` in the container. Compose enables `KIRO_IMPORT_WATCH=1`. Anyone able to write to `./data/imports` can cause accounts to be imported without the admin password. Keep that directory as restricted as `./data/config.json`, or set `KIRO_IMPORT_WATCH=0`. For remote deployments, use HTTPS and restrict access to `/admin`. The Microsoft SSO callback assumes a browser on the **Docker host**, not a remote workstation.
+> **Security:** The supplied Compose file does **not** forward a host `ADMIN_PASSWORD` environment variable. The Compose default without this loopback override exposes the API on all host interfaces. On the first local start, sign in with the fresh-config password `changeme` and change it immediately in the admin UI **before allowing network access**; alternatively use a private Compose override that explicitly sets `ADMIN_PASSWORD` in the container. Compose enables `KIRO_IMPORT_WATCH=1`. Anyone able to write to `./data/imports` can cause accounts to be imported without the admin password. Keep that directory as restricted as `./data/config.json`, or set `KIRO_IMPORT_WATCH=0`. For remote deployments, use HTTPS and restrict access to `/admin`. Only **Kiro Hosted SSO** requires a browser able to reach the server-side callback listener at `localhost:3128` (normally a browser on the Docker host). **Manual Microsoft SSO** works from a remote browser by copying the two redirect URLs into Admin; no inbound `3128` connection or tunnel is required. Publishing the port in Compose does not make a remote browser’s `localhost` point to the VPS.
 
 ### Docker build and run (without Compose)
 
@@ -68,7 +68,7 @@ docker run -d \
   kiro-go:local
 ```
 
-Replace `/absolute/path/to/data` with an actual writable host directory. This standalone command does **not** mount the IDE cache or publish the Enterprise SSO callback port; use Compose or provide those settings explicitly if needed. It also does not enable the import watcher unless requested.
+Replace `/absolute/path/to/data` with an actual writable host directory. This standalone command does **not** mount the IDE cache or publish the **Kiro Hosted SSO listener** port; use Compose or provide those settings only for that listener-based flow. **Manual Microsoft SSO** does not need the callback port. It also does not enable the import watcher unless requested.
 
 ### Build from source
 
@@ -86,7 +86,7 @@ Requires Go 1.21+ according to `go.mod`. The server generates `data/config.json`
 
 ### Hosting and Zeabur
 
-The repository includes a multi-stage `Dockerfile`. On Zeabur, deploy **from this GitHub repository**, expose container port `8080`, configure `ADMIN_PASSWORD`, and mount persistent storage at `/app/data`. Provide an HTTPS domain for external access. Interactive Microsoft SSO's loopback callback requires a separately verified host/browser network arrangement; do not assume it works unchanged in a remote container.
+The repository includes a multi-stage `Dockerfile`. On Zeabur, deploy **from this GitHub repository**, expose container port `8080`, configure `ADMIN_PASSWORD`, and mount persistent storage at `/app/data`. Provide an HTTPS domain for external access. For remote sign-in, prefer **manual Microsoft SSO** (paste both browser callback URLs in Admin); it needs no `3128` port forwarding. The distinct **Kiro Hosted SSO** flow uses a callback listener and needs the browser on a host that can reach it. See [authentication](docs/architecture/authentication.md) and [troubleshooting](docs/troubleshooting.md).
 
 ## API usage
 
@@ -139,9 +139,9 @@ This is an **upstream Kiro API key**, not the key used by API clients connecting
 
 ### Microsoft 365 / Entra ID and other credential imports
 
-There are **five entry paths**; file import paths share an internal `h.importCredential` classifier and validation core:
+There are **five categories of account-entry paths** (the interactive category has two SSO flows); file import paths share an internal `h.importCredential` classifier and validation core:
 
-1. **Interactive Enterprise SSO:** Admin panel → Add Account → Enterprise SSO, using the hosted sign-in flow.
+1. **Interactive Enterprise SSO:** Admin → Add Account. **Microsoft Enterprise SSO** uses two manually pasted localhost redirect URLs and works with a remote browser without a tunnel; **Kiro Hosted SSO** uses a `localhost:3128` listener on the server and polls for completion. These are separate flows. See [SSO setup](docs/architecture/authentication.md#2-two-browser-sso-flows-and-callback-ownership).
 2. **Paste or upload JSON:** The admin panel accepts the external helper's `CLIProxyAPI_*.json`, including `snake_case` credential fields, subject to validation.
 3. **Batch/admin endpoint:** `POST /admin/api/auth/import-cli-json` accepts individual JSON, arrays, supported wrapper formats, or concatenated objects, with per-item results.
 4. **Drop-folder watcher:** When `KIRO_IMPORT_WATCH=1`, eligible `CLIProxyAPI_*.json` files in `data/imports/` are processed and moved to `processed/` or `failed/`. Enabled by default **only in the supplied Compose configuration**.
@@ -215,7 +215,7 @@ The values below are from the current code and provided Compose file. An option 
 | `KIRO_IMPORT_DIR` | Watcher directory | `data/imports` |
 | `KIRO_IDE_CACHE` | Server-side Kiro IDE credential cache | `~/.aws/sso/cache/kiro-auth-token.json`; Compose sets mounted path |
 | `KIRO_AWS_SSO_CACHE_DIR` | Host directory mounted read-only by Compose | `${HOME}/.aws/sso/cache` |
-| `KIRO_SSO_CALLBACK_BIND` | Listener bind for Enterprise SSO callback | Normally loopback; `0.0.0.0` inside Compose network |
+| `KIRO_SSO_CALLBACK_BIND` | Bind address for **Kiro Hosted SSO listener only** | Loopback by default; Compose uses `0.0.0.0` in-container; manual Microsoft SSO ignores this variable |
 | `KIRO_PROFILE_REGIONS` | Kiro profile/API-key region probe candidates | Built-in list; comma-separated override |
 | `KIRO_DIAGNOSTICS` | Aggregate diagnostics master option | Disabled |
 | `KIRO_DIAG_STREAM`, `KIRO_DIAG_PAYLOAD`, `KIRO_DIAG_REASONING` | Granular metrics/diagnostics | Disabled |
@@ -230,6 +230,9 @@ The values below are from the current code and provided Compose file. An option 
 | `KIRO_AGENT_COMPLETION_AUDIT` | Semantic audit (`off` / `observe` / `enforce`) | `off` |
 | `KIRO_NATIVE_TOOL_CHOICE` | Native forced tool selection (`never` / `auto` / `always`) | `auto` |
 | `KIRO_MAX_REQUEST_BODY_BYTES` | General request-body limit; transport may be stricter | `67108864` bytes (64 MiB); Messages/count_tokens max 32 MiB |
+| `LOG_LEVEL` | Logging verbosity (overrides saved `logLevel`) | `info`; accepts `debug`, `info`, `warn`, `error` |
+| `BEDROCK_MODEL_MAP` | Optional global JSON map of client model aliases to Bedrock model IDs | Per-account map takes precedence; exact discovered model and built-in fallback may also apply |
+| `CUSTOM_API_CREDITS_PER_1K_TOKENS` | Local credit accounting for Custom API forwarding | `1.0` credit per 1,000 tokens when no upstream price is known |
 
 Routing strategy, priority, API key enforcement, thinking preferences and account settings are managed via the admin UI / persisted config. Consult [provider routing](docs/architecture/provider-routing.md), [Completion Guard](docs/architecture/completion-guard.md) and [authentication](docs/architecture/authentication.md) for exact eligibility and failure boundaries.
 
@@ -241,6 +244,8 @@ Routing strategy, priority, API key enforcement, thinking preferences and accoun
 - **Protocol compatibility:** an account can be healthy but ineligible for a particular model, tool family, reasoning mode or Responses history. Inspect the requested feature and provider transport before interpreting a 400/503 as a credential failure.
 - **Streaming:** a truncated stream is not automatically a successful response; retries stop at the semantic output boundary. Use aggregate diagnostics first; `KIRO_DIAG_CHUNKS` may record sensitive content.
 - **Useful checks:** `GET /health`, `GET /v1/models`, account status in `/admin`, then [provider routing](docs/architecture/provider-routing.md) and [streaming recovery](docs/architecture/streaming-recovery.md). `/health` alone does not test an upstream provider.
+
+For deployment examples, see [configuration reference](docs/configuration.md); for callback, model and stream errors, see [troubleshooting](docs/troubleshooting.md).
 
 ## Architecture documentation
 

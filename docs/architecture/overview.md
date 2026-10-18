@@ -14,6 +14,7 @@
 | Claude and OpenAI interfaces | [Agent protocols](agent-protocol.md) | Tool/MCP semantics, compatibility and Responses state |
 | Kiro stream transport | [Streaming and recovery](streaming-recovery.md) | Framing, stop signals and no-duplicate retry |
 | Sign-in and imports | [Authentication](authentication.md) | OAuth/SSO, API keys and import trust boundaries |
+| Operations and debugging | [Configuration](../configuration.md), [Troubleshooting](../troubleshooting.md) | Environment overrides, SSO and request failures |
 
 ## 1. Request flow and trust boundaries
 

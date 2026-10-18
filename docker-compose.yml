@@ -5,11 +5,12 @@ services:
       # Host port is overridable: `KIRO_PORT=9090 docker compose up -d` publishes
       # 9090 on the host. The container always listens on 8080 internally.
       - "${KIRO_PORT:-8080}:8080"
-      # Enterprise SSO (Microsoft 365) callback. The hosted-portal sign-in
-      # redirects the browser to localhost:3128, so the operator must run that
-      # browser ON THE DOCKER HOST. Publishing host-side to 127.0.0.1 only keeps
-      # the callback off the host's external interfaces while still letting the
-      # host browser's localhost:3128 reach the container listener below.
+      # ONLY the listener-based Kiro Hosted SSO flow needs this port. A browser
+      # on the Docker host can reach localhost:3128; a remote browser's localhost
+      # refers to its OWN computer (not this VPS). Microsoft Enterprise SSO via
+      # /auth/microsoft-sso/* is a separate manual-callback flow: paste two redirect
+      # URLs in Admin; no listener, SSH tunnel or published 3128 port is required.
+      # Keep this mapping for operators who still use Kiro Hosted SSO.
       - "127.0.0.1:3128:3128"
     volumes:
       - ./data:/app/data
@@ -48,13 +49,13 @@ services:
       # volume, a less-trusted uid, a syncing directory — set this to 0 and import
       # through the admin API instead.
       - KIRO_IMPORT_WATCH=1
-      # Bind host for the Enterprise SSO callback listener INSIDE the container.
-      # Default (unset) is loopback-only (127.0.0.1/::1), which the published port
-      # above cannot reach; 0.0.0.0 lets the forwarded connection land. The callback
-      # is transient (~10-minute login window) and anti-CSRF state-matched, and the
-      # host-side publish is pinned to loopback above, so it is not reachable off the
-      # host. Note 0.0.0.0 does expose 3128 to peer containers on the same Docker
-      # network during that window; on a shared/untrusted Docker network, pin
-      # KIRO_SSO_CALLBACK_BIND to a specific interface or isolate the network.
+      # Only auth/kiro_sso.go (Kiro Hosted SSO) reads this variable. The manual
+      # Microsoft flow in auth/microsoft_sso.go never binds a listener.
+      # For the Hosted SSO container listener, 0.0.0.0 accepts the Docker port
+      # forwarding above; without this override it binds 127.0.0.1/::1 INSIDE
+      # the container, which host-port forwarding cannot reach. Host publication
+      # stays on loopback, but peer containers on the same Docker network may
+      # still reach port 3128 during the ~10-minute sign-in window. Isolate an
+      # untrusted network or avoid this listener flow by using manual Microsoft SSO.
       - KIRO_SSO_CALLBACK_BIND=0.0.0.0
     restart: unless-stopped

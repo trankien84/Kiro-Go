@@ -18,7 +18,35 @@ Microsoft 365 tenant policies such as MFA and Conditional Access are why a headl
 
 **Source:** [`auth/microsoft_sso.go`](../../auth/microsoft_sso.go), [`auth/oidc.go`](../../auth/oidc.go), [`auth/kiro_sso.go`](../../auth/kiro_sso.go), [`config/account_credentials.go`](../../config/account_credentials.go), [`proxy/handler.go`](../../proxy/handler.go). **Tests:** [`auth/microsoft_sso_test.go`](../../auth/microsoft_sso_test.go), [`proxy/microsoft_lifecycle_test.go`](../../proxy/microsoft_lifecycle_test.go).
 
-## 2. Import paths converge on one classifier
+## 2. Two browser SSO flows and callback ownership
+
+Kiro-Go intentionally exposes **two different entry points**. They are not interchangeable, despite both using Kiro's hosted sign-in portal and the fixed browser redirect `http://localhost:3128`.
+
+| Flow | Admin/API | Who receives the redirect? | Remote workstation and tunnel |
+| --- | --- | --- | --- |
+| **Microsoft Enterprise SSO (manual)** | Admin's Microsoft option; `/admin/api/auth/microsoft-sso/start`, `/complete`, `/select-profile`, `/cancel` | Browser navigates to localhost and may show a connection error. **Operator copies the entire URL into Admin**, twice (Kiro portal descriptor, then Microsoft OAuth code). Kiro-Go validates each step; it **does not bind port 3128** for this flow. | Browser may run on another machine; **no SSH tunnel and no published callback port required**. |
+| **Kiro Hosted SSO (listener)** | Admin's Kiro Hosted option; `/admin/api/auth/kiro-sso/start`, `/poll`, `/select-profile`, `/cancel` | `auth/kiro_sso.go` opens a temporary HTTP listener on port `3128`; browser must reach that exact host from its own `localhost` redirect. The server captures the callback and the Admin UI polls for completion. | Typically requires a browser on the server/Docker host, or an explicitly configured tunnel/network arrangement. Merely publishing `3128` on a VPS does **not** redirect a remote browser's `localhost` there. |
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"nodeSpacing": 75, "rankSpacing": 85, "wrappingWidth": 320, "minNodeWidth": 260, "curve": "linear"}}}%%
+flowchart TD
+    Choose{"Choose an SSO flow"}
+    Choose -->|"Microsoft manual"| Manual["Open sign-in in a browser<br/>on any workstation"]
+    Manual --> Paste1["Copy full Kiro portal callback URL<br/>and paste into Admin"]
+    Paste1 --> Paste2["Complete Microsoft authorization<br/>paste second callback URL"]
+    Paste2 --> Exchange["Kiro-Go validates session and PKCE<br/>and exchanges code server-side"]
+    Choose -->|"Kiro Hosted"| Hosted["Server binds temporary listener<br/>at port 3128"]
+    Hosted --> Browser["Open browser where localhost:3128<br/>can reach that listener"]
+    Browser --> Poll["Server captures redirect<br/>Admin polls login status"]
+```
+
+**Manual flow sequence.** Start the login in Admin and open the returned Kiro sign-in URL. After portal authentication, copy the **whole** `http://localhost:3128/signin/callback?...` URL from the browser address bar (even if the localhost page fails). Submit it to Admin; Kiro-Go validates the descriptor and returns a Microsoft authorization URL. Sign in with Microsoft (including MFA if required); copy the **whole** `http://localhost:3128/oauth/callback?...` URL and submit it to Admin. The server checks the Microsoft leg's `state` and PKCE, exchanges the authorization code, and may ask you to select a Kiro profile. Do not share callback URLs or put authorization codes in logs. The manual session is limited to **10 minutes**; expired/used sessions require a new start.
+
+**Hosted listener deployment.** The checked-in Compose configuration preserves `127.0.0.1:3128:3128` and `KIRO_SSO_CALLBACK_BIND=0.0.0.0` **for this separate flow only**. The host publication is loopback-only, but an in-container `0.0.0.0` listener may be reachable by other containers on a shared Docker network during the temporary login window. Secure the network or use manual Microsoft SSO instead. Do not remove the listener settings unless you deliberately retire Kiro Hosted SSO.
+
+**Source:** [`auth/microsoft_sso.go`](../../auth/microsoft_sso.go) (`StartMicrosoftSSOLogin`, `ContinueMicrosoftSSOLogin`), [`auth/kiro_sso.go`](../../auth/kiro_sso.go) (`StartKiroSsoLogin`, `startListener`), [`proxy/handler.go`](../../proxy/handler.go), [`docker-compose.yml`](../../docker-compose.yml). **Tests:** [`auth/microsoft_sso_test.go`](../../auth/microsoft_sso_test.go), [`auth/kiro_sso_test.go`](../../auth/kiro_sso_test.go), [`proxy/microsoft_handler_test.go`](../../proxy/microsoft_handler_test.go).
+
+## 3. Import paths converge on one classifier
 
 ```mermaid
 %%{init: {"htmlLabels": false, "flowchart": {"nodeSpacing": 75, "rankSpacing": 90, "wrappingWidth": 270, "minNodeWidth": 220, "curve": "linear"}}}%%
@@ -61,7 +89,7 @@ The `/admin/api/auth/import-ide-cache` request body may still be parsed for back
 
 **Source:** [`docker-compose.yml`](../../docker-compose.yml), [`proxy/import_watcher.go`](../../proxy/import_watcher.go).
 
-## 3. OAuth refresh failure is not one generic ban reason
+## 4. OAuth refresh failure is not one generic ban reason
 
 Refresh errors distinguish **retryable**, **credential-terminal**, and **configuration-terminal** cases. A structured `OAuthTokenEndpointError` retains the standardized error code separately from the description; it is unsafe to infer policy from a prose message or HTTP 400 alone. A rotated refresh token is particularly sensitive: if an IdP rotation succeeds but local persistence fails, the new token cannot be quietly discarded.
 
@@ -95,13 +123,13 @@ For refreshable OAuth credentials, an asynchronous worker contacts the token end
 
 The implementation uses structured OAuth failure disposition rather than simply interpreting any HTTP 400 as permanent invalid credentials: retryable transport/rate-limit conditions, invalid credentials and invalid client configuration are materially different operator actions.
 
-## 4. Kiro API-key region reprobe
+## 5. Kiro API-key region reprobe
 
 The Kiro API-key region reprobe is bounded and only for applicable Kiro API-key authentication failures, not all providers or arbitrary errors. Candidate regions are validated. A REST/control-plane probe alone is **not** sufficient to persist a new runtime region; the new region is committed only after the retry against the actual Kiro runtime succeeds. Otherwise, restore the previous runtime choice. Reprobe is suppressed if a failed attempt already emitted output, to avoid replaying visible semantics.
 
 **Source:** [`proxy/kiro_api.go`](../../proxy/kiro_api.go) (`reprobeApiKeyRegion`), [`config/account_lifecycle_generation.go`](../../config/account_lifecycle_generation.go), [`proxy/kiro.go`](../../proxy/kiro.go). **Tests:** [`proxy/kiro_apikey_region_test.go`](../../proxy/kiro_apikey_region_test.go).
 
-## 5. Read-only diagnostics and operational safety
+## 6. Read-only diagnostics and operational safety
 
 - Treat files in `data/` and cache mounts as secrets; restrictive file permissions and Docker volume boundaries matter.
 - Do not log JWTs, access/refresh tokens, full Authorization headers or actual CLI JSON credential samples.

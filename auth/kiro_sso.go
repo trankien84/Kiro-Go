@@ -6,7 +6,9 @@ package auth
 // enterprise identity providers (e.g. a Microsoft 365 / Entra ID / Azure AD
 // tenant) behind a single PKCE authorization-code flow. It is the only way an
 // enterprise Azure-tenant account — which is neither an AWS Builder ID nor an
-// AWS IAM Identity Center account — can sign in to Kiro.
+// AWS IAM Identity Center account — can sign in via the hosted listener flow.
+// The separate Microsoft manual-callback flow in microsoft_sso.go does not
+// open a listener, and also supports Entra sign-in.
 //
 // The flow has two possible legs, both captured by one transient loopback
 // listener bound on the fixed redirect port:

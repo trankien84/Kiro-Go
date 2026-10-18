@@ -14,6 +14,7 @@
 | API Claude và OpenAI | [Giao thức agent](agent-protocol.md) | Tool/MCP, compatibility và Responses state |
 | Kiro streaming | [Streaming và recovery](streaming-recovery.md) | Event framing, stop reason và retry không lặp |
 | Đăng nhập và import | [Authentication](authentication.md) | OAuth/SSO, API key và trust boundary |
+| Cấu hình và xử lý lỗi | [Cấu hình](../../configuration.vi.md), [Xử lý sự cố](../../troubleshooting.vi.md) | Biến môi trường, SSO và lỗi request |
 
 ## 1. Luồng request và ranh giới tin cậy
 

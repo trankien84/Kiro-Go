@@ -51,9 +51,9 @@ KIRO_PORT=127.0.0.1:8080 docker compose up -d --build
 curl -fsS http://localhost:8080/health
 ```
 
-Compose **build từ source của checkout hiện tại**, mount `./data` vào `/app/data`, mặc định công bố API trên port `8080` (ví dụ giới hạn trên loopback qua `KIRO_PORT=127.0.0.1:8080`) và chỉ publish callback Microsoft SSO trên loopback máy host `127.0.0.1:3128`. Để đổi cổng host: `KIRO_PORT=127.0.0.1:9090 docker compose up -d --build` nếu chỉ cần truy cập local; container vẫn dùng cổng `8080`. Các lệnh clone trực tiếp branch chính **`main`** của repository.
+Compose **build từ source của checkout hiện tại**, mount `./data` vào `/app/data`, mặc định công bố API trên port `8080` (ví dụ giới hạn trên loopback qua `KIRO_PORT=127.0.0.1:8080`) và publish `127.0.0.1:3128` cho **Kiro Hosted SSO có listener**. **Microsoft SSO nhập callback thủ công** không cần listener hay SSH tunnel. Để đổi cổng host: `KIRO_PORT=127.0.0.1:9090 docker compose up -d --build` nếu chỉ cần truy cập local; container vẫn dùng cổng `8080`. Các lệnh clone trực tiếp branch chính **`main`** của repository.
 
-> **Bảo mật:** `docker-compose.yml` hiện **không truyền** biến `ADMIN_PASSWORD` từ môi trường host vào container. Nếu không giới hạn địa chỉ như ví dụ, cấu hình Compose mặc định công bố API trên mọi interface của host. Khi mới chạy local, đăng nhập với mật khẩu fresh-config `changeme` và đổi ngay trên admin UI **trước khi cho phép truy cập qua mạng**; hoặc dùng Compose override riêng để truyền `ADMIN_PASSWORD` vào container. Compose bật `KIRO_IMPORT_WATCH=1`: bất kỳ ai ghi được vào `./data/imports` đều có thể thêm account mà không cần mật khẩu admin. Hãy bảo vệ thư mục này giống `./data/config.json`, hoặc tắt watcher bằng `KIRO_IMPORT_WATCH=0`. Khi triển khai từ xa, sử dụng HTTPS và giới hạn `/admin`. Callback Microsoft SSO yêu cầu browser chạy **trên Docker host**, không phải máy từ xa.
+> **Bảo mật:** `docker-compose.yml` hiện **không truyền** biến `ADMIN_PASSWORD` từ môi trường host vào container. Nếu không giới hạn địa chỉ như ví dụ, cấu hình Compose mặc định công bố API trên mọi interface của host. Khi mới chạy local, đăng nhập với mật khẩu fresh-config `changeme` và đổi ngay trên admin UI **trước khi cho phép truy cập qua mạng**; hoặc dùng Compose override riêng để truyền `ADMIN_PASSWORD` vào container. Compose bật `KIRO_IMPORT_WATCH=1`: bất kỳ ai ghi được vào `./data/imports` đều có thể thêm account mà không cần mật khẩu admin. Hãy bảo vệ thư mục này giống `./data/config.json`, hoặc tắt watcher bằng `KIRO_IMPORT_WATCH=0`. Khi triển khai từ xa, sử dụng HTTPS và giới hạn `/admin`. Chỉ **Kiro Hosted SSO** cần trình duyệt truy cập được listener `localhost:3128` phía server (thường mở trình duyệt ngay trên Docker host). **Microsoft SSO thủ công** cho phép đăng nhập bằng trình duyệt máy cá nhân và dán hai callback URL vào Admin, không cần tunnel. Cổng `3128` được publish trên VPS không làm `localhost` của trình duyệt máy khác trỏ đến VPS.
 
 ### Docker build và run (không dùng Compose)
 
@@ -68,7 +68,7 @@ docker run -d \
   kiro-go:local
 ```
 
-Thay `/absolute/path/to/data` bằng thư mục host có quyền ghi. Lệnh standalone này **không** mount IDE cache hoặc publish callback Enterprise SSO; nếu cần hãy bổ sung cấu hình riêng hoặc dùng Compose. Watcher cũng không tự bật trong lệnh này.
+Thay `/absolute/path/to/data` bằng thư mục host có quyền ghi. Lệnh standalone này **không** mount IDE cache hoặc publish callback cho **Kiro Hosted SSO**; chỉ cần bổ sung nếu dùng luồng listener đó. **Microsoft SSO thủ công** không cần publish callback port. Watcher cũng không tự bật trong lệnh này.
 
 ### Build từ source
 
@@ -86,7 +86,7 @@ Theo `go.mod`, yêu cầu Go 1.21+. Khi chưa tồn tại, server tự tạo `da
 
 ### Hosting và Zeabur
 
-Repository có `Dockerfile` multi-stage. Trên Zeabur, deploy **từ repository GitHub này**, expose cổng container `8080`, đặt `ADMIN_PASSWORD`, và mount storage bền vững tại `/app/data`. Dùng HTTPS domain nếu truy cập bên ngoài. Với Microsoft SSO interactive, callback loopback cần cấu hình browser/network phù hợp và kiểm tra riêng; không nên mặc định coi cơ chế này chạy được y nguyên trong container từ xa.
+Repository có `Dockerfile` multi-stage. Trên Zeabur, deploy **từ repository GitHub này**, expose cổng container `8080`, đặt `ADMIN_PASSWORD`, và mount storage bền vững tại `/app/data`. Dùng HTTPS domain nếu truy cập bên ngoài. Khi đăng nhập từ máy khác, ưu tiên **Microsoft SSO thủ công** bằng cách dán hai callback URL trong Admin, không cần forward cổng `3128`. **Kiro Hosted SSO** là luồng riêng có listener, cần trình duyệt truy cập được callback. Xem [authentication](docs/architecture/vi/authentication.md) và [xử lý sự cố](docs/troubleshooting.vi.md).
 
 ## Sử dụng API
 
@@ -139,9 +139,9 @@ curl -X POST http://localhost:8080/admin/api/auth/credentials \
 
 ### Microsoft 365 / Entra ID và những đường import khác
 
-Có **năm đường thêm credential**; các đường import file đều hội tụ tại bộ phân loại và kiểm tra `h.importCredential`:
+Có **năm nhóm cách thêm credential** (nhóm đăng nhập tương tác có hai luồng SSO); các đường import file đều hội tụ tại bộ phân loại và kiểm tra `h.importCredential`:
 
-1. **Enterprise SSO interactive:** Admin → Add Account → Enterprise SSO, thông qua luồng đăng nhập hosted portal.
+1. **Enterprise SSO tương tác:** Trong Admin → Add Account có hai luồng riêng. **Microsoft Enterprise SSO** yêu cầu dán hai redirect URL `localhost` và dùng được từ máy từ xa, không cần tunnel; **Kiro Hosted SSO** mở listener `localhost:3128` trên server và poll kết quả. Xem [hai cơ chế callback](docs/architecture/vi/authentication.md#2-hai-luồng-sso-trên-trình-duyệt-và-nơi-nhận-callback).
 2. **Paste hoặc upload JSON:** Admin hỗ trợ `CLIProxyAPI_*.json` do helper bên ngoài xuất, bao gồm các trường `snake_case`, sau khi validation.
 3. **API import hàng loạt:** `POST /admin/api/auth/import-cli-json` hỗ trợ JSON đơn, array, các wrapper hợp lệ hoặc nhiều object nối tiếp; trả kết quả theo từng item.
 4. **Drop-folder watcher:** Với `KIRO_IMPORT_WATCH=1`, các file `CLIProxyAPI_*.json` trong `data/imports/` được xử lý rồi chuyển sang `processed/` hoặc `failed/`. **Chỉ Compose đi kèm** bật mặc định.
@@ -215,7 +215,7 @@ Các giá trị dưới đây dựa trên source và Compose hiện tại. Có o
 | `KIRO_IMPORT_DIR` | Thư mục watcher | `data/imports` |
 | `KIRO_IDE_CACHE` | Đường dẫn cache Kiro IDE trên server | `~/.aws/sso/cache/kiro-auth-token.json`; Compose dùng đường dẫn mount |
 | `KIRO_AWS_SSO_CACHE_DIR` | Cache host mount read-only bởi Compose | `${HOME}/.aws/sso/cache` |
-| `KIRO_SSO_CALLBACK_BIND` | Bind listener callback Enterprise SSO | Thường là loopback; `0.0.0.0` bên trong mạng Compose |
+| `KIRO_SSO_CALLBACK_BIND` | Địa chỉ bind của **Kiro Hosted SSO có listener**, không áp dụng cho Microsoft SSO thủ công | Mặc định loopback; Compose đặt `0.0.0.0` bên trong container |
 | `KIRO_PROFILE_REGIONS` | Danh sách region để dò Kiro profile/API key | Danh sách có sẵn; cho phép override bằng dấu phẩy |
 | `KIRO_DIAGNOSTICS` | Bật nhóm diagnostics tổng hợp | Tắt |
 | `KIRO_DIAG_STREAM`, `KIRO_DIAG_PAYLOAD`, `KIRO_DIAG_REASONING` | Metrics/diagnostics riêng | Tắt |
@@ -230,6 +230,9 @@ Các giá trị dưới đây dựa trên source và Compose hiện tại. Có o
 | `KIRO_AGENT_COMPLETION_AUDIT` | Audit ngữ nghĩa (`off` / `observe` / `enforce`) | `off` |
 | `KIRO_NATIVE_TOOL_CHOICE` | Chọn tool native (`never` / `auto` / `always`) | `auto` |
 | `KIRO_MAX_REQUEST_BODY_BYTES` | Giới hạn body chung; transport có thể thấp hơn | `67108864` byte (64 MiB); Messages/count_tokens tối đa 32 MiB |
+| `LOG_LEVEL` | Mức chi tiết log; ưu tiên hơn `logLevel` đã lưu | Mặc định `info`; hỗ trợ `debug`, `info`, `warn`, `error` |
+| `BEDROCK_MODEL_MAP` | JSON ánh xạ model alias sang Bedrock model ID ở cấp hệ thống | Map riêng của account được ưu tiên; còn có discovery và fallback |
+| `CUSTOM_API_CREDITS_PER_1K_TOKENS` | Giá credit ước tính khi forward qua Custom API | `1.0` credit / 1.000 token nếu không có giá upstream |
 
 Routing strategy, priority, yêu cầu client API key, thinking và thông tin account được cấu hình trong admin UI / config đã lưu. Xem [provider routing](docs/architecture/vi/provider-routing.md), [Completion Guard](docs/architecture/vi/completion-guard.md) và [authentication](docs/architecture/vi/authentication.md) để hiểu điều kiện eligibility và ranh giới lỗi.
 
@@ -241,6 +244,8 @@ Routing strategy, priority, yêu cầu client API key, thinking và thông tin a
 - **Tính tương thích:** account có thể khỏe nhưng không phù hợp model, tool, reasoning hoặc Responses history cụ thể. Kiểm tra tính năng request và transport trước khi kết luận 400/503 do credential.
 - **Streaming:** luồng bị cắt không được tự nhận là thành công; retry dừng tại ranh giới output đã commit. Ưu tiên diagnostics tổng hợp; `KIRO_DIAG_CHUNKS` có thể ghi dữ liệu nhạy cảm.
 - **Kiểm tra nhanh:** `GET /health`, `GET /v1/models`, trạng thái account trong `/admin`, sau đó xem [provider routing](docs/architecture/vi/provider-routing.md) và [streaming recovery](docs/architecture/vi/streaming-recovery.md). `/health` không kiểm tra được upstream account.
+
+Xem thêm [tham chiếu cấu hình](docs/configuration.vi.md) và [hướng dẫn xử lý sự cố](docs/troubleshooting.vi.md).
 
 ## Tài liệu kiến trúc
 

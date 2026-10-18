@@ -14,6 +14,7 @@
 | Claude / OpenAI 接口 | [Agent 协议](agent-protocol.md) | Tool/MCP 语义、兼容性与 Responses 状态 |
 | Kiro 流式传输 | [流完整性与恢复](streaming-recovery.md) | 帧解析、终止信号与防重复重试 |
 | 登录及导入 | [身份认证](authentication.md) | OAuth/SSO、API Key 和信任边界 |
+| 配置与故障排查 | [配置参考](../../configuration.zh-CN.md)、[故障排查](../../troubleshooting.zh-CN.md) | 环境变量、SSO 和请求异常 |
 
 ## 1. 请求处理链路与信任边界
 

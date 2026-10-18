@@ -51,9 +51,9 @@ KIRO_PORT=127.0.0.1:8080 docker compose up -d --build
 curl -fsS http://localhost:8080/health
 ```
 
-Compose **直接构建当前 checkout 的源码**，将 `./data` 挂载到 `/app/data`，默认在宿主机 `8080` 端口发布 API（示例使用 `KIRO_PORT=127.0.0.1:8080` 限制为回环访问），并将 Microsoft SSO 浏览器回调限制在宿主机回环地址 `127.0.0.1:3128`。更改宿主机 API 端口：`KIRO_PORT=127.0.0.1:9090 docker compose up -d --build`（仅本机可访问）；容器内部仍监听 `8080`。上述命令明确检出仓库的 **`main`** 分支。
+Compose **直接构建当前 checkout 的源码**，将 `./data` 挂载到 `/app/data`，默认在宿主机 `8080` 端口发布 API（示例使用 `KIRO_PORT=127.0.0.1:8080` 限制为回环访问），并仅在宿主机回环地址 `127.0.0.1:3128` 发布**需要 Listener 的 Kiro Hosted SSO** 回调。**手动粘贴回调的 Microsoft SSO** 不需要 Listener 或 SSH Tunnel。更改宿主机 API 端口：`KIRO_PORT=127.0.0.1:9090 docker compose up -d --build`（仅本机可访问）；容器内部仍监听 `8080`。上述命令明确检出仓库的 **`main`** 分支。
 
-> **安全提示：** 当前 `docker-compose.yml` **不会自动把宿主机 `ADMIN_PASSWORD` 环境变量传入容器**。如果没有示例中的 loopback 限制，Compose 默认将 API 发布到宿主机所有网络接口。首次本地运行时可用新配置默认密码 `changeme` 登录，但必须在**允许任何网络访问之前**立即在管理界面修改；或者使用私有 Compose override，在容器环境中显式设置 `ADMIN_PASSWORD`。Compose 默认启用 `KIRO_IMPORT_WATCH=1`：能向 `./data/imports` 写文件的主体，无须管理员密码即可导入账号。务必像保护 `./data/config.json` 一样保护该目录，必要时设置 `KIRO_IMPORT_WATCH=0`。远程部署应启用 HTTPS 并限制 `/admin` 的访问。Microsoft SSO 回调要求浏览器运行于 **Docker 宿主机**，而非另一台远程电脑。
+> **安全提示：** 当前 `docker-compose.yml` **不会自动把宿主机 `ADMIN_PASSWORD` 环境变量传入容器**。如果没有示例中的 loopback 限制，Compose 默认将 API 发布到宿主机所有网络接口。首次本地运行时可用新配置默认密码 `changeme` 登录，但必须在**允许任何网络访问之前**立即在管理界面修改；或者使用私有 Compose override，在容器环境中显式设置 `ADMIN_PASSWORD`。Compose 默认启用 `KIRO_IMPORT_WATCH=1`：能向 `./data/imports` 写文件的主体，无须管理员密码即可导入账号。务必像保护 `./data/config.json` 一样保护该目录，必要时设置 `KIRO_IMPORT_WATCH=0`。远程部署应启用 HTTPS 并限制 `/admin` 的访问。只有 **Kiro Hosted SSO** 要求浏览器能够访问服务端 `localhost:3128` Listener（通常需在 Docker 宿主机打开浏览器）。**Microsoft 手动回调登录**允许在远程电脑完成登录并把两次回调 URL 粘贴到管理界面，无须 Tunnel。VPS 发布 `3128` 端口不会让远程电脑的 `localhost` 自动指向 VPS。
 
 ### Docker 构建和运行（不使用 Compose）
 
@@ -68,7 +68,7 @@ docker run -d \
   kiro-go:local
 ```
 
-请将 `/absolute/path/to/data` 改成有写权限的宿主机目录。此独立运行命令**未**挂载 IDE cache，也没有发布 Enterprise SSO 回调端口；若有需要，请自行增加相关参数或使用 Compose。除非明确设置，独立运行时也不会启用导入 watcher。
+请将 `/absolute/path/to/data` 改成有写权限的宿主机目录。此独立运行命令**未**挂载 IDE cache，也没有发布 **Kiro Hosted SSO** Listener 端口；只有使用该自动回调流程时才需要配置。**Microsoft 手动回调 SSO** 不需要发布此端口。除非明确设置，独立运行时也不会启用导入 watcher。
 
 ### 从源码编译
 
@@ -86,7 +86,7 @@ go build -o kiro-go .
 
 ### 云部署与 Zeabur
 
-仓库包含多阶段 `Dockerfile`。在 Zeabur 上**从本 GitHub 仓库部署**，暴露容器 `8080` 端口、设置 `ADMIN_PASSWORD`，并将持久存储挂载至 `/app/data`。外部访问应使用 HTTPS 域名。Microsoft SSO 的交互式登录采用 loopback 回调，需单独验证浏览器与网络配置，不能假设在远程容器内原样可用。
+仓库包含多阶段 `Dockerfile`。在 Zeabur 上**从本 GitHub 仓库部署**，暴露容器 `8080` 端口、设置 `ADMIN_PASSWORD`，并将持久存储挂载至 `/app/data`。外部访问应使用 HTTPS 域名。远程登录推荐使用**手动 Microsoft SSO**：在管理界面粘贴两次浏览器回调 URL，不需要转发 `3128` 端口。**Kiro Hosted SSO** 是另一条使用 Listener 的流程，需要浏览器能够访问回调地址。详见[认证](docs/architecture/zh-CN/authentication.md)和[故障排查](docs/troubleshooting.zh-CN.md)。
 
 ## API 使用方法
 
@@ -139,9 +139,9 @@ curl -X POST http://localhost:8080/admin/api/auth/credentials \
 
 ### Microsoft 365 / Entra ID 与其他凭证导入方式
 
-共有**五种凭证接入方式**；基于文件的导入流程最终统一由 `h.importCredential` 负责分类与校验：
+共有**五类凭证接入方式**（其中交互式登录包含两种 SSO 流程）；基于文件的导入流程最终统一由 `h.importCredential` 负责分类与校验：
 
-1. **交互式 Enterprise SSO：** 管理界面 → Add Account → Enterprise SSO，使用托管登录页面。
+1. **交互式 Enterprise SSO：** 管理界面 → Add Account 提供两种不同流程。**Microsoft Enterprise SSO** 需要手动粘贴两次 `localhost` 回调 URL，可从远程电脑完成，无须 Tunnel；**Kiro Hosted SSO** 则在服务端启动 `localhost:3128` Listener，通过轮询获取结果。详见[两种回调流程](docs/architecture/zh-CN/authentication.md#2-两种浏览器-sso-流程及回调归属)。
 2. **粘贴或上传 JSON：** 管理界面接受外部 helper 生成的 `CLIProxyAPI_*.json`，包括 `snake_case` 字段，经过校验后导入。
 3. **批量/管理员 API：** `POST /admin/api/auth/import-cli-json` 接受单个 JSON、数组、支持的 wrapper 格式或串联对象，并返回逐项结果。
 4. **文件夹 watcher：** 设置 `KIRO_IMPORT_WATCH=1` 后，`data/imports/` 中符合条件的 `CLIProxyAPI_*.json` 被处理并移至 `processed/` 或 `failed/`。**只有随项目提供的 Compose 配置**默认开启。
@@ -215,7 +215,7 @@ Guard 默认模式为 `strict`，但**语义层 completion audit 默认关闭**�
 | `KIRO_IMPORT_DIR` | Watcher 扫描目录 | `data/imports` |
 | `KIRO_IDE_CACHE` | 服务器上的 Kiro IDE 凭证缓存路径 | `~/.aws/sso/cache/kiro-auth-token.json`；Compose 指向挂载位置 |
 | `KIRO_AWS_SSO_CACHE_DIR` | Compose 只读挂载的宿主机缓存目录 | `${HOME}/.aws/sso/cache` |
-| `KIRO_SSO_CALLBACK_BIND` | Enterprise SSO 回调监听地址 | 通常为 loopback；Compose 网络内用 `0.0.0.0` |
+| `KIRO_SSO_CALLBACK_BIND` | 仅供 **Kiro Hosted SSO** 使用的 Listener 绑定地址 | 默认 loopback；Compose 容器内部使用 `0.0.0.0`；不影响手动 Microsoft SSO |
 | `KIRO_PROFILE_REGIONS` | Kiro profile/API key 探测 region | 内置列表，可用逗号分隔值覆盖 |
 | `KIRO_DIAGNOSTICS` | 启用聚合诊断 | 关闭 |
 | `KIRO_DIAG_STREAM`, `KIRO_DIAG_PAYLOAD`, `KIRO_DIAG_REASONING` | 专项统计/诊断 | 关闭 |
@@ -230,6 +230,9 @@ Guard 默认模式为 `strict`，但**语义层 completion audit 默认关闭**�
 | `KIRO_AGENT_COMPLETION_AUDIT` | 语义审计（`off` / `observe` / `enforce`） | `off` |
 | `KIRO_NATIVE_TOOL_CHOICE` | 原生工具选择（`never` / `auto` / `always`） | `auto` |
 | `KIRO_MAX_REQUEST_BODY_BYTES` | 通用请求体限制，transport 可能更严格 | `67108864` 字节（64 MiB）；Messages/count_tokens 最高 32 MiB |
+| `LOG_LEVEL` | 日志级别，覆盖已保存的 `logLevel` | 默认 `info`；支持 `debug`、`info`、`warn`、`error` |
+| `BEDROCK_MODEL_MAP` | 全局 JSON 模型别名到 Bedrock Model ID 的映射 | 优先使用账号映射，也可使用发现结果和内置回退映射 |
+| `CUSTOM_API_CREDITS_PER_1K_TOKENS` | Custom API 转发时的本地 Credit 估算费率 | 无上游费率时默认每 1,000 Tokens 使用 `1.0` Credit |
 
 路由策略、账号优先级、客户端密钥强制认证、thinking 偏好及账号信息由管理界面和持久化配置管理。详见[提供商路由](docs/architecture/zh-CN/provider-routing.md)、[Completion Guard](docs/architecture/zh-CN/completion-guard.md)和[认证](docs/architecture/zh-CN/authentication.md)，了解准确的筛选条件及错误边界。
 
@@ -241,6 +244,8 @@ Guard 默认模式为 `strict`，但**语义层 completion audit 默认关闭**�
 - **协议兼容：** 健康的账号也可能不支持某个模型、工具类别、推理模式或 Responses 历史。在将 400/503 归咎于凭证之前，应检查请求语义及传输后端。
 - **流式输出：** 截断的流不能自动视为成功；超过语义输出提交边界后不得重新播放整个请求。优先开启聚合诊断；`KIRO_DIAG_CHUNKS` 可能记录敏感内容。
 - **常用检查：** `GET /health`、`GET /v1/models`、`/admin` 中的账号状态，以及[提供商路由](docs/architecture/zh-CN/provider-routing.md)和[流式恢复](docs/architecture/zh-CN/streaming-recovery.md)。`/health` 本身不会测试上游账号。
+
+部署细节参阅[配置参考](docs/configuration.zh-CN.md)，错误处理参阅[故障排查](docs/troubleshooting.zh-CN.md)。
 
 ## 架构文档
 
