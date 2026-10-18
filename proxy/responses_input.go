@@ -67,6 +67,11 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 		role, _ := obj["role"].(string)
 
 		switch {
+		case typ == "additional_tools":
+			// Declaration-only Responses Lite input item. The unified tool parser
+			// handles it before message projection; it is not conversational history.
+			continue
+
 		case typ == "message" || (typ == "" && role != ""):
 			flushPendingUser()
 			msg := buildMessageFromInputItem(obj, role)
@@ -74,15 +79,21 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 				messages = append(messages, *msg)
 			}
 
-		case typ == "function_call_output" || typ == "tool_result":
+		case typ == "function_call_output" || typ == "custom_tool_call_output" || typ == "tool_result":
 			flushPendingUser()
 			callID, _ := obj["call_id"].(string)
 			if callID == "" {
 				callID, _ = obj["tool_call_id"].(string)
 			}
-			out := stringifyArbitrary(obj["output"])
-			if out == "" {
-				out = stringifyArbitrary(obj["content"])
+			out, err := responsesToolOutputContent(obj["output"])
+			if err != nil {
+				return nil, err
+			}
+			if responsesToolOutputEmpty(out) {
+				out, err = responsesToolOutputContent(obj["content"])
+				if err != nil {
+					return nil, err
+				}
 			}
 			messages = append(messages, OpenAIMessage{
 				Role:       "tool",
@@ -90,14 +101,23 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 				ToolCallID: callID,
 			})
 
-		case typ == "function_call":
+		case typ == "function_call" || typ == "custom_tool_call":
 			flushPendingUser()
 			tc := ToolCall{
 				ID:   stringField(obj, "call_id", "id"),
 				Type: "function",
 			}
 			tc.Function.Name, _ = obj["name"].(string)
-			tc.Function.Arguments = stringifyArbitrary(obj["arguments"])
+			tc.Namespace, _ = obj["namespace"].(string)
+			if typ == "custom_tool_call" {
+				tc.ResponsesKind = responsesToolKindCustom
+				input, _ := obj["input"].(string)
+				encoded, _ := json.Marshal(map[string]interface{}{"input": input})
+				tc.Function.Arguments = string(encoded)
+			} else {
+				tc.ResponsesKind = responsesToolKindFunction
+				tc.Function.Arguments = stringifyArbitrary(obj["arguments"])
+			}
 			// Merge consecutive function_call items into a single assistant
 			// message so parallel tool calls stay grouped in one turn. The
 			// Responses API emits each parallel call as a separate input item;
@@ -135,6 +155,16 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 				messages = append(messages, OpenAIMessage{Role: "assistant", Content: text})
 			}
 
+		case typ == "agent_message":
+			flushPendingUser()
+			agentText, err := responsesAgentMessageText(obj)
+			if err != nil {
+				return nil, err
+			}
+			if strings.TrimSpace(agentText) != "" {
+				messages = append(messages, OpenAIMessage{Role: "user", Content: agentText})
+			}
+
 		default:
 			if role != "" {
 				flushPendingUser()
@@ -148,6 +178,112 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 
 	flushPendingUser()
 	return messages, nil
+}
+
+func responsesToolOutputEmpty(value interface{}) bool {
+	switch typed := value.(type) {
+	case nil:
+		return true
+	case string:
+		return typed == ""
+	case []interface{}:
+		return len(typed) == 0
+	default:
+		return false
+	}
+}
+
+// responsesToolOutputContent preserves the multimodal Responses output shape
+// that OpenAIToKiro already understands. String/object outputs keep the legacy
+// text projection, while content-item arrays retain input_image blocks so Kiro
+// can hoist inline image bytes to the current user turn. Unknown array items are
+// converted to text rather than silently dropped.
+func responsesToolOutputContent(value interface{}) (interface{}, error) {
+	switch typed := value.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return typed, nil
+	case []interface{}:
+		parts := make([]interface{}, 0, len(typed))
+		for _, raw := range typed {
+			part, ok := raw.(map[string]interface{})
+			if !ok {
+				if text := stringifyArbitrary(raw); text != "" {
+					parts = append(parts, map[string]interface{}{"type": "input_text", "text": text})
+				}
+				continue
+			}
+			typ, _ := part["type"].(string)
+			switch strings.ToLower(strings.TrimSpace(typ)) {
+			case "input_text", "text", "output_text", "input_image", "image", "image_url":
+				parts = append(parts, part)
+			case "encrypted_content":
+				encrypted, _ := part["encrypted_content"].(string)
+				if encrypted == "" {
+					continue
+				}
+				if responsesEncryptedContentOpaque(encrypted) {
+					return nil, fmt.Errorf("tool output encrypted_content is opaque and cannot be safely projected to Kiro")
+				}
+				parts = append(parts, map[string]interface{}{"type": "input_text", "text": encrypted})
+			default:
+				if text := stringifyArbitrary(part); text != "" {
+					parts = append(parts, map[string]interface{}{"type": "input_text", "text": text})
+				}
+			}
+		}
+		return parts, nil
+	default:
+		return stringifyArbitrary(value), nil
+	}
+}
+
+func responsesAgentMessageText(obj map[string]interface{}) (string, error) {
+	content, _ := obj["content"].([]interface{})
+	var out strings.Builder
+	for _, value := range content {
+		part, _ := value.(map[string]interface{})
+		if part == nil {
+			continue
+		}
+		typ, _ := part["type"].(string)
+		switch typ {
+		case "input_text", "text", "output_text":
+			if text, _ := part["text"].(string); text != "" {
+				out.WriteString(text)
+			}
+		case "encrypted_content":
+			value, _ := part["encrypted_content"].(string)
+			if value == "" {
+				continue
+			}
+			if responsesEncryptedContentOpaque(value) {
+				return "", fmt.Errorf("agent_message encrypted_content is opaque and cannot be safely projected to Kiro")
+			}
+			out.WriteString(value)
+		}
+	}
+	return out.String(), nil
+}
+
+func responsesEncryptedContentOpaque(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "ocx1:") || strings.HasPrefix(lower, "fernet:") || strings.HasPrefix(trimmed, "gAAAA") {
+		return true
+	}
+	// Long token-like blobs with no whitespace are safer to treat as opaque.
+	if len(trimmed) >= 96 && !strings.ContainsAny(trimmed, " \t\r\n") {
+		for _, r := range trimmed {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("-_+/=:.", r) {
+				continue
+			}
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 func buildMessageFromInputItem(obj map[string]interface{}, role string) *OpenAIMessage {

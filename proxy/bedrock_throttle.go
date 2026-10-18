@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"kiro-go/config"
 )
 
 // errBedrockThrottled signals a model is in a throttle cooldown. It is a
@@ -34,22 +36,28 @@ const (
 	bedrockMaxThrottleCooldown = 5 * time.Minute
 )
 
-type bedrockThrottleState struct {
-	mu    sync.RWMutex
-	until map[string]time.Time
+type bedrockThrottleKey struct {
+	lifecycle accountLifecycleKey
+	model     string
 }
 
-var bedrockThrottle = &bedrockThrottleState{until: map[string]time.Time{}}
+type bedrockThrottleState struct {
+	mu    sync.RWMutex
+	until map[bedrockThrottleKey]time.Time
+}
 
-func bedrockThrottleKey(accountID, model string) string {
-	return accountID + "\x00" + model
+var bedrockThrottle = &bedrockThrottleState{until: map[bedrockThrottleKey]time.Time{}}
+
+func newBedrockThrottleKey(account *config.Account, model string) bedrockThrottleKey {
+	return bedrockThrottleKey{lifecycle: lifecycleOrLegacyKeyForAccount(account), model: model}
 }
 
 // remaining returns the time left in the (account, model) cooldown, or 0.
-func (s *bedrockThrottleState) remaining(accountID, model string) time.Duration {
+func (s *bedrockThrottleState) remainingForAccount(account *config.Account, model string) time.Duration {
+	key := newBedrockThrottleKey(account, model)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	t, ok := s.until[bedrockThrottleKey(accountID, model)]
+	t, ok := s.until[key]
 	if !ok {
 		return 0
 	}
@@ -63,7 +71,7 @@ func (s *bedrockThrottleState) remaining(accountID, model string) time.Duration 
 // non-positive duration falls back to the default; oversized values are capped.
 // An existing longer cooldown is kept (never shortened by a concurrent 429 that
 // carried a smaller Retry-After).
-func (s *bedrockThrottleState) record(accountID, model string, d time.Duration) {
+func (s *bedrockThrottleState) recordForAccount(account *config.Account, model string, d time.Duration) {
 	if d <= 0 {
 		d = bedrockDefaultThrottleCooldown
 	}
@@ -71,7 +79,78 @@ func (s *bedrockThrottleState) record(accountID, model string, d time.Duration) 
 		d = bedrockMaxThrottleCooldown
 	}
 	until := time.Now().Add(d)
-	key := bedrockThrottleKey(accountID, model)
+	key := newBedrockThrottleKey(account, model)
+	if !lifecycleRuntimeKeyCanPublish(key.lifecycle) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for existingKey, existingUntil := range s.until {
+		if !existingUntil.After(now) {
+			delete(s.until, existingKey)
+		}
+	}
+	if existing, ok := s.until[key]; ok && existing.After(until) {
+		return
+	}
+	s.until[key] = until
+}
+
+// noteBedrockResponseThrottle records a cooldown when a Bedrock response is a 429.
+func noteBedrockResponseThrottleForAccount(account *config.Account, model string, resp *http.Response) {
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		return
+	}
+	bedrockThrottle.recordForAccount(account, model, parseRetryAfterSeconds(resp.Header.Get("Retry-After")))
+}
+
+func (s *bedrockThrottleState) clearForLifecycle(account *config.Account) bool {
+	if s == nil || account == nil || strings.TrimSpace(account.ID) == "" || account.DispatchGeneration == 0 {
+		return false
+	}
+	key := accountLifecycleKey{accountID: account.ID, generation: account.DispatchGeneration}
+	s.mu.Lock()
+	for throttleKey := range s.until {
+		if throttleKey.lifecycle == key {
+			delete(s.until, throttleKey)
+		}
+	}
+	s.mu.Unlock()
+	return true
+}
+
+// Legacy ID-only throttle helpers use generation 0 so unchanged tests/admin code
+// keeps its previous semantics without sharing state with dispatched requests.
+func (s *bedrockThrottleState) remaining(accountID, model string) time.Duration {
+	if accountID == "" {
+		return 0
+	}
+	key := bedrockThrottleKey{lifecycle: legacyBedrockLifecycleKey(accountID), model: model}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.until[key]
+	if !ok {
+		return 0
+	}
+	if d := time.Until(t); d > 0 {
+		return d
+	}
+	return 0
+}
+
+func (s *bedrockThrottleState) record(accountID, model string, d time.Duration) {
+	if accountID == "" {
+		return
+	}
+	if d <= 0 {
+		d = bedrockDefaultThrottleCooldown
+	}
+	if d > bedrockMaxThrottleCooldown {
+		d = bedrockMaxThrottleCooldown
+	}
+	until := time.Now().Add(d)
+	key := bedrockThrottleKey{lifecycle: legacyBedrockLifecycleKey(accountID), model: model}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, ok := s.until[key]; ok && existing.After(until) {
@@ -80,7 +159,6 @@ func (s *bedrockThrottleState) record(accountID, model string, d time.Duration) 
 	s.until[key] = until
 }
 
-// noteBedrockResponseThrottle records a cooldown when a Bedrock response is a 429.
 func noteBedrockResponseThrottle(accountID, model string, resp *http.Response) {
 	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
 		return

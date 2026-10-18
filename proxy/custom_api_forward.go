@@ -2,9 +2,12 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,6 +18,7 @@ import (
 
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/pool"
 )
 
 // customApiCreditsPer1kTokens is the operator-configured credit price for traffic
@@ -98,11 +102,62 @@ func (f quotaFields) toQuota() *customApiQuota {
 	}
 }
 
-// customApiHTTPClient is a direct-transport client (Proxy nil) so pool-to-pool
-// probes go straight out and never touch the process-global ProxyFromEnvironment
-// cache — keeping add-time probes independent of egress-proxy env state.
+const (
+	customAPIProbeTimeout         = 5 * time.Second
+	customAPIModelProbeTimeout    = 10 * time.Second
+	customAPINonStreamIdleTimeout = 2 * time.Minute
+	customAPIStreamIdleTimeout    = 15 * time.Minute
+)
+
+var errCustomAPIResponseTooLarge = errors.New(
+	"custom API response body exceeds configured limit",
+)
+
+func readCustomAPIResponseBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	if body == nil {
+		return nil, errors.New("custom API response body is nil")
+	}
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("custom API response body limit must be positive: %d", maxBytes)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf(
+			"%w: limit=%d bytes",
+			errCustomAPIResponseTooLarge,
+			maxBytes,
+		)
+	}
+	return data, nil
+}
+
+var customAPIDirectTransport = &http.Transport{
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	TLSHandshakeTimeout:   15 * time.Second,
+	ResponseHeaderTimeout: 2 * time.Minute,
+	ExpectContinueTimeout: 1 * time.Second,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   20,
+	IdleConnTimeout:       90 * time.Second,
+	ForceAttemptHTTP2:     true,
+}
+
+var customAPIDirectClient = &http.Client{
+	Transport: customAPIDirectTransport,
+}
+
+// customApiHTTPClient is a shared direct-transport client (Proxy nil) so
+// pool-to-pool probes and forwarding reuse connections without touching the
+// process-global ProxyFromEnvironment transport.
 func customApiHTTPClient() *http.Client {
-	return &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{}}
+	return customAPIDirectClient
 }
 
 // quotaEndpointPref caches which quota endpoint answered for a given baseURL. The
@@ -111,26 +166,36 @@ func customApiHTTPClient() *http.Client {
 // every single request. baseURL -> "apime" | "checkkey".
 var quotaEndpointPref sync.Map
 
-// probeCustomApiQuota fetches the upstream key's quota. It tries GET {baseURL}/api/me
-// (Kiro-Go pools) first; if that is unavailable it falls back to POST
-// {baseURL}/checkkey/info with {"key": apiKey} (other pool software). The endpoint
-// that last worked for a baseURL is cached and tried first. Package var so tests can
-// stub the round-trip.
+// probeCustomApiQuota fetches the upstream key's quota. The context-aware
+// implementation is used by request/admin paths so cancellation propagates all
+// the way to the outbound request. The legacy package variable remains for
+// focused tests and background callers that intentionally use a bounded context.
 var probeCustomApiQuota = func(baseURL, apiKey string) (*customApiQuota, error) {
-	// Fast path: reuse the endpoint that last answered for this pool.
+	return probeCustomApiQuotaWithContext(context.Background(), baseURL, apiKey)
+}
+
+func boundedProbeContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func probeCustomApiQuotaWithContext(ctx context.Context, baseURL, apiKey string) (*customApiQuota, error) {
+	ctx, cancel := boundedProbeContext(ctx, customAPIProbeTimeout)
+	defer cancel()
+
 	if pref, ok := quotaEndpointPref.Load(baseURL); ok && pref == "checkkey" {
-		if q, err := probeQuotaViaCheckKey(baseURL, apiKey); err == nil {
+		if q, err := probeQuotaViaCheckKey(ctx, baseURL, apiKey); err == nil {
 			return q, nil
 		}
-		// Cached endpoint stopped answering — fall through to the full probe.
 	}
-	q, err := probeQuotaViaApiMe(baseURL, apiKey)
+	q, err := probeQuotaViaApiMe(ctx, baseURL, apiKey)
 	if err == nil {
 		quotaEndpointPref.Store(baseURL, "apime")
 		return q, nil
 	}
-	// /api/me unavailable — try the /checkkey/info fallback.
-	q2, err2 := probeQuotaViaCheckKey(baseURL, apiKey)
+	q2, err2 := probeQuotaViaCheckKey(ctx, baseURL, apiKey)
 	if err2 == nil {
 		quotaEndpointPref.Store(baseURL, "checkkey")
 		return q2, nil
@@ -138,10 +203,9 @@ var probeCustomApiQuota = func(baseURL, apiKey string) (*customApiQuota, error) 
 	return &customApiQuota{OK: false}, fmt.Errorf("quota check failed (api/me: %v; checkkey/info: %v)", err, err2)
 }
 
-// probeQuotaViaApiMe reads GET {baseURL}/api/me with the key as a bearer token.
-func probeQuotaViaApiMe(baseURL, apiKey string) (*customApiQuota, error) {
-	url := strings.TrimRight(baseURL, "/") + "/api/me"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func probeQuotaViaApiMe(ctx context.Context, baseURL, apiKey string) (*customApiQuota, error) {
+	u := strings.TrimRight(baseURL, "/") + "/api/me"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -152,9 +216,15 @@ func probeQuotaViaApiMe(baseURL, apiKey string) (*customApiQuota, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, readErr := readCustomAPIResponseBody(resp.Body, 1<<20)
 	if resp.StatusCode != http.StatusOK {
+		if readErr != nil {
+			return nil, fmt.Errorf("/api/me returned %d and response body read failed: %w", resp.StatusCode, readErr)
+		}
 		return nil, fmt.Errorf("/api/me returned %d", resp.StatusCode)
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("/api/me: read response body: %w", readErr)
 	}
 	var raw quotaFields
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -163,12 +233,10 @@ func probeQuotaViaApiMe(baseURL, apiKey string) (*customApiQuota, error) {
 	return raw.toQuota(), nil
 }
 
-// probeQuotaViaCheckKey reads POST {baseURL}/checkkey/info with {"key": apiKey}. A
-// "found": false response means the key does not exist on that upstream.
-func probeQuotaViaCheckKey(baseURL, apiKey string) (*customApiQuota, error) {
-	url := strings.TrimRight(baseURL, "/") + "/checkkey/info"
+func probeQuotaViaCheckKey(ctx context.Context, baseURL, apiKey string) (*customApiQuota, error) {
+	u := strings.TrimRight(baseURL, "/") + "/checkkey/info"
 	reqBody, _ := json.Marshal(map[string]string{"key": apiKey})
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}
@@ -178,9 +246,15 @@ func probeQuotaViaCheckKey(baseURL, apiKey string) (*customApiQuota, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, readErr := readCustomAPIResponseBody(resp.Body, 1<<20)
 	if resp.StatusCode != http.StatusOK {
+		if readErr != nil {
+			return nil, fmt.Errorf("/checkkey/info returned %d and response body read failed: %w", resp.StatusCode, readErr)
+		}
 		return nil, fmt.Errorf("/checkkey/info returned %d", resp.StatusCode)
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("/checkkey/info: read response body: %w", readErr)
 	}
 	var raw quotaFields
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -192,27 +266,36 @@ func probeQuotaViaCheckKey(baseURL, apiKey string) (*customApiQuota, error) {
 	return raw.toQuota(), nil
 }
 
-// probeCustomApiModels fetches the model list from the upstream pool's OpenAI-style
-// GET {baseURL}/v1/models (data:[{id}]) using the upstream key, and returns them as
-// ModelInfo. Custom API accounts serve whatever the linked pool serves, so the model
-// list must come from the upstream, not from Kiro/AWS. Package var so tests can stub.
+// probeCustomApiModels is retained for focused tests and callers without an
+// existing request context.
 var probeCustomApiModels = func(baseURL, apiKey string) ([]ModelInfo, error) {
-	url := strings.TrimRight(baseURL, "/") + "/v1/models"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	return probeCustomApiModelsWithContext(context.Background(), baseURL, apiKey)
+}
+
+func probeCustomApiModelsWithContext(ctx context.Context, baseURL, apiKey string) ([]ModelInfo, error) {
+	ctx, cancel := boundedProbeContext(ctx, customAPIModelProbeTimeout)
+	defer cancel()
+	u := strings.TrimRight(baseURL, "/") + "/v1/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("x-api-key", apiKey)
-	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{}}
-	resp, err := client.Do(req)
+	resp, err := customApiHTTPClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	body, readErr := readCustomAPIResponseBody(resp.Body, 4<<20)
 	if resp.StatusCode != http.StatusOK {
+		if readErr != nil {
+			return nil, fmt.Errorf("upstream /v1/models returned %d and response body read failed: %w", resp.StatusCode, readErr)
+		}
 		return nil, fmt.Errorf("upstream /v1/models returned %d", resp.StatusCode)
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("upstream /v1/models: read response body: %w", readErr)
 	}
 	var raw struct {
 		Data []struct {
@@ -233,10 +316,159 @@ var probeCustomApiModels = func(baseURL, apiKey string) ([]ModelInfo, error) {
 	return models, nil
 }
 
+const (
+	directAnthropicModelsMaxPages = 100
+	directAnthropicModelsMaxItems = 10000
+)
+
+// probeDirectAnthropicModels follows Anthropic's cursor pagination contract.
+// The compatibility wrapper returns ModelInfo while the detailed variant also
+// preserves provider capability metadata for the shared capability registry.
+var probeDirectAnthropicModels = func(ctx context.Context, baseURL, apiKey string) ([]ModelInfo, error) {
+	models, _, err := probeDirectAnthropicModelsDetailed(ctx, baseURL, apiKey)
+	return models, err
+}
+
+func probeDirectAnthropicModelsDetailed(
+	ctx context.Context,
+	baseURL,
+	apiKey string,
+) ([]ModelInfo, map[string]directAnthropicModelMetadata, error) {
+	ctx, cancel := boundedProbeContext(ctx, customAPIModelProbeTimeout)
+	defer cancel()
+
+	endpoint, err := directAnthropicEndpointURL(baseURL, "/v1/models")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	models := make([]ModelInfo, 0)
+	metadata := make(map[string]directAnthropicModelMetadata)
+	seenModels := make(map[string]struct{})
+	seenCursors := make(map[string]struct{})
+	afterID := ""
+
+	for page := 0; page < directAnthropicModelsMaxPages; page++ {
+		u, parseErr := url.Parse(endpoint)
+		if parseErr != nil {
+			return nil, nil, fmt.Errorf("direct Anthropic /v1/models URL: %w", parseErr)
+		}
+		query := u.Query()
+		query.Set("limit", "1000")
+		if afterID != "" {
+			query.Set("after_id", afterID)
+		}
+		u.RawQuery = query.Encode()
+
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if requestErr != nil {
+			return nil, nil, requestErr
+		}
+		req.Header.Set("x-api-key", apiKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("Accept", "application/json")
+
+		resp, requestErr := customApiHTTPClient().Do(req)
+		if requestErr != nil {
+			return nil, nil, requestErr
+		}
+		maxBodyBytes := int64(4 << 20)
+		if resp.StatusCode != http.StatusOK {
+			maxBodyBytes = maxDirectAnthropicErrorBodyBytes
+		}
+		body, readErr := readCustomAPIResponseBody(resp.Body, maxBodyBytes)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, nil, fmt.Errorf("direct Anthropic /v1/models: read response body: %w", readErr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, nil, newDirectAnthropicResponseError(resp, body)
+		}
+
+		var raw struct {
+			Data []struct {
+				ID             string                            `json:"id"`
+				DisplayName    string                            `json:"display_name"`
+				CreatedAt      string                            `json:"created_at"`
+				MaxInputTokens int64                             `json:"max_input_tokens"`
+				MaxTokens      int64                             `json:"max_tokens"`
+				Capabilities   *directAnthropicModelCapabilities `json:"capabilities"`
+			} `json:"data"`
+			HasMore bool   `json:"has_more"`
+			LastID  string `json:"last_id"`
+		}
+		if err := json.Unmarshal(body, &raw); err != nil {
+			return nil, nil, fmt.Errorf("direct Anthropic /v1/models: bad JSON: %w", err)
+		}
+
+		for _, item := range raw.Data {
+			id := strings.TrimSpace(item.ID)
+			if id == "" {
+				continue
+			}
+			key := id
+			if _, exists := seenModels[key]; exists {
+				continue
+			}
+			seenModels[key] = struct{}{}
+			name := strings.TrimSpace(item.DisplayName)
+			if name == "" {
+				name = id
+			}
+			inputTypes := []string{"TEXT"}
+			if item.Capabilities != nil && item.Capabilities.ImageInput.Supported {
+				inputTypes = append(inputTypes, "IMAGE")
+			}
+			models = append(models, ModelInfo{ModelId: id, ModelName: name, InputTypes: inputTypes})
+			modelMetadata := directAnthropicModelMetadata{
+				ID:             id,
+				DisplayName:    name,
+				CreatedAt:      item.CreatedAt,
+				MaxInputTokens: item.MaxInputTokens,
+				MaxTokens:      item.MaxTokens,
+			}
+			if item.Capabilities != nil {
+				modelMetadata.Capabilities = *item.Capabilities
+				modelMetadata.CapabilitiesPresent = true
+			}
+			metadata[key] = modelMetadata
+			if len(models) > directAnthropicModelsMaxItems {
+				return nil, nil, fmt.Errorf("direct Anthropic /v1/models exceeded %d models", directAnthropicModelsMaxItems)
+			}
+		}
+
+		if !raw.HasMore {
+			return models, metadata, nil
+		}
+		nextCursor := strings.TrimSpace(raw.LastID)
+		if nextCursor == "" {
+			return nil, nil, errors.New("direct Anthropic /v1/models has_more=true without last_id")
+		}
+		if nextCursor == afterID {
+			return nil, nil, fmt.Errorf("direct Anthropic /v1/models cursor did not advance: %q", nextCursor)
+		}
+		if _, exists := seenCursors[nextCursor]; exists {
+			return nil, nil, fmt.Errorf("direct Anthropic /v1/models repeated cursor: %q", nextCursor)
+		}
+		seenCursors[nextCursor] = struct{}{}
+		afterID = nextCursor
+	}
+
+	return nil, nil, fmt.Errorf("direct Anthropic /v1/models exceeded %d pages", directAnthropicModelsMaxPages)
+}
+
 // customApiTestReply sends a minimal chat request through the linked upstream pool
 // and returns the assistant reply text, so the admin "test account" button verifies
 // the whole path (auth + routing) end-to-end. model defaults when empty.
-func customApiTestReply(baseURL, apiKey, model string) (string, error) {
+func customApiTestReply(
+	ctx context.Context,
+	baseURL,
+	apiKey,
+	model string,
+) (string, error) {
+	if ctx == nil {
+		return "", errors.New("custom_api test requires a non-nil context")
+	}
 	if strings.TrimSpace(model) == "" {
 		model = "claude-sonnet-4"
 	}
@@ -248,14 +480,32 @@ func customApiTestReply(baseURL, apiKey, model string) (string, error) {
 	}
 	body, _ := json.Marshal(reqBody)
 	url := strings.TrimRight(baseURL, "/") + "/v1/chat/completions"
-	resp, err := forwardUpstreamRequest(http.MethodPost, url, apiKey, body, false)
+	resp, err := forwardUpstreamRequest(
+		ctx,
+		http.MethodPost,
+		url,
+		apiKey,
+		body,
+		false,
+		nil,
+	)
 	if err != nil {
 		return "", fmt.Errorf("custom_api test connect: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, readErr := readCustomAPIResponseBody(resp.Body, 1<<20)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if readErr != nil {
+			return "", fmt.Errorf(
+				"custom_api upstream HTTP %d and response body read failed: %w",
+				resp.StatusCode,
+				readErr,
+			)
+		}
 		return "", fmt.Errorf("custom_api upstream HTTP %d", resp.StatusCode)
+	}
+	if readErr != nil {
+		return "", fmt.Errorf("custom_api test read response body: %w", readErr)
 	}
 	var parsed struct {
 		Choices []struct {
@@ -271,6 +521,79 @@ func customApiTestReply(baseURL, apiKey, model string) (string, error) {
 		return "", fmt.Errorf("custom_api test: empty response")
 	}
 	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+}
+
+// directAnthropicTestReply verifies an authMethod=anthropic_api account against
+// the native Messages endpoint. It deliberately does not add the Kiro-Go relay
+// marker and preserves the required Anthropic version header.
+func directAnthropicTestReply(
+	ctx context.Context,
+	baseURL,
+	apiKey,
+	model string,
+) (string, error) {
+	if ctx == nil {
+		return "", errors.New("direct Anthropic test requires a non-nil context")
+	}
+	if strings.TrimSpace(model) == "" {
+		model = directAnthropicDefaultTestModel
+	}
+	body, _ := json.Marshal(map[string]interface{}{
+		"model": model,
+		"messages": []map[string]interface{}{{
+			"role": "user", "content": "say ok",
+		}},
+		"max_tokens": 16,
+		"stream":     false,
+	})
+	semanticHeaders := make(http.Header)
+	semanticHeaders.Set("Anthropic-Version", "2023-06-01")
+	endpoint, err := directAnthropicEndpointURL(baseURL, "/v1/messages")
+	if err != nil {
+		return "", err
+	}
+	resp, err := forwardDirectAnthropicRequest(
+		ctx,
+		http.MethodPost,
+		endpoint,
+		apiKey,
+		body,
+		false,
+		semanticHeaders,
+	)
+	if err != nil {
+		return "", fmt.Errorf("direct Anthropic test connect: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, readErr := readCustomAPIResponseBody(resp.Body, 1<<20)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if readErr != nil {
+			return "", &directAnthropicTransportError{Err: fmt.Errorf(
+				"HTTP %d error body: %w",
+				resp.StatusCode,
+				readErr,
+			)}
+		}
+		return "", newDirectAnthropicResponseError(resp, raw)
+	}
+	if readErr != nil {
+		return "", fmt.Errorf("direct Anthropic test read response body: %w", readErr)
+	}
+	var parsed struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", fmt.Errorf("direct Anthropic test: bad JSON: %w", err)
+	}
+	for _, block := range parsed.Content {
+		if strings.EqualFold(strings.TrimSpace(block.Type), "text") && strings.TrimSpace(block.Text) != "" {
+			return strings.TrimSpace(block.Text), nil
+		}
+	}
+	return "", errors.New("direct Anthropic test: empty text response")
 }
 
 // customApiQuotaAcceptable is the add-time gate: accept when the upstream key is
@@ -307,15 +630,58 @@ func normalizeBaseURL(raw string) (string, error) {
 	return u.Scheme + "://" + u.Host + strings.TrimRight(u.Path, "/"), nil
 }
 
+// normalizeDirectAnthropicBaseURL accepts either an Anthropic-compatible API
+// origin or the same URL ending in /v1. It stores a canonical API root so callers
+// can append /v1/messages and /v1/models exactly once. Concrete endpoint URLs are
+// rejected because silently appending another route would produce ambiguous paths.
+func normalizeDirectAnthropicBaseURL(raw string) (string, error) {
+	normalized, err := normalizeBaseURL(raw)
+	if err != nil {
+		return "", err
+	}
+
+	u, err := url.Parse(normalized)
+	if err != nil {
+		return "", fmt.Errorf("baseUrl is not a valid URL: %w", err)
+	}
+
+	path := strings.TrimRight(u.Path, "/")
+	lowerPath := strings.ToLower(path)
+	if strings.HasSuffix(lowerPath, "/v1/messages") ||
+		strings.HasSuffix(lowerPath, "/v1/models") {
+		return "", fmt.Errorf("baseUrl must be an API root or end in /v1, not a concrete Anthropic endpoint")
+	}
+	if strings.HasSuffix(lowerPath, "/v1") {
+		path = path[:len(path)-len("/v1")]
+	}
+
+	return u.Scheme + "://" + u.Host + strings.TrimRight(path, "/"), nil
+}
+
+func directAnthropicEndpointURL(baseURL, endpointPath string) (string, error) {
+	base, err := normalizeDirectAnthropicBaseURL(baseURL)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(endpointPath, "/") {
+		return "", fmt.Errorf("Anthropic endpoint path must start with /: %q", endpointPath)
+	}
+	return strings.TrimRight(base, "/") + endpointPath, nil
+}
+
 // forwardParams bundles everything forwardToUpstream needs from a dispatch handler.
 type forwardParams struct {
-	account   *config.Account
-	body      []byte
-	endpoint  string // "anthropic" | "openai"
-	streaming bool
-	model     string
-	apiKeyID  string
-	forwarded bool // incoming request already carried forwardHeader
+	selection       *pool.AccountSelection
+	account         *config.Account
+	body            []byte
+	endpoint        string // "anthropic" | "openai"
+	streaming       bool
+	model           string // client-visible/requested model
+	providerModelID string // exact provider target captured by the candidate plan
+	apiKeyID        string
+	forwarded       bool // incoming request already carried forwardHeader
+	semanticHeaders http.Header
+	requestContext  context.Context
 }
 
 // upstreamPath maps the incoming API surface to the upstream pool's path.
@@ -330,30 +696,158 @@ func upstreamPath(endpoint string) string {
 	}
 }
 
+func requestedModelFromJSON(body []byte, fallback string) string {
+	var envelope struct {
+		Model string `json:"model"`
+	}
+	if len(body) > 0 && json.Unmarshal(body, &envelope) == nil {
+		if model := strings.TrimSpace(envelope.Model); model != "" {
+			return model
+		}
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func rewriteForwardBodyModel(body []byte, providerModelID string) ([]byte, error) {
+	providerModelID = strings.TrimSpace(providerModelID)
+	if providerModelID == "" || len(body) == 0 {
+		return body, nil
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, fmt.Errorf("rewrite forwarded request model: %w", err)
+	}
+	encodedModel, err := json.Marshal(providerModelID)
+	if err != nil {
+		return nil, fmt.Errorf("encode forwarded provider model: %w", err)
+	}
+	envelope["model"] = encodedModel
+	rewritten, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("rewrite forwarded request: %w", err)
+	}
+	return rewritten, nil
+}
+
 // forwardUpstreamRequest performs the actual round-trip to the upstream pool. It
 // is a package var so tests can stub it; the default does a real HTTP call.
-var forwardUpstreamRequest = func(method, url, apiKey string, body []byte, stream bool) (*http.Response, error) {
-	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+func cloneAnthropicSemanticHeaders(source http.Header) http.Header {
+	if len(source) == 0 {
+		return nil
+	}
+	// Keep this as an explicit request-semantic allowlist. A prefix match would
+	// also forward future credential, routing, or internal headers supplied by
+	// an untrusted client.
+	result := make(http.Header)
+	for key, values := range source {
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "anthropic-beta", "anthropic-version",
+			"anthropic-user-profile-id":
+		default:
+			continue
+		}
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				result.Add(key, value)
+			}
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+var forwardUpstreamRequest = func(
+	ctx context.Context,
+	method,
+	url,
+	apiKey string,
+	body []byte,
+	stream bool,
+	semanticHeaders http.Header,
+) (*http.Response, error) {
+	return doForwardUpstreamRequest(
+		ctx, method, url, apiKey, body, stream, semanticHeaders, true, false,
+	)
+}
+
+// forwardDirectAnthropicRequest uses the same bounded transport as a relay but
+// does not add the Kiro-Go loop marker. It is used only for accounts explicitly
+// configured with authMethod=anthropic_api.
+var forwardDirectAnthropicRequest = func(
+	ctx context.Context,
+	method,
+	url,
+	apiKey string,
+	body []byte,
+	stream bool,
+	semanticHeaders http.Header,
+) (*http.Response, error) {
+	headers := cloneAnthropicSemanticHeaders(semanticHeaders)
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	if strings.TrimSpace(headers.Get("Anthropic-Version")) == "" {
+		headers.Set("Anthropic-Version", "2023-06-01")
+	}
+	return doForwardUpstreamRequest(
+		ctx, method, url, apiKey, body, stream, headers, false, true,
+	)
+}
+
+func doForwardUpstreamRequest(
+	ctx context.Context,
+	method,
+	url,
+	apiKey string,
+	body []byte,
+	stream bool,
+	semanticHeaders http.Header,
+	markForwarded bool,
+	directAnthropic bool,
+) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		method,
+		url,
+		bytes.NewReader(body),
+	)
 	if err != nil {
 		return nil, err
 	}
+	for key, values := range cloneAnthropicSemanticHeaders(semanticHeaders) {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if !directAnthropic {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set(forwardHeader, "1")
+	if markForwarded {
+		req.Header.Set(forwardHeader, "1")
+	}
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
-	// Direct transport (Proxy nil): pool-to-pool forwarding goes straight out and
-	// avoids coupling to the process-global ProxyFromEnvironment cache that
-	// http.DefaultTransport shares. Streaming replies are long-lived so they get no
-	// overall timeout; non-stream replies get a ceiling so a hung upstream can't pin
-	// the request forever.
-	client := &http.Client{Transport: &http.Transport{}}
-	if !stream {
-		client.Timeout = 120 * time.Second
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	req = req.WithContext(requestCtx)
+	resp, err := customApiHTTPClient().Do(req)
+	if err != nil {
+		cancelRequest()
+		return nil, err
 	}
-	return client.Do(req)
+	idleTimeout := customAPINonStreamIdleTimeout
+	if stream {
+		idleTimeout = customAPIStreamIdleTimeout
+	}
+	resp.Body = newIdleWatchdogReadCloser(resp.Body, idleTimeout, cancelRequest)
+	return resp, nil
 }
 
 // parseUpstreamUsage best-effort extracts token counts from a JSON reply (or a
@@ -377,30 +871,306 @@ func parseUpstreamUsage(endpoint string, body []byte) (int, int) {
 	return raw.Usage.InputTokens, raw.Usage.OutputTokens
 }
 
+const (
+	maxDirectAnthropicErrorBodyBytes = 1 << 20
+	directAnthropicDefaultTestModel  = "claude-sonnet-4-6"
+)
+
+// directAnthropicResponseError preserves a terminal provider response across
+// account failover. Client errors remain terminal; credential and transient
+// failures may try another account without collapsing the final response to 500.
+type directAnthropicTransportError struct {
+	Err error
+}
+
+func (e *directAnthropicTransportError) Error() string {
+	if e == nil || e.Err == nil {
+		return "direct Anthropic transport failed"
+	}
+	return "direct Anthropic transport failed: " + e.Err.Error()
+}
+
+func (e *directAnthropicTransportError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+type directAnthropicErrorScope uint8
+
+const (
+	directAnthropicErrorRequest directAnthropicErrorScope = iota
+	directAnthropicErrorCredential
+	directAnthropicErrorBilling
+	directAnthropicErrorPermission
+	directAnthropicErrorNotFound
+	directAnthropicErrorRateLimit
+	directAnthropicErrorTransient
+)
+
+type directAnthropicResponseError struct {
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+	ErrorType  string
+	Message    string
+	RequestID  string
+	Scope      directAnthropicErrorScope
+	RetryAfter time.Duration
+	Retryable  bool
+}
+
+func (e *directAnthropicResponseError) Error() string {
+	if e == nil {
+		return "direct Anthropic response error"
+	}
+	if strings.TrimSpace(e.ErrorType) != "" {
+		return fmt.Sprintf("direct Anthropic upstream HTTP %d (%s)", e.StatusCode, e.ErrorType)
+	}
+	return fmt.Sprintf("direct Anthropic upstream HTTP %d", e.StatusCode)
+}
+
+type directAnthropicErrorBody struct {
+	Error struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error"`
+	RequestID string `json:"request_id"`
+}
+
+func parseRetryAfter(header http.Header, now time.Time) time.Duration {
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		const maxRetryAfterSeconds = int64((24 * time.Hour) / time.Second)
+		if seconds > maxRetryAfterSeconds {
+			seconds = maxRetryAfterSeconds
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		if delay := at.Sub(now); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+func classifyDirectAnthropicError(status int, errorType string) directAnthropicErrorScope {
+	switch strings.ToLower(strings.TrimSpace(errorType)) {
+	case "authentication_error":
+		return directAnthropicErrorCredential
+	case "billing_error":
+		return directAnthropicErrorBilling
+	case "permission_error":
+		return directAnthropicErrorPermission
+	case "not_found_error":
+		return directAnthropicErrorNotFound
+	case "rate_limit_error":
+		return directAnthropicErrorRateLimit
+	case "api_error", "timeout_error", "overloaded_error":
+		return directAnthropicErrorTransient
+	}
+
+	switch {
+	case status == http.StatusUnauthorized:
+		return directAnthropicErrorCredential
+	case status == http.StatusPaymentRequired:
+		return directAnthropicErrorBilling
+	case status == http.StatusForbidden:
+		return directAnthropicErrorPermission
+	case status == http.StatusNotFound:
+		return directAnthropicErrorNotFound
+	case status == http.StatusTooManyRequests:
+		return directAnthropicErrorRateLimit
+	case status >= 500:
+		return directAnthropicErrorTransient
+	default:
+		return directAnthropicErrorRequest
+	}
+}
+
+func directAnthropicScopeRetryable(scope directAnthropicErrorScope) bool {
+	switch scope {
+	case directAnthropicErrorCredential,
+		directAnthropicErrorBilling,
+		directAnthropicErrorPermission,
+		directAnthropicErrorNotFound,
+		directAnthropicErrorRateLimit,
+		directAnthropicErrorTransient:
+		return true
+	default:
+		return false
+	}
+}
+
+func newDirectAnthropicResponseError(resp *http.Response, body []byte) *directAnthropicResponseError {
+	status := 0
+	header := make(http.Header)
+	if resp != nil {
+		status = resp.StatusCode
+		header = cloneDirectAnthropicResponseHeaders(resp.Header)
+	}
+	var payload directAnthropicErrorBody
+	_ = json.Unmarshal(body, &payload)
+	errorType := strings.TrimSpace(payload.Error.Type)
+	scope := classifyDirectAnthropicError(status, errorType)
+	requestID := strings.TrimSpace(payload.RequestID)
+	if requestID == "" {
+		requestID = strings.TrimSpace(header.Get("Request-Id"))
+	}
+	return &directAnthropicResponseError{
+		StatusCode: status,
+		Header:     header,
+		Body:       append([]byte(nil), body...),
+		ErrorType:  errorType,
+		Message:    strings.TrimSpace(payload.Error.Message),
+		RequestID:  requestID,
+		Scope:      scope,
+		RetryAfter: parseRetryAfter(header, time.Now()),
+		Retryable:  directAnthropicScopeRetryable(scope),
+	}
+}
+
+func cloneDirectAnthropicResponseHeaders(source http.Header) http.Header {
+	result := make(http.Header)
+	for key, values := range source {
+		lower := strings.ToLower(strings.TrimSpace(key))
+		if lower != "content-type" && lower != "request-id" && lower != "retry-after" &&
+			!strings.HasPrefix(lower, "anthropic-ratelimit-") {
+			continue
+		}
+		for _, value := range values {
+			result.Add(key, value)
+		}
+	}
+	return result
+}
+
+func appendAccessControlExposeHeader(dst http.Header, headerName string) {
+	name := strings.TrimSpace(headerName)
+	if dst == nil || name == "" {
+		return
+	}
+	existing := dst.Values("Access-Control-Expose-Headers")
+	seen := make(map[string]struct{})
+	ordered := make([]string, 0)
+	for _, value := range existing {
+		for _, item := range strings.Split(value, ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			key := strings.ToLower(item)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			ordered = append(ordered, item)
+		}
+	}
+	if _, ok := seen[strings.ToLower(name)]; !ok {
+		ordered = append(ordered, name)
+	}
+	dst.Set("Access-Control-Expose-Headers", strings.Join(ordered, ", "))
+}
+
+func copyDirectAnthropicResponseHeaders(dst, source http.Header) {
+	for key, values := range cloneDirectAnthropicResponseHeaders(source) {
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+		lower := strings.ToLower(strings.TrimSpace(key))
+		if lower == "request-id" || lower == "retry-after" ||
+			strings.HasPrefix(lower, "anthropic-ratelimit-") {
+			appendAccessControlExposeHeader(dst, key)
+		}
+	}
+}
+
+func writeDirectAnthropicResponseError(w http.ResponseWriter, responseErr *directAnthropicResponseError) {
+	if responseErr == nil {
+		return
+	}
+	copyDirectAnthropicResponseHeaders(w.Header(), responseErr.Header)
+	if strings.TrimSpace(w.Header().Get("Content-Type")) == "" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	}
+	w.WriteHeader(responseErr.StatusCode)
+	_, _ = w.Write(responseErr.Body)
+}
+
 // forwardToUpstream proxies the raw request to the account's upstream pool. On any
 // failure BEFORE a 2xx reply it returns an error and writes nothing, so the caller
 // can fail over to another account. After a 2xx it writes the reply and returns nil.
 func (h *Handler) forwardToUpstream(w http.ResponseWriter, flusher http.Flusher, p forwardParams) error {
-	// Loop guard: never add a second hop to an already-forwarded request.
-	if p.forwarded {
+	// Loop guard applies only to Kiro-Go pool relays. A direct Anthropic
+	// endpoint is terminal and must not inherit relay hop semantics.
+	if p.forwarded && p.account != nil && p.account.IsCustomApi() {
 		return fmt.Errorf("custom_api: refusing to forward an already-forwarded request (loop guard)")
 	}
 
 	reqStart := time.Now()
-	url := strings.TrimRight(p.account.BaseURL, "/") + upstreamPath(p.endpoint)
-	resp, err := forwardUpstreamRequest(http.MethodPost, url, p.account.KiroApiKey, p.body, p.streaming)
+	requestURL := strings.TrimRight(p.account.BaseURL, "/") + upstreamPath(p.endpoint)
+	requestFn := forwardUpstreamRequest
+	if p.account.IsDirectAnthropic() {
+		var endpointErr error
+		requestURL, endpointErr = directAnthropicEndpointURL(p.account.BaseURL, upstreamPath(p.endpoint))
+		if endpointErr != nil {
+			return &directAnthropicTransportError{Err: endpointErr}
+		}
+		requestFn = forwardDirectAnthropicRequest
+	}
+	forwardBody, rewriteErr := rewriteForwardBodyModel(p.body, p.providerModelID)
+	if rewriteErr != nil {
+		if p.account.IsDirectAnthropic() {
+			return &directAnthropicTransportError{Err: rewriteErr}
+		}
+		return rewriteErr
+	}
+	resp, err := requestFn(
+		p.requestContext,
+		http.MethodPost,
+		requestURL,
+		p.account.KiroApiKey,
+		forwardBody,
+		p.streaming,
+		p.semanticHeaders,
+	)
 	if err != nil {
+		if p.account.IsDirectAnthropic() {
+			return &directAnthropicTransportError{Err: err}
+		}
 		return fmt.Errorf("custom_api upstream connect: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Log the upstream body for the operator, but return a status-only error: this
-		// error can bubble to the end customer on failover exhaustion, and the linked
-		// pool's raw error body must not leak downstream. The status code is preserved
-		// so the ban classifier still sees 401/403 correctly. No client write here, so
-		// the caller can fail over to another account.
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if p.account.IsDirectAnthropic() {
+			body, readErr := readCustomAPIResponseBody(resp.Body, maxDirectAnthropicErrorBodyBytes)
+			if readErr != nil {
+				return &directAnthropicTransportError{Err: fmt.Errorf("HTTP %d error body: %w", resp.StatusCode, readErr)}
+			}
+			return newDirectAnthropicResponseError(resp, body)
+		}
+
+		// Linked pools are not terminal providers. Keep their raw error body private
+		// while preserving the status code for existing auth/failover classification.
+		msg, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		logger.Warnf("[CustomApi] upstream %s HTTP %d: %s", p.account.ID, resp.StatusCode, strings.TrimSpace(string(msg)))
+		if readErr != nil {
+			return fmt.Errorf(
+				"custom_api upstream HTTP %d and error body read failed: %w",
+				resp.StatusCode,
+				readErr,
+			)
+		}
 		return fmt.Errorf("custom_api upstream HTTP %d", resp.StatusCode)
 	}
 
@@ -410,16 +1180,49 @@ func (h *Handler) forwardToUpstream(w http.ResponseWriter, flusher http.Flusher,
 
 	// Non-streaming: copy the JSON reply verbatim, then meter. Cap the read so a
 	// misbehaving upstream cannot balloon memory (32 MiB is far above any real reply).
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	const maxNonStreamResponseBytes = 32 << 20
+	body, err := io.ReadAll(io.LimitReader(
+		resp.Body,
+		maxNonStreamResponseBytes+1,
+	))
 	if err != nil {
+		if p.account.IsDirectAnthropic() {
+			return &directAnthropicTransportError{Err: err}
+		}
 		return fmt.Errorf("custom_api upstream read: %w", err)
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write(body)
+	if len(body) > maxNonStreamResponseBytes {
+		err := fmt.Errorf("upstream response exceeds %d bytes", maxNonStreamResponseBytes)
+		if p.account.IsDirectAnthropic() {
+			return &directAnthropicTransportError{Err: err}
+		}
+		return fmt.Errorf("custom_api %w", err)
+	}
+	if p.account.IsDirectAnthropic() {
+		copyDirectAnthropicResponseHeaders(w.Header(), resp.Header)
+	}
+	if strings.TrimSpace(w.Header().Get("Content-Type")) == "" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	}
+	w.WriteHeader(resp.StatusCode)
+	n, writeErr := w.Write(body)
+	if writeErr != nil || n != len(body) {
+		if writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
+		// The response is already committed, so failover would corrupt the
+		// downstream response. Treat this as terminal client I/O, but do not
+		// record a successful upstream request or bill it as delivered.
+		logger.Warnf(
+			"[CustomApi] downstream write failed after commit account=%s: %v",
+			p.account.ID,
+			writeErr,
+		)
+		return nil
+	}
 
 	in, out := parseUpstreamUsage(p.endpoint, body)
-	h.recordCustomApiSuccess(p, in, out, reqStart)
+	h.recordForwardedUpstreamSuccess(p, in, out, reqStart)
 	return nil
 }
 
@@ -427,10 +1230,15 @@ func (h *Handler) forwardToUpstream(w http.ResponseWriter, flusher http.Flusher,
 // flushing as data arrives, and taps token usage from the stream on the way past.
 // Called only after a 2xx upstream status, so headers are safe to commit here.
 func (h *Handler) streamUpstream(w http.ResponseWriter, flusher http.Flusher, resp *http.Response, p forwardParams, reqStart time.Time) error {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	if p.account.IsDirectAnthropic() {
+		copyDirectAnthropicResponseHeaders(w.Header(), resp.Header)
+	}
+	if strings.TrimSpace(w.Header().Get("Content-Type")) == "" {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	}
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(resp.StatusCode)
 
 	// tail keeps a bounded window of the most recent stream bytes so we can parse
 	// the terminal usage event without holding the entire stream in memory.
@@ -469,6 +1277,13 @@ func (h *Handler) streamUpstream(w http.ResponseWriter, flusher http.Flusher, re
 	// Kiro path does) and record a FAILURE — never a success — so pool health reflects
 	// reality. Tokens from a truncated stream are not metered.
 	if streamErr != nil {
+		if p.requestContext != nil &&
+			p.requestContext.Err() != nil {
+			// The downstream request was canceled. Its context has already
+			// closed the upstream socket; this is neither an upstream health
+			// failure nor a response that should be metered as delivered.
+			return nil
+		}
 		msg := "custom_api upstream stream interrupted: " + streamErr.Error()
 		if p.endpoint == "anthropic" {
 			// Anthropic SSE error event shape.
@@ -484,13 +1299,17 @@ func (h *Handler) streamUpstream(w http.ResponseWriter, flusher http.Flusher, re
 		if p.endpoint == "openai" || p.endpoint == "responses" {
 			endpoint = "openai"
 		}
-		h.pool.RecordError(p.account.ID, false)
+		if p.selection != nil {
+			h.pool.RecordErrorForSelection(*p.selection, false)
+		} else {
+			h.pool.RecordError(p.account.ID, false)
+		}
 		h.recordFailureWithDetails(endpoint, p.model, p.account.ID, p.apiKeyID, streamErr)
 		return nil
 	}
 
 	in, out := parseStreamUsage(p.endpoint, tail.Bytes())
-	h.recordCustomApiSuccess(p, in, out, reqStart)
+	h.recordForwardedUpstreamSuccess(p, in, out, reqStart)
 	return nil
 }
 
@@ -521,6 +1340,62 @@ func parseStreamUsage(endpoint string, tail []byte) (int, int) {
 	return lastIn, lastOut
 }
 
+// recordForwardedUpstreamSuccess keeps relay billing and terminal-provider
+// billing separate. A direct Anthropic endpoint has no Kiro-Go quota API, so it
+// must never enter the custom_api real-cost probe path.
+func (h *Handler) recordForwardedUpstreamSuccess(
+	p forwardParams,
+	inputTokens,
+	outputTokens int,
+	reqStart time.Time,
+) {
+	if p.account.IsDirectAnthropic() {
+		h.recordDirectAnthropicSuccess(p, inputTokens, outputTokens, reqStart)
+		return
+	}
+	h.recordCustomApiSuccess(p, inputTokens, outputTokens, reqStart)
+}
+
+// recordDirectAnthropicSuccess meters a terminal Anthropic-compatible account
+// without probing Kiro-Go-specific quota endpoints. The optional operator
+// credit rate is deliberately separate from CUSTOM_API_CREDITS_PER_1K_TOKENS.
+func (h *Handler) recordDirectAnthropicSuccess(
+	p forwardParams,
+	inputTokens,
+	outputTokens int,
+	reqStart time.Time,
+) {
+	tokens := inputTokens + outputTokens
+	credits := directAnthropicCreditsForTokens(tokens)
+	h.recordSuccessForApiKey(p.apiKeyID, inputTokens, outputTokens, credits)
+	if p.selection != nil {
+		h.pool.RecordSuccessForSelection(*p.selection)
+		h.pool.RecordLatencyForSelection(*p.selection, float64(time.Since(reqStart).Milliseconds()))
+		h.pool.UpdateStatsForSelection(*p.selection, tokens, credits)
+	} else {
+		h.pool.RecordSuccess(p.account.ID)
+		h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))
+		h.pool.UpdateStats(p.account.ID, tokens, credits)
+	}
+	h.recordSuccessLog(
+		"claude",
+		p.model,
+		p.account.ID,
+		p.apiKeyID,
+		tokens,
+		credits,
+		time.Since(reqStart).Milliseconds(),
+	)
+}
+
+func directAnthropicCreditsForTokens(tokens int) float64 {
+	rate := envFloatDefault("ANTHROPIC_CREDITS_PER_1K_TOKENS", 0)
+	if rate <= 0 || tokens <= 0 {
+		return 0
+	}
+	return float64(tokens) / 1000.0 * rate
+}
+
 // recordCustomApiSuccess mirrors the Kiro success path's metering so custom_api
 // traffic shows up in pool stats, per-key usage, and request logs. Runs AFTER the
 // client already has the full response, so the real-cost probe it does adds no
@@ -534,9 +1409,15 @@ func (h *Handler) recordCustomApiSuccess(p forwardParams, inputTokens, outputTok
 	// delta of its reported creditsUsed, instead of a flat token-derived price.
 	credits := h.billCustomApiRealCost(p, inputTokens, outputTokens)
 	h.recordSuccessForApiKey(p.apiKeyID, inputTokens, outputTokens, credits)
-	h.pool.RecordSuccess(p.account.ID)
-	h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))
-	h.pool.UpdateStats(p.account.ID, inputTokens+outputTokens, credits)
+	if p.selection != nil {
+		h.pool.RecordSuccessForSelection(*p.selection)
+		h.pool.RecordLatencyForSelection(*p.selection, float64(time.Since(reqStart).Milliseconds()))
+		h.pool.UpdateStatsForSelection(*p.selection, inputTokens+outputTokens, credits)
+	} else {
+		h.pool.RecordSuccess(p.account.ID)
+		h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))
+		h.pool.UpdateStats(p.account.ID, inputTokens+outputTokens, credits)
+	}
 	h.recordSuccessLog(endpoint, p.model, p.account.ID, p.apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 }
 
@@ -559,9 +1440,14 @@ const customApiRateTTL = 2 * time.Minute
 // stable, authoritative price: billing each request its own tokens at that rate is
 // smooth, fair across customers, needs no per-account accumulation, and has no
 // seed/reset/ordering races. Guarded by a mutex covering only the cache map.
+type customApiLifecycleKey struct {
+	accountID  string
+	generation uint64
+}
+
 type customApiCreditLedger struct {
 	mu    sync.Mutex
-	rates map[string]customApiRate
+	rates map[customApiLifecycleKey]customApiRate
 }
 
 type customApiRate struct {
@@ -570,7 +1456,7 @@ type customApiRate struct {
 }
 
 func newCustomApiCreditLedger() *customApiCreditLedger {
-	return &customApiCreditLedger{rates: make(map[string]customApiRate)}
+	return &customApiCreditLedger{rates: make(map[customApiLifecycleKey]customApiRate)}
 }
 
 // billCustomApiRealCost returns the credits to charge this request: its token count
@@ -586,6 +1472,20 @@ func newCustomApiCreditLedger() *customApiCreditLedger {
 // from the pool's OWN token count. If our token counting under-reports relative to the
 // pool's, this under-bills proportionally (safe direction). Fixing that requires
 // aligning our token counts with the pool's, tracked separately.
+func customApiLifecycleKeyForForward(p forwardParams) customApiLifecycleKey {
+	generation := uint64(0)
+	if p.selection != nil {
+		generation = p.selection.LifecycleGeneration
+	} else if p.account != nil {
+		generation = p.account.DispatchGeneration
+	}
+	id := ""
+	if p.account != nil {
+		id = p.account.ID
+	}
+	return customApiLifecycleKey{accountID: id, generation: generation}
+}
+
 func (h *Handler) billCustomApiRealCost(p forwardParams, inputTokens, outputTokens int) float64 {
 	tokens := float64(inputTokens + outputTokens)
 	estimate := tokens / 1000.0 * customApiCreditsPer1kTokens()
@@ -596,8 +1496,9 @@ func (h *Handler) billCustomApiRealCost(p forwardParams, inputTokens, outputToke
 	}
 
 	now := time.Now()
+	ledgerKey := customApiLifecycleKeyForForward(p)
 	l.mu.Lock()
-	cached, ok := l.rates[p.account.ID]
+	cached, ok := l.rates[ledgerKey]
 	fresh := ok && now.Sub(cached.at) < customApiRateTTL
 	if !fresh && ok {
 		// Claim this refresh window: bump the timestamp (keeping the old rate) before
@@ -605,7 +1506,7 @@ func (h *Handler) billCustomApiRealCost(p forwardParams, inputTokens, outputToke
 		// at once, and so a FAILING probe backs off for a full TTL instead of every
 		// request re-probing throughout an outage. A successful probe below overwrites
 		// the rate. (Cold start with no cached entry still lets a one-time burst probe.)
-		l.rates[p.account.ID] = customApiRate{perToken: cached.perToken, at: now}
+		l.rates[ledgerKey] = customApiRate{perToken: cached.perToken, at: now}
 	}
 	l.mu.Unlock()
 	if fresh {
@@ -614,11 +1515,11 @@ func (h *Handler) billCustomApiRealCost(p forwardParams, inputTokens, outputToke
 
 	// Refresh the rate. Probe runs outside the lock — never hold the mutex across
 	// network I/O.
-	q, err := probeCustomApiQuota(p.account.BaseURL, p.account.KiroApiKey)
+	q, err := probeCustomApiQuotaWithContext(p.requestContext, p.account.BaseURL, p.account.KiroApiKey)
 	if err == nil && q != nil && q.OK && q.TokensUsed > 0 && q.CreditsUsed > 0 {
 		rate := q.CreditsUsed / float64(q.TokensUsed)
 		l.mu.Lock()
-		l.rates[p.account.ID] = customApiRate{perToken: rate, at: now}
+		l.rates[ledgerKey] = customApiRate{perToken: rate, at: now}
 		l.mu.Unlock()
 		return tokens * rate
 	}

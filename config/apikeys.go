@@ -48,89 +48,95 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 	if entry.Key == "" {
 		return ApiKeyEntry{}, errors.New("api key value must not be empty")
 	}
-	for _, existing := range cfg.ApiKeys {
-		if existing.Key == entry.Key {
-			return ApiKeyEntry{}, errors.New("api key already exists")
-		}
-	}
 	if entry.ID == "" {
 		entry.ID = newUUID()
 	}
 	if entry.CreatedAt == 0 {
 		entry.CreatedAt = time.Now().Unix()
 	}
-	cfg.ApiKeys = append(cfg.ApiKeys, entry)
-	if err := saveLocked(); err != nil {
-		// Roll back the in-memory append so we don't leave inconsistent state.
-		cfg.ApiKeys = cfg.ApiKeys[:len(cfg.ApiKeys)-1]
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		for _, existing := range next.ApiKeys {
+			if existing.Key == entry.Key {
+				return errors.New("api key already exists")
+			}
+		}
+		next.ApiKeys = append(next.ApiKeys, entry)
+		return nil
+	})
+	if err != nil {
 		return ApiKeyEntry{}, err
 	}
 	return entry, nil
 }
 
-// UpdateApiKey applies a patch to an existing API key. Patch semantics:
-//   - Name, Key are overwritten when non-empty in patch.
-//   - Enabled, TokenLimit, CreditLimit are always overwritten (zero values are valid).
-//   - Counters (TokensUsed/CreditsUsed/RequestsCount) are not touched here; use
-//     RecordApiKeyUsage or ResetApiKeyUsage instead.
-//   - Migrated stays as-is once true; only flips when explicitly set in patch.
 func UpdateApiKey(id string, patch ApiKeyEntry) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
 		return errors.New("config not initialized")
 	}
-	idx := -1
-	for i := range cfg.ApiKeys {
-		if cfg.ApiKeys[i].ID == id {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
-		return errors.New("api key not found")
-	}
-	if patch.Name != "" {
-		cfg.ApiKeys[idx].Name = patch.Name
-	}
-	if patch.Key != "" {
-		newKey := strings.TrimSpace(patch.Key)
-		// Reject duplicates against any other entry.
-		for j := range cfg.ApiKeys {
-			if j != idx && cfg.ApiKeys[j].Key == newKey {
-				return errors.New("api key value collides with existing entry")
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		idx := -1
+		for i := range next.ApiKeys {
+			if next.ApiKeys[i].ID == id {
+				idx = i
+				break
 			}
 		}
-		cfg.ApiKeys[idx].Key = newKey
-	}
-	cfg.ApiKeys[idx].Enabled = patch.Enabled
-	cfg.ApiKeys[idx].TokenLimit = patch.TokenLimit
-	cfg.ApiKeys[idx].CreditLimit = patch.CreditLimit
-	if patch.Migrated {
-		cfg.ApiKeys[idx].Migrated = true
-	}
-	return saveLocked()
+		if idx < 0 {
+			return errors.New("api key not found")
+		}
+		if patch.Name != "" {
+			next.ApiKeys[idx].Name = patch.Name
+		}
+		if patch.Key != "" {
+			newKey := strings.TrimSpace(patch.Key)
+			for j := range next.ApiKeys {
+				if j != idx && next.ApiKeys[j].Key == newKey {
+					return errors.New("api key value collides with existing entry")
+				}
+			}
+			next.ApiKeys[idx].Key = newKey
+		}
+		next.ApiKeys[idx].Enabled = patch.Enabled
+		next.ApiKeys[idx].TokenLimit = patch.TokenLimit
+		next.ApiKeys[idx].CreditLimit = patch.CreditLimit
+		if patch.Migrated {
+			next.ApiKeys[idx].Migrated = true
+		}
+		return nil
+	})
+	return err
 }
 
-// DeleteApiKey removes the API key entry with the given ID. Returns nil even if
-// the ID is unknown (idempotent), matching the existing DeleteAccount style.
 func DeleteApiKey(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
 		return errors.New("config not initialized")
 	}
-	for i, e := range cfg.ApiKeys {
-		if e.ID == id {
-			cfg.ApiKeys = append(cfg.ApiKeys[:i], cfg.ApiKeys[i+1:]...)
-			return saveLocked()
+	found := false
+	for _, entry := range cfg.ApiKeys {
+		if entry.ID == id {
+			found = true
+			break
 		}
 	}
-	return nil
+	if !found {
+		return nil
+	}
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		for i, entry := range next.ApiKeys {
+			if entry.ID == id {
+				next.ApiKeys = append(next.ApiKeys[:i], next.ApiKeys[i+1:]...)
+				return nil
+			}
+		}
+		return errors.New("api key changed while staging delete")
+	})
+	return err
 }
 
-// FindApiKeyByValue returns a copy of the entry whose Key matches the given value,
-// or nil if no match. O(n) linear scan.
 func FindApiKeyByValue(key string) *ApiKeyEntry {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -170,92 +176,81 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 	if cfg == nil {
 		return errors.New("config not initialized")
 	}
-	for i := range cfg.ApiKeys {
-		if cfg.ApiKeys[i].ID == id {
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		for i := range next.ApiKeys {
+			if next.ApiKeys[i].ID != id {
+				continue
+			}
 			if tokens > 0 {
-				cfg.ApiKeys[i].TokensUsed += tokens
+				next.ApiKeys[i].TokensUsed += tokens
 			}
 			if credits > 0 {
-				cfg.ApiKeys[i].CreditsUsed += credits
+				next.ApiKeys[i].CreditsUsed += credits
 			}
-			cfg.ApiKeys[i].RequestsCount++
-			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
-			// Auto-deactivate on quota exhaustion (see function comment).
-			if overToken, overCredit := ApiKeyOverLimit(cfg.ApiKeys[i]); overToken || overCredit {
-				cfg.ApiKeys[i].Enabled = false
+			next.ApiKeys[i].RequestsCount++
+			next.ApiKeys[i].LastUsedAt = time.Now().Unix()
+			if overToken, overCredit := ApiKeyOverLimit(next.ApiKeys[i]); overToken || overCredit {
+				next.ApiKeys[i].Enabled = false
 			}
-			return saveLocked()
+			return nil
 		}
-	}
-	return errors.New("api key not found")
+		return errors.New("api key not found")
+	})
+	return err
 }
 
-// ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount for the entry.
-// LastUsedAt is preserved so operators can still see when the key was last used.
 func ResetApiKeyUsage(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
 		return errors.New("config not initialized")
 	}
-	for i := range cfg.ApiKeys {
-		if cfg.ApiKeys[i].ID == id {
-			cfg.ApiKeys[i].TokensUsed = 0
-			cfg.ApiKeys[i].CreditsUsed = 0
-			cfg.ApiKeys[i].RequestsCount = 0
-			return saveLocked()
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		for i := range next.ApiKeys {
+			if next.ApiKeys[i].ID == id {
+				next.ApiKeys[i].TokensUsed = 0
+				next.ApiKeys[i].CreditsUsed = 0
+				next.ApiKeys[i].RequestsCount = 0
+				return nil
+			}
 		}
-	}
-	return errors.New("api key not found")
+		return errors.New("api key not found")
+	})
+	return err
 }
 
-// RechargeApiKey additively increases an API key's limits (a customer buying
-// more credits for an existing key they want to keep) and re-enables the key
-// when the top-up brings its usage back under all configured limits.
-//
-// Amounts are ADDED, not set: a key sold with 100 credits, exhausted, then
-// recharged by 50 ends with CreditLimit=150 (remaining = 150 - 100 = 50). Usage
-// counters (CreditsUsed/TokensUsed) are preserved so lifetime accounting stays
-// intact — this is the inverse of ResetApiKeyUsage, which the recharge flow
-// intentionally does NOT use (a recharge tops up allowance; it does not wipe the
-// buyer's consumption record).
-//
-// addCredits/addTokens must be >= 0 (validated by the caller); a zero amount
-// leaves that limit untouched. Adding to a currently-unlimited limit (0) turns
-// it metered at the added amount — the bot only recharges metered keys, so this
-// is benign. Re-enable happens only when the key is under limit after the
-// top-up: a partial recharge that still leaves usage over the (also-raised)
-// limit stays disabled. Returns the updated entry.
 func RechargeApiKey(id string, addCredits float64, addTokens int64) (ApiKeyEntry, error) {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	if cfg == nil {
 		return ApiKeyEntry{}, errors.New("config not initialized")
 	}
-	for i := range cfg.ApiKeys {
-		if cfg.ApiKeys[i].ID == id {
+	var updated ApiKeyEntry
+	_, err := publishConfigFieldsLocked(func(next *Config) error {
+		for i := range next.ApiKeys {
+			if next.ApiKeys[i].ID != id {
+				continue
+			}
 			if addCredits > 0 {
-				cfg.ApiKeys[i].CreditLimit += addCredits
+				next.ApiKeys[i].CreditLimit += addCredits
 			}
 			if addTokens > 0 {
-				cfg.ApiKeys[i].TokenLimit += addTokens
+				next.ApiKeys[i].TokenLimit += addTokens
 			}
-			// Re-enable a key auto-deactivated on exhaustion now that the raised
-			// limit puts it back under quota. No-op if already enabled; stays off if
-			// still over limit after a partial top-up.
-			if overToken, overCredit := ApiKeyOverLimit(cfg.ApiKeys[i]); !overToken && !overCredit {
-				cfg.ApiKeys[i].Enabled = true
+			if overToken, overCredit := ApiKeyOverLimit(next.ApiKeys[i]); !overToken && !overCredit {
+				next.ApiKeys[i].Enabled = true
 			}
-			if err := saveLocked(); err != nil {
-				return ApiKeyEntry{}, err
-			}
-			return cfg.ApiKeys[i], nil
+			updated = next.ApiKeys[i]
+			return nil
 		}
+		return errors.New("api key not found")
+	})
+	if err != nil {
+		return ApiKeyEntry{}, err
 	}
-	return ApiKeyEntry{}, errors.New("api key not found")
+	return updated, nil
 }
 
-// GenerateApiKeyValue returns a new random 32-byte hex API key prefixed with "sk-".
 func GenerateApiKeyValue() string {
 	buf := make([]byte, 32)
 	_, _ = rand.Read(buf)

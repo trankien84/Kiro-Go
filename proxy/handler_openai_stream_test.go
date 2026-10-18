@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
 	"net/http"
@@ -10,7 +11,7 @@ import (
 	"time"
 )
 
-// TestOpenAIStreamEmitsFinishChunkOnMidStreamError drives the REAL
+// TestOpenAIStreamTerminatesWithErrorChunkWithoutDoneOnMidStreamFailure drives the REAL
 // handleOpenAIStream error-after-started path. The mock upstream returns one
 // valid toolUseEvent frame (stop:true) — parseEventStream invokes
 // handleToolUseEvent which calls finishToolUse mid-stream, firing OnToolUse so
@@ -19,11 +20,10 @@ import (
 // parseEventStream returns io.ErrUnexpectedEOF. CallKiroAPI therefore returns a
 // non-nil error AFTER the response has already begun.
 //
-// Before the fix the error path (responseStarted==true) returned without
-// emitting anything, silently truncating the client's SSE stream (no
-// finish_reason, no [DONE]). After the fix it emits a finish chunk with
-// finish_reason:"error" plus a terminating data: [DONE] line.
-func TestOpenAIStreamEmitsFinishChunkOnMidStreamError(t *testing.T) {
+// The integrated transport must make the failure visible without emitting the
+// normal [DONE] sentinel: once semantic output is visible, replay is unsafe and
+// [DONE] would misclassify a truncated/failed stream as successful completion.
+func TestOpenAIStreamTerminatesWithErrorChunkWithoutDoneOnMidStreamFailure(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
@@ -31,6 +31,7 @@ func TestOpenAIStreamEmitsFinishChunkOnMidStreamError(t *testing.T) {
 
 	if err := config.AddAccount(config.Account{
 		ID:          "acct",
+		AuthMethod:  "social",
 		Enabled:     true,
 		AccessToken: "token-x",
 		ProfileArn:  "arn:aws:codewhisperer:profile/test",
@@ -89,13 +90,16 @@ func TestOpenAIStreamEmitsFinishChunkOnMidStreamError(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleOpenAIStream(rec, payload, "claude-sonnet-4.5", false, 1, "", nil, false)
+	h.handleOpenAIStream(rec, payload, "claude-sonnet-4.5", false, 1, "", nil, false, context.Background())
 
 	body := rec.Body.String()
+	if !strings.Contains(body, `"error"`) || !strings.Contains(body, `"message"`) {
+		t.Fatalf("expected an explicit SSE error frame after partial output, got body=%s", body)
+	}
 	if !strings.Contains(body, `"finish_reason":"error"`) {
 		t.Fatalf("expected a finish chunk with finish_reason:\"error\", got body=%s", body)
 	}
-	if !strings.Contains(body, "data: [DONE]") {
-		t.Fatalf("expected a terminating data: [DONE] line, got body=%s", body)
+	if strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("mid-stream failure must not emit the normal [DONE] sentinel, got body=%s", body)
 	}
 }

@@ -1,27 +1,61 @@
-version: '3.8'
-
 services:
   kiro-go:
     build: .
     ports:
-      - "8080:8080"
-      # Enterprise SSO (Microsoft 365) callback. The hosted-portal sign-in
-      # redirects the browser to localhost:3128, so the operator must run that
-      # browser ON THE DOCKER HOST. Publishing host-side to 127.0.0.1 only keeps
-      # the callback off the host's external interfaces while still letting the
-      # host browser's localhost:3128 reach the container listener below.
+      # Host port is overridable: `KIRO_PORT=9090 docker compose up -d` publishes
+      # 9090 on the host. The container always listens on 8080 internally.
+      - "${KIRO_PORT:-8080}:8080"
+      # ONLY the listener-based Kiro Hosted SSO flow needs this port. A browser
+      # on the Docker host can reach localhost:3128; a remote browser's localhost
+      # refers to its OWN computer (not this VPS). Microsoft Enterprise SSO via
+      # /auth/microsoft-sso/* is a separate manual-callback flow: paste two redirect
+      # URLs in Admin; no listener, SSH tunnel or published 3128 port is required.
+      # Keep this mapping for operators who still use Kiro Hosted SSO.
       - "127.0.0.1:3128:3128"
     volumes:
       - ./data:/app/data
+      # Zero-touch credential drop folder. Any CLIProxyAPI_*.json minted by
+      # kiro-login-helper.py and dropped in ./data/imports is auto-imported within
+      # ~15s (then moved to ./data/imports/processed). It is a subpath of the data
+      # mount above, so no extra mount is strictly required — kept explicit for clarity.
+      - ./data/imports:/app/data/imports
+      # Let the Dockerized app import the Kiro IDE credential cached on the host.
+      # The app runs as root in the container, so its default ~/.aws path would be
+      # /root/.aws/...; mount the host user's AWS SSO cache directory explicitly.
+      # Directory mount is portable across Linux/macOS and lets the container start
+      # even when the cache file has not been created yet.
+      - ${KIRO_AWS_SSO_CACHE_DIR:-${HOME}/.aws/sso/cache}:/host-aws-sso-cache:ro
     environment:
       - CONFIG_PATH=/app/data/config.json
-      # Bind host for the Enterprise SSO callback listener INSIDE the container.
-      # Default (unset) is loopback-only (127.0.0.1/::1), which the published port
-      # above cannot reach; 0.0.0.0 lets the forwarded connection land. The callback
-      # is transient (~10-minute login window) and anti-CSRF state-matched, and the
-      # host-side publish is pinned to loopback above, so it is not reachable off the
-      # host. Note 0.0.0.0 does expose 3128 to peer containers on the same Docker
-      # network during that window; on a shared/untrusted Docker network, pin
-      # KIRO_SSO_CALLBACK_BIND to a specific interface or isolate the network.
+      - KIRO_IDE_CACHE=/host-aws-sso-cache/kiro-auth-token.json
+      # Force the app's in-container listen port to match the published
+      # container-side port above. This prevents a stale data/config.json port
+      # (for example 8081) from making `localhost:8080` unreachable.
+      - PORT=8080
+      - HOST=0.0.0.0
+      # Enable the auto-ingest watcher (off by default on a bare build). Drop a
+      # CLIProxyAPI_*.json into ./data/imports and the account appears with no
+      # restart and no manual API call. Imports go through the same persisted path
+      # the live server owns, so they never race the in-memory config.
+      #
+      # SECURITY: this makes filesystem write access to ./data/imports equivalent
+      # to admin-authenticated account creation — no admin password is checked on
+      # this path, and it is a more reliable injection route than editing
+      # data/config.json (which the running server's in-memory state overwrites on
+      # its next save). That is an acceptable default here only because
+      # ./data/imports sits inside the same host directory as data/config.json, so
+      # anyone who can write it can already read every stored credential. If you
+      # ever mount the imports folder more widely than the data folder — a shared
+      # volume, a less-trusted uid, a syncing directory — set this to 0 and import
+      # through the admin API instead.
+      - KIRO_IMPORT_WATCH=1
+      # Only auth/kiro_sso.go (Kiro Hosted SSO) reads this variable. The manual
+      # Microsoft flow in auth/microsoft_sso.go never binds a listener.
+      # For the Hosted SSO container listener, 0.0.0.0 accepts the Docker port
+      # forwarding above; without this override it binds 127.0.0.1/::1 INSIDE
+      # the container, which host-port forwarding cannot reach. Host publication
+      # stays on loopback, but peer containers on the same Docker network may
+      # still reach port 3128 during the ~10-minute sign-in window. Isolate an
+      # untrusted network or avoid this listener flow by using manual Microsoft SSO.
       - KIRO_SSO_CALLBACK_BIND=0.0.0.0
     restart: unless-stopped

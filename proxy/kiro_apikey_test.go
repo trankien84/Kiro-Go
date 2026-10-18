@@ -155,6 +155,11 @@ func TestApiImportCredentialsApiKey(t *testing.T) {
 	// network: the stub serves exactly the region this record was exported with.
 	stubProbeKiroApiKey(t, "eu-west-1")
 
+	// The successful import schedules model discovery. Keep the REST client
+	// isolated, then join the Handler before restoring the exact prior client.
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
+
 	r := httptest.NewRequest(http.MethodPost, "/admin/api/auth/credentials",
 		strings.NewReader(`{"authMethod":"api_key","kiroApiKey":"ksk_restore","region":"eu-west-1"}`))
 	r.Header.Set("X-Admin-Password", "pw")
@@ -369,6 +374,8 @@ func TestApiImportCredentialsApiKeyDiscoversRegion(t *testing.T) {
 	p.Reload()
 	h := &Handler{pool: p}
 	stubProbeKiroApiKey(t, "eu-central-1")
+	restoreRestClient := installNoNetworkKiroRestClientForTest()
+	cleanupHandlerBeforeRestore(t, h, restoreRestClient)
 
 	r := httptest.NewRequest(http.MethodPost, "/admin/api/auth/credentials",
 		strings.NewReader(`{"authMethod":"api_key","kiroApiKey":"ksk_importeu"}`))

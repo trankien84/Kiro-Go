@@ -16,6 +16,11 @@
 .DS_Store
 Thumbs.db
 
+# Agent tooling state (local only)
+.omc/
+**/.omc/
+.codegraph/
+
 # Zeabur local CLI context (contains personal project/service IDs)
 .zeabur/
 
@@ -33,3 +38,6 @@ debug_*.txt
 kiro_sso_auto.py
 test_proofup_next.py
 guaranteed
+
+# Temporary files
+tmp/

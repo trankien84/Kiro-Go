@@ -23,7 +23,7 @@ func TestParseRetryAfterSeconds(t *testing.T) {
 }
 
 func TestBedrockThrottleRecordAndRemaining(t *testing.T) {
-	s := &bedrockThrottleState{until: map[string]time.Time{}}
+	s := &bedrockThrottleState{until: map[bedrockThrottleKey]time.Time{}}
 	acct, model := "acct-thr", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 	// No record -> not throttled.
@@ -52,7 +52,7 @@ func TestBedrockThrottleRecordAndRemaining(t *testing.T) {
 }
 
 func TestBedrockThrottleRecordKeepsLonger(t *testing.T) {
-	s := &bedrockThrottleState{until: map[string]time.Time{}}
+	s := &bedrockThrottleState{until: map[bedrockThrottleKey]time.Time{}}
 	s.record("a", "m", 5*time.Minute) // capped at max (5m)
 	long := s.remaining("a", "m")
 	s.record("a", "m", 2*time.Second) // shorter must NOT shorten the active cooldown
@@ -70,15 +70,15 @@ func TestErrBedrockThrottledNotQuota(t *testing.T) {
 }
 
 func TestBedrockThrottleExpires(t *testing.T) {
-	s := &bedrockThrottleState{until: map[string]time.Time{}}
-	s.until[bedrockThrottleKey("a", "m")] = time.Now().Add(-time.Second) // already past
+	s := &bedrockThrottleState{until: map[bedrockThrottleKey]time.Time{}}
+	s.until[bedrockThrottleKey{lifecycle: legacyBedrockLifecycleKey("a"), model: "m"}] = time.Now().Add(-time.Second) // already past
 	if s.remaining("a", "m") != 0 {
 		t.Error("expired cooldown should read as 0")
 	}
 }
 
 func TestNoteBedrockResponseThrottle(t *testing.T) {
-	s := &bedrockThrottleState{until: map[string]time.Time{}}
+	s := &bedrockThrottleState{until: map[bedrockThrottleKey]time.Time{}}
 	// Swap the package global for isolation.
 	prev := bedrockThrottle
 	bedrockThrottle = s

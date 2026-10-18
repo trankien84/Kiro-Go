@@ -11,8 +11,10 @@
     localStorage.removeItem('admin_login_time');
   }
   let password = sessionStorage.getItem('admin_password') || localStorage.getItem('admin_password') || '';
+  const supportedLangs = ['zh', 'en', 'vi'];
   let currentLang = localStorage.getItem('kiro_lang') || 'zh';
-  const dict = { en: null, zh: null };
+  if (!supportedLangs.includes(currentLang)) currentLang = 'zh';
+  const dict = { en: null, zh: null, vi: null };
   let accountsData = [];
   const selectedAccounts = new Set();
   let filterKeyword = '';
@@ -28,6 +30,14 @@
   // that window would fire a second POST /start and orphan the first session.
   let kiroSsoStarting = false;
   let iamSession = '';
+  let microsoftSession = '';
+  let microsoftSelectionId = '';
+  let microsoftStage = 'kiro';
+  let microsoftAuthorizeUrl = '';
+  let microsoftProfiles = [];
+  let microsoftSelectedProfileArn = '';
+  let microsoftBusy = false;
+  let microsoftGeneration = 0;
   let exportSelectedIds = new Set();
   let currentVersion = '';
   let testLogs = [];
@@ -39,6 +49,36 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+
+  let accountRoutingConfig = {
+    strategy: 'round-robin',
+    supportedStrategies: ['round-robin', 'priority', 'fill-first'],
+    defaultPriority: 100
+  };
+  let accountRoutingLoadState = 'loading'; // loading | ready | error
+  let accountsLoadSequence = 0;
+  let accountsLoadController = null;
+  let accountsLoadPromise = null;
+  let accountRoutingLoadSequence = 0;
+  let accountRoutingLoadController = null;
+  let accountRoutingLoadPromise = null;
+  let accountRoutingMutationSequence = 0;
+  let accountRoutingMutation = null;
+
+
+  // Live account-runtime state is local-only data served by Kiro-Go. Polling
+  // never triggers OAuth, quota, or model-discovery work upstream.
+  let accountRuntimeById = new Map();
+  let accountRuntimeInstance = '';
+  let accountRuntimeRevision = -1;
+  let accountRuntimeETag = '';
+  let accountRuntimeServerOffsetMs = 0;
+  let accountRuntimePollTimer = null;
+  let accountRuntimePollController = null;
+  let accountRuntimeCountdownTimer = null;
+  let accountRuntimeNeedsAccountReload = false;
+  let accountRuntimeImmediatePending = false;
+  const accountRuntimePollIntervalMs = 5000;
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -128,10 +168,12 @@
     refreshCustomSelects();
   }
   async function setLang(lang) {
+    if (!supportedLangs.includes(lang)) lang = 'zh';
     currentLang = lang;
     localStorage.setItem('kiro_lang', lang);
     await loadLocale(lang);
     applyTranslations();
+    renderAccountRoutingPanel();
     renderVersionBadge();
     renderAccounts();
     renderPromptRules();
@@ -141,11 +183,12 @@
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
     qsa('.lang-toggle').forEach(btn => {
       const label = btn.querySelector('.lang-toggle-label');
-      if (label) label.textContent = currentLang === 'zh' ? t('lang.zh') : t('lang.en');
+      if (label) label.textContent = t('lang.' + currentLang);
     });
   }
   function toggleLang() {
-    setLang(currentLang === 'zh' ? 'en' : 'zh');
+    const next = supportedLangs[(supportedLangs.indexOf(currentLang) + 1) % supportedLangs.length];
+    setLang(next);
   }
 
   // Custom select
@@ -674,13 +717,14 @@
 
   // Data loaders
   async function loadData() {
-    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
+    await Promise.all([loadStats(), loadAccounts(), loadAccountRouting(), loadSettings(), loadVersion()]);
     renderEndpointCode('claudeEndpoint', baseUrl + '/v1/messages');
     renderEndpointCode('openaiEndpoint', baseUrl + '/v1/chat/completions');
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
     renderEndpointCode('modelsEndpoint', baseUrl + '/v1/models');
     renderEndpointCode('statsEndpoint', baseUrl + '/v1/stats');
     setTimeout(checkUpdate, 2000);
+    syncAccountRuntimePolling(true);
   }
   async function loadStats() {
     const res = await api('/status');
@@ -806,15 +850,573 @@
     }
   }
 
-  async function loadAccounts() {
-    const res = await api('/accounts');
-    accountsData = await res.json();
-    renderAccounts();
+  function isAbortError(error) {
+    return !!(error && error.name === 'AbortError');
+  }
+  function followLatestLoad(ownPromise, getCurrentPromise, result) {
+    if (!result || result.superseded !== true) return result;
+    const latest = getCurrentPromise();
+    return latest && latest !== ownPromise ? latest : result;
+  }
+  function loadAccounts() {
+    const sequence = ++accountsLoadSequence;
+    if (accountsLoadController) accountsLoadController.abort();
+    const controller = new AbortController();
+    accountsLoadController = controller;
+
+    const operation = (async () => {
+      try {
+        const res = await api('/accounts', { signal: controller.signal, cache: 'no-cache' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (controller.signal.aborted || sequence !== accountsLoadSequence) {
+          return { ok: false, superseded: true };
+        }
+        if (!Array.isArray(data)) throw new Error('Invalid account list response');
+        accountsData = data;
+        renderAccounts();
+        accountRuntimeNeedsAccountReload = false;
+        return { ok: true };
+      } catch (error) {
+        if (controller.signal.aborted || sequence !== accountsLoadSequence || isAbortError(error)) {
+          return { ok: false, superseded: true };
+        }
+        throw error;
+      } finally {
+        if (sequence === accountsLoadSequence && accountsLoadController === controller) {
+          accountsLoadController = null;
+        }
+      }
+    })();
+
+    let publishedPromise;
+    publishedPromise = operation.then(result =>
+      followLatestLoad(publishedPromise, () => accountsLoadPromise, result)
+    );
+    accountsLoadPromise = publishedPromise;
+    return publishedPromise;
+  }
+
+  function currentAccountRoutingStrategy() {
+    const strategy = String(accountRoutingConfig.strategy || 'round-robin');
+    return ['round-robin', 'priority', 'fill-first'].includes(strategy) ? strategy : 'round-robin';
+  }
+  function rawRoutingPriority(a) {
+    const value = Number(a && a.priority);
+    return Number.isSafeInteger(value) ? value : 0;
+  }
+  function effectiveRoutingPriority(a) {
+    const effective = Number(a && a.effectivePriority);
+    if (Number.isSafeInteger(effective) && effective > 0) return effective;
+    const persisted = rawRoutingPriority(a);
+    if (persisted > 0) return persisted;
+    const fallback = Number(accountRoutingConfig.defaultPriority);
+    return Number.isSafeInteger(fallback) && fallback > 0 ? fallback : 100;
+  }
+  function accountRoutingFiltersActive() {
+    return !!String(filterKeyword || '').trim() || filterStatus !== 'all';
+  }
+  function accountRoutingOrderSnapshotReady() {
+    return accountRoutingLoadState === 'ready' && Array.isArray(accountsData) && accountsData.every(item => {
+      if (!item || !String(item.id || '').trim()) return false;
+      if (!Number.isSafeInteger(Number(item.generation)) || Number(item.generation) <= 0) return false;
+      if (item.priority == null) return true;
+      return Number.isSafeInteger(Number(item.priority));
+    });
+  }
+  function accountRoutingMutationActive() {
+    return accountRoutingMutation !== null;
+  }
+  function beginAccountRoutingMutation(kind, accountId) {
+    if (accountRoutingMutationActive()) return null;
+    const token = {
+      sequence: ++accountRoutingMutationSequence,
+      kind: String(kind || ''),
+      accountId: String(accountId || '')
+    };
+    accountRoutingMutation = token;
+    renderAccountRoutingPanel();
+    if (Array.isArray(accountsData)) renderAccounts();
+    return token;
+  }
+  function endAccountRoutingMutation(token) {
+    if (!token || !accountRoutingMutation || accountRoutingMutation.sequence !== token.sequence) return;
+    accountRoutingMutation = null;
+    renderAccountRoutingPanel();
+    if (Array.isArray(accountsData)) renderAccounts();
+    refreshCustomSelects();
+  }
+
+  function sortAccountsForRouting(accounts) {
+    if (accountRoutingLoadState !== 'ready') return accounts;
+    const strategy = currentAccountRoutingStrategy();
+    if (strategy === 'round-robin') return accounts;
+    const canonicalIndex = new Map(accountsData.map((a, index) => [a.id, index]));
+    return accounts.slice().sort((left, right) => {
+      const tierDiff = effectiveRoutingPriority(left) - effectiveRoutingPriority(right);
+      if (tierDiff !== 0) return tierDiff;
+      const leftIndex = canonicalIndex.has(left.id) ? canonicalIndex.get(left.id) : Number.MAX_SAFE_INTEGER;
+      const rightIndex = canonicalIndex.has(right.id) ? canonicalIndex.get(right.id) : Number.MAX_SAFE_INTEGER;
+      return leftIndex - rightIndex;
+    });
+  }
+  function renderAccountRoutingPanel() {
+    const select = $('accountRoutingStrategySelect');
+    const help = $('accountRoutingHelp');
+    if (!select || !help) return;
+    const strategy = currentAccountRoutingStrategy();
+    select.value = strategy;
+    select.disabled = accountRoutingLoadState !== 'ready' || accountRoutingMutationActive();
+    if (accountRoutingLoadState === 'loading') {
+      help.textContent = t('routing.loading');
+      syncCustomSelect(select);
+      return;
+    }
+    if (accountRoutingLoadState === 'error') {
+      help.textContent = t('routing.loadFailed');
+      syncCustomSelect(select);
+      return;
+    }
+    let key = 'routing.roundRobinHelp';
+    if (strategy === 'priority') key = 'routing.priorityHelp';
+    else if (strategy === 'fill-first') key = 'routing.fillFirstHelp';
+    let text = t(key) + ' ' + t('routing.affinityHelp');
+    if (strategy === 'fill-first' && accountRoutingFiltersActive()) {
+      text += ' ' + t('routing.clearFiltersToReorder');
+    } else if (strategy === 'fill-first' && !accountRoutingOrderSnapshotReady()) {
+      text += ' ' + t('routing.reloadBeforeReorder');
+    }
+    help.textContent = text;
+    syncCustomSelect(select);
+  }
+  function loadAccountRouting() {
+    const sequence = ++accountRoutingLoadSequence;
+    if (accountRoutingLoadController) accountRoutingLoadController.abort();
+    const controller = new AbortController();
+    accountRoutingLoadController = controller;
+    if (accountRoutingLoadState !== 'ready') accountRoutingLoadState = 'loading';
+    renderAccountRoutingPanel();
+
+    const operation = (async () => {
+      try {
+        const res = await api('/account-routing', { signal: controller.signal, cache: 'no-cache' });
+        const data = await res.json().catch(() => ({}));
+        if (controller.signal.aborted || sequence !== accountRoutingLoadSequence) {
+          return { ok: false, superseded: true };
+        }
+        if (!res.ok || data.success === false) throw new Error(data.error || 'HTTP ' + res.status);
+        const supported = Array.isArray(data.supportedStrategies)
+          ? data.supportedStrategies.filter(value => ['round-robin', 'priority', 'fill-first'].includes(value))
+          : [];
+        accountRoutingConfig = {
+          strategy: ['round-robin', 'priority', 'fill-first'].includes(data.strategy) ? data.strategy : 'round-robin',
+          supportedStrategies: supported.length ? supported : ['round-robin', 'priority', 'fill-first'],
+          defaultPriority: Number.isSafeInteger(Number(data.defaultPriority)) && Number(data.defaultPriority) > 0
+            ? Number(data.defaultPriority) : 100
+        };
+        accountRoutingLoadState = 'ready';
+        qsa('#accountRoutingStrategySelect option').forEach(option => {
+          option.disabled = !accountRoutingConfig.supportedStrategies.includes(option.value);
+        });
+        renderAccountRoutingPanel();
+        refreshCustomSelects();
+        if (Array.isArray(accountsData)) renderAccounts();
+        return { ok: true };
+      } catch (error) {
+        if (controller.signal.aborted || sequence !== accountRoutingLoadSequence || isAbortError(error)) {
+          return { ok: false, superseded: true };
+        }
+        accountRoutingLoadState = 'error';
+        try { console.warn('[AccountRouting] load failed', error); } catch (_) { }
+        renderAccountRoutingPanel();
+        refreshCustomSelects();
+        if (Array.isArray(accountsData)) renderAccounts();
+        return { ok: false, error };
+      } finally {
+        if (sequence === accountRoutingLoadSequence && accountRoutingLoadController === controller) {
+          accountRoutingLoadController = null;
+        }
+      }
+    })();
+
+    let publishedPromise;
+    publishedPromise = operation.then(result =>
+      followLatestLoad(publishedPromise, () => accountRoutingLoadPromise, result)
+    );
+    accountRoutingLoadPromise = publishedPromise;
+    return publishedPromise;
+  }
+
+  async function refreshAccountRoutingControlPlane() {
+    const results = await Promise.allSettled([loadAccountRouting(), loadAccounts()]);
+    const failed = results.some(result =>
+      result.status === 'rejected' || (result.value && result.value.ok === false)
+    );
+    if (!failed) return true;
+    accountRoutingLoadState = 'error';
+    renderAccountRoutingPanel();
+    refreshCustomSelects();
+    if (Array.isArray(accountsData)) renderAccounts();
+    toast(t('routing.refreshFailed'), 'warning');
+    return false;
+  }
+
+  async function saveAccountRoutingStrategy() {
+    const select = $('accountRoutingStrategySelect');
+    if (!select || select.disabled || accountRoutingLoadState !== 'ready' || accountRoutingMutationActive()) return;
+    const observed = currentAccountRoutingStrategy();
+    const strategy = select.value;
+    if (strategy === observed) return;
+    const mutation = beginAccountRoutingMutation('strategy', '');
+    if (!mutation) return;
+    try {
+      const res = await api('/account-routing', {
+        method: 'PUT',
+        body: JSON.stringify({ observedStrategy: observed, strategy })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        const err = new Error(data.error || t('common.saveFailed'));
+        err.status = res.status;
+        err.published = data.published === true;
+        throw err;
+      }
+      accountRoutingConfig.strategy = data.strategy || strategy;
+      toast(t('routing.strategySaved'), 'success');
+    } catch (e) {
+      toast(e && e.status === 409 ? t('routing.stale') : ((e && e.message) || t('common.saveFailed')), 'error');
+    } finally {
+      try {
+        await refreshAccountRoutingControlPlane();
+      } finally {
+        endAccountRoutingMutation(mutation);
+      }
+    }
+  }
+  function routingMoveState(id) {
+    const filtered = accountRoutingFiltersActive();
+    const snapshotUnavailable = !accountRoutingOrderSnapshotReady();
+    const updating = accountRoutingMutationActive();
+    const locked = filtered || snapshotUnavailable || updating;
+    const account = accountsData.find(item => item.id === id);
+    if (!account) return { locked: true, filtered, snapshotUnavailable, updating, previous: null, next: null };
+    const tier = effectiveRoutingPriority(account);
+    const index = accountsData.findIndex(item => item.id === id);
+    let previous = null;
+    let next = null;
+    for (let i = index - 1; i >= 0; i--) {
+      if (effectiveRoutingPriority(accountsData[i]) === tier) {
+        previous = accountsData[i];
+        break;
+      }
+    }
+    for (let i = index + 1; i < accountsData.length; i++) {
+      if (effectiveRoutingPriority(accountsData[i]) === tier) {
+        next = accountsData[i];
+        break;
+      }
+    }
+    return { locked, filtered, snapshotUnavailable, updating, previous, next };
+  }
+  function renderAccountRoutingControls(a) {
+    if (accountRoutingLoadState !== 'ready') return '';
+    const strategy = currentAccountRoutingStrategy();
+    if (strategy === 'round-robin') return '';
+    const observedRaw = rawRoutingPriority(a);
+    const displayed = observedRaw >= 0 ? observedRaw : 0;
+    const effective = effectiveRoutingPriority(a);
+    const idAttr = escapeAttr(a.id);
+    let ordering = '';
+    if (strategy === 'fill-first') {
+      const move = routingMoveState(a.id);
+      let lockTitle = '';
+      if (move.filtered) lockTitle = t('routing.clearFiltersToReorder');
+      else if (move.snapshotUnavailable) lockTitle = t('routing.reloadBeforeReorder');
+      else if (move.updating) lockTitle = t('routing.updateInProgress');
+      ordering = '<span class="account-routing-order">' +
+        '<button type="button" class="btn btn-icon btn-xs btn-ghost" data-action="moveRoutingUp" data-id="' + idAttr + '"' +
+        ((!move.previous || move.locked) ? ' disabled' : '') + ' title="' + escapeAttr(lockTitle || t('routing.moveUp')) + '" aria-label="' + escapeAttr(t('routing.moveUp')) + '">' +
+        '<i class="fa-solid fa-chevron-up" aria-hidden="true"></i></button>' +
+        '<button type="button" class="btn btn-icon btn-xs btn-ghost" data-action="moveRoutingDown" data-id="' + idAttr + '"' +
+        ((!move.next || move.locked) ? ' disabled' : '') + ' title="' + escapeAttr(lockTitle || t('routing.moveDown')) + '" aria-label="' + escapeAttr(t('routing.moveDown')) + '">' +
+        '<i class="fa-solid fa-chevron-down" aria-hidden="true"></i></button>' +
+        '</span>';
+    }
+    const mutationLocked = accountRoutingMutationActive();
+    return '<div class="account-routing-controls">' +
+      '<label class="account-routing-priority-field">' +
+      '<span class="account-routing-priority-label">' + escapeHtml(t('routing.accountPriority')) + '</span>' +
+      '<input class="account-routing-priority-input" type="number" min="0" step="1" inputmode="numeric" value="' + escapeAttr(displayed) + '" data-routing-priority-input data-id="' + idAttr + '"' + (mutationLocked ? ' disabled' : '') + ' />' +
+      '</label>' +
+      '<button type="button" class="btn btn-outline btn-xs" data-action="savePriority" data-id="' + idAttr + '"' + (mutationLocked ? ' disabled' : '') + '>' + escapeHtml(t('routing.savePriority')) + '</button>' +
+      '<span class="account-routing-effective">' + escapeHtml(t('routing.effectivePriority')) + ': ' + effective + '</span>' +
+      ordering +
+      '</div>';
+  }
+  async function saveAccountPriority(id, btn) {
+    if (accountRoutingLoadState !== 'ready' || accountRoutingMutationActive()) return;
+    const account = accountsData.find(item => item.id === id);
+    const controls = btn && btn.closest('.account-routing-controls');
+    const input = controls && controls.querySelector('[data-routing-priority-input]');
+    if (!account || !input || btn.disabled) return;
+    const raw = String(input.value || '').trim();
+    const priority = raw === '' ? 0 : Number(raw);
+    if (!Number.isSafeInteger(priority) || priority < 0) {
+      toast(t('routing.invalidPriority'), 'warning');
+      return;
+    }
+    const observedPriority = rawRoutingPriority(account);
+    if (priority === observedPriority) return;
+    const mutation = beginAccountRoutingMutation('priority', id);
+    if (!mutation) return;
+    try {
+      const res = await api('/accounts/' + encodeURIComponent(id) + '/routing', {
+        method: 'PUT',
+        body: JSON.stringify({
+          generation: Number(account.generation) || 0,
+          observedPriority,
+          priority
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        const err = new Error(data.error || t('common.saveFailed'));
+        err.status = res.status;
+        err.published = data.published === true;
+        throw err;
+      }
+      toast(t('routing.prioritySaved'), 'success');
+    } catch (e) {
+      toast(e && e.status === 409 ? t('routing.stale') : ((e && e.message) || t('common.saveFailed')), 'error');
+    } finally {
+      try {
+        await refreshAccountRoutingControlPlane();
+      } finally {
+        endAccountRoutingMutation(mutation);
+      }
+    }
+  }
+  async function moveAccountWithinPriority(id, direction, btn) {
+    if (accountRoutingLoadState !== 'ready' || currentAccountRoutingStrategy() !== 'fill-first' || accountRoutingMutationActive()) return;
+    const state = routingMoveState(id);
+    if (state.filtered) {
+      toast(t('routing.clearFiltersToReorder'), 'warning');
+      return;
+    }
+    if (state.snapshotUnavailable) {
+      toast(t('routing.reloadBeforeReorder'), 'warning');
+      return;
+    }
+    const target = direction < 0 ? state.previous : state.next;
+    if (!target || state.locked) return;
+    const from = accountsData.findIndex(item => item.id === id);
+    const to = accountsData.findIndex(item => item.id === target.id);
+    if (from < 0 || to < 0) return;
+    const observedStrategy = currentAccountRoutingStrategy();
+    const observed = accountsData.map(item => ({
+      id: item.id,
+      generation: Number(item.generation) || 0,
+      priority: rawRoutingPriority(item)
+    }));
+    const desired = observed.map(item => ({ ...item }));
+    const tmp = desired[from];
+    desired[from] = desired[to];
+    desired[to] = tmp;
+    const mutation = beginAccountRoutingMutation('order', id);
+    if (!mutation) return;
+    try {
+      const res = await api('/accounts/order', {
+        method: 'PUT',
+        body: JSON.stringify({ observedStrategy, observed, accounts: desired })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        const err = new Error(data.error || t('common.saveFailed'));
+        err.status = res.status;
+        err.published = data.published === true;
+        throw err;
+      }
+      toast(t('routing.orderSaved'), 'success');
+    } catch (e) {
+      toast(e && e.status === 409 ? t('routing.stale') : ((e && e.message) || t('common.saveFailed')), 'error');
+    } finally {
+      try {
+        await refreshAccountRoutingControlPlane();
+      } finally {
+        endAccountRoutingMutation(mutation);
+      }
+    }
+  }
+
+  function accountRuntimeNowSeconds() {
+    return Math.floor((Date.now() + accountRuntimeServerOffsetMs) / 1000);
+  }
+  function formatRuntimeDuration(seconds) {
+    seconds = Math.max(0, Math.ceil(Number(seconds) || 0));
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    if (days > 0) return days + 'd ' + hours + 'h';
+    if (hours > 0) return hours + 'h ' + minutes + 'm';
+    if (minutes > 0) return minutes + 'm ' + secs + 's';
+    return secs + 's';
+  }
+  function runtimeCountdownText(timestamp) {
+    timestamp = Number(timestamp) || 0;
+    if (!timestamp) return '';
+    const remaining = timestamp - accountRuntimeNowSeconds();
+    return remaining <= 0 ? t('runtime.due') : formatRuntimeDuration(remaining);
+  }
+  function runtimeAgeText(timestamp) {
+    timestamp = Number(timestamp) || 0;
+    if (!timestamp) return '';
+    return formatRuntimeDuration(accountRuntimeNowSeconds() - timestamp);
+  }
+  function refreshAccountRuntimeCountdowns(root) {
+    qsa('[data-runtime-countdown]', root || document).forEach(el => {
+      el.textContent = runtimeCountdownText(el.dataset.runtimeCountdown);
+    });
+    qsa('[data-runtime-age]', root || document).forEach(el => {
+      el.textContent = runtimeAgeText(el.dataset.runtimeAge);
+    });
+  }
+  function runtimeLaneHtml(label, lane) {
+    if (!lane || lane.supported !== true) return '';
+    const now = accountRuntimeNowSeconds();
+    let stateClass = '';
+    let detail = t('runtime.ready');
+    if (lane.refreshing) {
+      stateClass = ' is-refreshing';
+      detail = t('runtime.refreshing');
+    } else if (lane.retryAt && lane.retryAt > now) {
+      stateClass = lane.stale ? ' is-stale' : '';
+      detail = t('runtime.retry') + ' <span data-runtime-countdown="' + escapeAttr(lane.retryAt) + '">' +
+        escapeHtml(runtimeCountdownText(lane.retryAt)) + '</span>';
+    } else if (lane.stale) {
+      stateClass = ' is-stale';
+      detail = t('runtime.stale');
+    } else if (lane.nextRefreshAt) {
+      detail = t('runtime.next') + ' <span data-runtime-countdown="' + escapeAttr(lane.nextRefreshAt) + '">' +
+        escapeHtml(runtimeCountdownText(lane.nextRefreshAt)) + '</span>';
+    }
+    return '<span class="account-runtime-lane' + stateClass + '">' +
+      '<strong>' + escapeHtml(label) + '</strong><span>' + detail + '</span></span>';
+  }
+  function renderAccountRuntime(a) {
+    const runtime = accountRuntimeById.get(a.id);
+    if (!runtime || Number(runtime.generation) !== Number(a.generation)) return '';
+    const credential = runtime.credential || {};
+    const accountInfo = runtime.accountInfo || {};
+    const lanes = runtimeLaneHtml(t('runtime.token'), credential) +
+      runtimeLaneHtml(t('runtime.quota'), accountInfo);
+    const expiresAt = Number(runtime.expiresAt) || 0;
+    const expiry = expiresAt
+      ? '<span class="account-runtime-expiry">' + escapeHtml(t('runtime.expires')) + ' <span data-runtime-countdown="' +
+        escapeAttr(expiresAt) + '">' + escapeHtml(runtimeCountdownText(expiresAt)) + '</span></span>'
+      : '';
+    if (!lanes && !expiry) return '';
+    const updatedAt = Math.max(Number(a.lastRefresh) || 0, Number(accountInfo.lastSuccessAt) || 0);
+    const errors = Array.from(new Set([credential.lastError, accountInfo.lastError].filter(Boolean)));
+    return '<div class="account-runtime" data-runtime-account="' + escapeAttr(a.id) + '">' +
+      lanes + expiry +
+      (updatedAt ? '<span class="account-runtime-updated">' + escapeHtml(t('runtime.updated')) + ' <span data-runtime-age="' +
+        escapeAttr(updatedAt) + '">' + escapeHtml(runtimeAgeText(updatedAt)) + '</span></span>' : '') +
+      errors.map(message => '<span class="account-runtime-error" title="' + escapeAttr(message) + '">' + escapeHtml(message) + '</span>').join('') +
+      '</div>';
+  }
+  function accountsRuntimePollingAllowed() {
+    const main = $('mainPage');
+    const tab = $('tabAccounts');
+    return document.visibilityState !== 'hidden' && main && !main.classList.contains('hidden') &&
+      tab && !tab.classList.contains('hidden');
+  }
+  function stopAccountRuntimeTimers() {
+    if (accountRuntimePollTimer) {
+      clearTimeout(accountRuntimePollTimer);
+      accountRuntimePollTimer = null;
+    }
+    if (accountRuntimeCountdownTimer) {
+      clearInterval(accountRuntimeCountdownTimer);
+      accountRuntimeCountdownTimer = null;
+    }
+    accountRuntimeImmediatePending = false;
+    if (accountRuntimePollController) {
+      // Keep the controller registered until fetch unwinds in finally. This
+      // preserves the one-request-at-a-time invariant across fast visibility
+      // transitions while a canceled request is still settling.
+      accountRuntimePollController.abort();
+    }
+  }
+  function scheduleAccountRuntimePoll(delay) {
+    if (!accountsRuntimePollingAllowed() || accountRuntimePollTimer || accountRuntimePollController) return;
+    accountRuntimePollTimer = setTimeout(() => {
+      accountRuntimePollTimer = null;
+      pollAccountRuntime();
+    }, Math.max(0, delay || 0));
+  }
+  function syncAccountRuntimePolling(immediate) {
+    if (!accountsRuntimePollingAllowed()) {
+      stopAccountRuntimeTimers();
+      return;
+    }
+    if (!accountRuntimeCountdownTimer) {
+      accountRuntimeCountdownTimer = setInterval(() => refreshAccountRuntimeCountdowns($('accountsList')), 1000);
+    }
+    if (immediate && accountRuntimePollController) accountRuntimeImmediatePending = true;
+    if (immediate && accountRuntimePollTimer) {
+      clearTimeout(accountRuntimePollTimer);
+      accountRuntimePollTimer = null;
+    }
+    scheduleAccountRuntimePoll(immediate ? 0 : accountRuntimePollIntervalMs);
+  }
+  async function pollAccountRuntime() {
+    if (!accountsRuntimePollingAllowed() || accountRuntimePollController) return;
+    const controller = new AbortController();
+    accountRuntimePollController = controller;
+    try {
+      const headers = {};
+      if (accountRuntimeETag) headers['If-None-Match'] = accountRuntimeETag;
+      const res = await api('/accounts/runtime', { headers, signal: controller.signal, cache: 'no-cache' });
+      if (res.status === 304) {
+        if (accountRuntimeNeedsAccountReload) await loadAccounts();
+        return;
+      }
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (controller.signal.aborted) return;
+      const instance = String(data.instance || '');
+      const revision = Number(data.revision) || 0;
+      const changed = instance !== accountRuntimeInstance || revision !== accountRuntimeRevision;
+      accountRuntimeInstance = instance;
+      accountRuntimeRevision = revision;
+      accountRuntimeETag = res.headers.get('ETag') || accountRuntimeETag;
+      if (Number.isFinite(Number(data.serverTime)) && Number(data.serverTime) > 0) {
+        accountRuntimeServerOffsetMs = Number(data.serverTime) * 1000 - Date.now();
+      }
+      accountRuntimeById = new Map((Array.isArray(data.accounts) ? data.accounts : [])
+        .filter(item => item && item.id)
+        .map(item => [item.id, item]));
+      if (changed) accountRuntimeNeedsAccountReload = true;
+      if (accountRuntimeNeedsAccountReload) await loadAccounts();
+      else refreshAccountRuntimeCountdowns($('accountsList'));
+    } catch (e) {
+      if (!(e && e.name === 'AbortError')) {
+        try { console.warn('[AccountRuntime] poll failed', e); } catch (_) { }
+      }
+    } finally {
+      if (accountRuntimePollController === controller) accountRuntimePollController = null;
+      if (accountsRuntimePollingAllowed()) {
+        const immediate = accountRuntimeImmediatePending;
+        accountRuntimeImmediatePending = false;
+        scheduleAccountRuntimePoll(immediate ? 0 : accountRuntimePollIntervalMs);
+      }
+    }
   }
 
   // Account list
   function getFilteredAccounts() {
-    return accountsData.filter(a => {
+    const filtered = accountsData.filter(a => {
       if (filterStatus === 'enabled' && !a.enabled) return false;
       if (filterStatus === 'disabled' && (a.enabled || (a.banStatus && a.banStatus !== 'ACTIVE'))) return false;
       if (filterStatus === 'banned' && (!a.banStatus || a.banStatus === 'ACTIVE')) return false;
@@ -824,10 +1426,12 @@
       }
       return true;
     });
+    return sortAccountsForRouting(filtered);
   }
   function onFilterChange() {
     filterKeyword = $('filterSearch').value;
     filterStatus = $('filterStatusSelect').value;
+    renderAccountRoutingPanel();
     renderAccounts();
   }
   function toggleSelectAll(checked) {
@@ -893,8 +1497,10 @@
   function formatAuthMethod(method) {
     if (!method) return '-';
     const normalized = String(method).toLowerCase();
+    if (normalized === 'external_idp' || normalized === 'azuread') return t('auth.microsoft');
     if (normalized === 'idc') return t('auth.enterprise');
     if (normalized === 'social') return t('auth.social');
+    if (normalized === 'api_key' || normalized === 'apikey') return t('auth.apiKey');
     if (normalized === 'builderid') return 'BuilderID';
     if (normalized === 'api_key') return t('auth.apiKey');
     if (normalized === 'custom_api') return t('auth.customApi');
@@ -1002,6 +1608,7 @@
         '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
         '</div>' +
         '</div>' +
+        renderAccountRoutingControls(a) +
         (a.usageLimit > 0 ?
           '<div class="account-usage">' +
           '<div class="usage-label">' + escapeHtml(t('accounts.mainQuota')) + '</div>' +
@@ -1014,6 +1621,7 @@
           '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
           '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
           '</div>' : '') +
+        renderAccountRuntime(a) +
         // Compact account cards: no per-account stats row. Requests/Tokens/Credits
         // and token expiry are intentionally omitted here (usage still shown per
         // API key) so cards stay small enough to pack 2-3 per row.
@@ -1105,13 +1713,46 @@
       toast((e && e.message) || t('common.failed'), 'error');
     }
   }
+  function credentialImportPayloadFromFullAccount(a) {
+    const payload = {
+      clientId: a.clientId || '',
+      clientSecret: a.clientSecret || '',
+      accessToken: a.accessToken || '',
+      refreshToken: a.refreshToken || ''
+    };
+    if (a.authMethod) payload.authMethod = a.authMethod;
+    if (a.provider) payload.provider = a.provider;
+    if (a.tokenEndpoint) payload.tokenEndpoint = a.tokenEndpoint;
+    if (a.issuerUrl) payload.issuerUrl = a.issuerUrl;
+    if (a.scopes) payload.scopes = a.scopes;
+    if (a.userId) payload.userId = a.userId;
+    if (a.profileArn) payload.profileArn = a.profileArn;
+    if (a.region) payload.region = a.region;
+    return payload;
+  }
+  function credentialImportPayloadFromExportAccount(a) {
+    const credentials = a.credentials || {};
+    return credentialImportPayloadFromFullAccount({
+      clientId: credentials.clientId,
+      clientSecret: credentials.clientSecret,
+      accessToken: credentials.accessToken,
+      refreshToken: credentials.refreshToken,
+      authMethod: credentials.authMethod || a.authMethod,
+      provider: credentials.provider || a.provider || a.idp,
+      tokenEndpoint: credentials.tokenEndpoint,
+      issuerUrl: credentials.issuerUrl,
+      scopes: credentials.scopes,
+      userId: a.userId,
+      profileArn: a.profileArn,
+      region: credentials.region || a.region
+    });
+  }
   async function copyAccountJSON(id, btn) {
     try {
       const jsonPromise = api('/accounts/' + id + '/full').then(async res => {
         if (!res.ok) throw new Error('Failed');
         const a = await res.json();
-        const { clientId, clientSecret, accessToken, refreshToken } = a;
-        return JSON.stringify({ clientId, clientSecret, accessToken, refreshToken }, null, 2);
+        return JSON.stringify(credentialImportPayloadFromFullAccount(a), null, 2);
       });
       await copyText(jsonPromise);
       flashCopySuccess(btn);
@@ -1651,8 +2292,36 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+    $('responseLanguagePolicy').value = d.responseLanguagePolicy || 'preserve';
+    $('responseLanguage').value = d.responseLanguage || '';
+    updateResponseLanguageVisibility();
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
+  }
+
+  function updateResponseLanguageVisibility() {
+    const fixed = $('responseLanguagePolicy').value === 'fixed';
+    $('responseLanguageFixedGroup').classList.toggle('hidden', !fixed);
+  }
+
+  async function saveResponseLanguageConfig() {
+    const policy = $('responseLanguagePolicy').value || 'preserve';
+    const language = ($('responseLanguage').value || '').trim();
+    if (policy === 'fixed' && !language) {
+      return toast(t('settings.responseLanguageRequired'), 'warning');
+    }
+    try {
+      const res = await api('/settings', {
+        method: 'POST',
+        body: JSON.stringify({ responseLanguagePolicy: policy, responseLanguage: language })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('settings.responseLanguageSaved'), 'success');
+      await loadSettings();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
   }
   async function loadThinkingConfig() {
     const res = await api('/thinking');
@@ -2161,11 +2830,12 @@
     builderid: 'fa-solid fa-id-card',
     iam: 'fa-solid fa-key',
     enterprisesso: 'fa-brands fa-microsoft',
+    microsoft: 'fa-brands fa-microsoft',
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
     cookie: 'fa-solid fa-cookie-bite',
-    apikey: 'fa-solid fa-lock',
+    apikey: 'fa-solid fa-key',
     bedrock: 'fa-brands fa-aws'
   };
   function methodCard(type, title, desc) {
@@ -2187,6 +2857,7 @@
     else if (type === 'builderid') modalBuilderId(title, body);
     else if (type === 'iam') modalIam(title, body);
     else if (type === 'enterprisesso') modalEnterpriseSso(title, body);
+    else if (type === 'microsoft') openMicrosoftModal(title, body);
     else if (type === 'sso') modalSso(title, body);
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
@@ -2199,6 +2870,7 @@
   }
   function closeModal() {
     closeDialog('addModal');
+    resetMicrosoftFlow(true);
     iamSession = '';
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
     builderIdSession = '';
@@ -2218,6 +2890,7 @@
       methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
       methodCard('enterprisesso', t('modal.enterpriseSsoTitle'), t('modal.enterpriseSsoDesc')) +
+      methodCard('microsoft', t('modal.microsoftTitle'), t('modal.microsoftDesc')) +
       methodCard('sso', t('modal.ssoTitle'), t('modal.ssoDesc')) +
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
@@ -2276,6 +2949,82 @@
       '</div>';
     $('iamBtn').addEventListener('click', startIamSso);
   }
+  function openMicrosoftModal(title, body) {
+    resetMicrosoftFlow(true);
+    renderMicrosoftModal(title, body);
+  }
+  function renderMicrosoftModal(title, body) {
+    title = title || $('modalTitle');
+    body = body || $('modalBody');
+    title.textContent = t('modal.microsoftTitle');
+
+    if (microsoftSelectionId && microsoftProfiles.length) {
+      body.innerHTML =
+        '<p class="help-block">' + escapeHtml(t('microsoft.selectProfileDesc')) + '</p>' +
+        '<fieldset class="microsoft-profile-list"><legend class="sr-only">' + escapeHtml(t('microsoft.selectProfileTitle')) + '</legend>' +
+        microsoftProfiles.map((profile, index) => {
+          const arn = String(profile.arn || '');
+          const checked = arn === microsoftSelectedProfileArn || (!microsoftSelectedProfileArn && index === 0);
+          return '<label class="microsoft-profile-card' + (checked ? ' selected' : '') + '">' +
+            '<input type="radio" name="microsoftProfile" value="' + escapeAttr(arn) + '"' + (checked ? ' checked' : '') + ' />' +
+            '<span class="microsoft-profile-body">' +
+            '<span class="microsoft-profile-name">' + escapeHtml(profile.name || arn) + '</span>' +
+            '<span class="microsoft-profile-arn font-mono">' + escapeHtml(arn) + '</span>' +
+            (profile.region ? '<span class="microsoft-profile-region">' + escapeHtml(t('microsoft.profileRegion', profile.region)) + '</span>' : '') +
+            '</span></label>';
+        }).join('') +
+        '</fieldset>' +
+        '<div class="modal-footer">' +
+        '<button class="btn btn-secondary" data-microsoft-back="1" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+        '<button class="btn btn-primary" id="microsoftSelectProfileBtn" type="button">' + escapeHtml(t('microsoft.selectProfile')) + '</button>' +
+        '</div>';
+      qsa('input[name="microsoftProfile"]', body).forEach(radio => radio.addEventListener('change', e => {
+        microsoftSelectedProfileArn = e.target.value;
+        qsa('.microsoft-profile-card', body).forEach(card => {
+          const input = card.querySelector('input');
+          card.classList.toggle('selected', Boolean(input && input.checked));
+        });
+      }));
+      $('microsoftSelectProfileBtn').addEventListener('click', selectMicrosoftProfile);
+      syncMicrosoftBusyUI();
+      return;
+    }
+
+    const hasAuthorizeUrl = Boolean(microsoftAuthorizeUrl);
+    const loginLabel = microsoftStage === 'microsoft' ? t('microsoft.providerStep') : t('microsoft.portalStep');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.microsoftDesc')) + '</p>' +
+      (hasAuthorizeUrl ?
+        '<div class="form-group"><label>' + escapeHtml(loginLabel) + '</label>' +
+        '<div class="endpoint"><span id="microsoftAuthUrl" class="font-mono text-xs"></span></div>' +
+        '<div class="flex gap-2 mt-2">' +
+        '<button class="btn btn-sm btn-outline flex-1" id="microsoftOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
+        '<button class="btn btn-sm btn-outline flex-1" id="microsoftCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+        '</div></div>' +
+        '<div class="message message-info microsoft-callback-note"><p>' + escapeHtml(t('microsoft.callbackInstructions')) + '</p></div>' +
+        '<div class="form-group mt-4"><label>' + escapeHtml(t('microsoft.callbackUrl')) + '</label>' +
+        '<textarea id="microsoftCallback" class="font-mono microsoft-callback-input" placeholder="' + escapeAttr(t('microsoft.callbackPlaceholder')) + '"></textarea></div>'
+        : '') +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-microsoft-back="1" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="microsoftBtn" type="button">' +
+      escapeHtml(hasAuthorizeUrl ? t('microsoft.complete') : t('microsoft.start')) +
+      '</button></div>';
+
+    if (hasAuthorizeUrl) {
+      $('microsoftAuthUrl').textContent = microsoftAuthorizeUrl;
+      $('microsoftOpenBtn').addEventListener('click', () => {
+        const opened = window.open(microsoftAuthorizeUrl, '_blank', 'noopener');
+        if (opened) opened.opener = null;
+      });
+      $('microsoftCopyBtn').addEventListener('click', async () => {
+        await copyText(microsoftAuthorizeUrl);
+        toast(t('common.copied'), 'primary');
+      });
+    }
+    $('microsoftBtn').addEventListener('click', hasAuthorizeUrl ? completeMicrosoftLogin : startMicrosoftLogin);
+    syncMicrosoftBusyUI();
+  }
   function modalSso(title, body) {
     title.textContent = t('modal.ssoTitle');
     body.innerHTML =
@@ -2295,6 +3044,33 @@
       '<button class="btn btn-primary" id="importSsoBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
       '</div>';
     $('importSsoBtn').addEventListener('click', importSsoToken);
+  }
+  function modalApiKey(title, body) {
+    title.textContent = t('modal.apiKeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apiKeyDesc')) + '</p>' +
+      '<div class="help-block">' +
+      '<p>' + escapeHtml(t('apikey.hint')) + '</p>' +
+      '<p class="font-mono text-xs">ksk_xxxxxxxx</p>' +
+      '<p class="font-mono text-xs">ksk_xxxxxxxx|eu-central-1</p>' +
+      '</div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.label')) + '</label>' +
+      '<textarea id="kiroApiKeyInput" class="font-mono" placeholder="' + escapeAttr(t('apikey.placeholder')) + '"></textarea></div>' +
+      // H1: no default value here. A non-empty default silently collapses
+      // resolveApiKeyRegion's probe (backend) to that ONE region — an
+      // EU-provisioned key pasted with this box left untouched would 403
+      // forever against us-east-1 instead of being probed across every
+      // candidate region. Leave blank so importApiKey below can omit region
+      // entirely and let the backend's full multi-region probe run.
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + ' <small>' + escapeHtml(t('apikey.regionHint')) + '</small></label>' +
+      '<input type="text" id="kiroApiKeyRegion" placeholder="us-east-1 / eu-west-1 (leave blank to auto-detect)" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + '</label>' +
+      '<input type="text" id="kiroApiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApiKeyBtn').addEventListener('click', importApiKey);
   }
 
   function modalLocal(title, body) {
@@ -2380,47 +3156,6 @@
       '<button class="btn btn-primary" id="importCookieBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
       '</div>';
     $('importCookieBtn').addEventListener('click', importFromCookie);
-  }
-  function modalApiKey(title, body) {
-    title.textContent = t('modal.apiKeyTitle');
-    body.innerHTML =
-      '<p class="help-block">' + escapeHtml(t('modal.apiKeyDesc')) + '</p>' +
-      '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + ' <small>' + escapeHtml(t('apikey.optional')) + '</small></label>' +
-      '<input type="text" id="apiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('apikey.keyLabel')) + '</label>' +
-      '<input type="text" id="apiKeyValue" class="font-mono" placeholder="ksk_..." /></div>' +
-      '<div class="modal-footer">' +
-      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
-      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
-      '</div>';
-    $('importApiKeyBtn').addEventListener('click', importApiKey);
-  }
-  async function importApiKey() {
-    const key = $('apiKeyValue').value.trim();
-    if (!key) return toastWarning(t('apikey.keyMissing'));
-    // region intentionally omitted — the server probes the candidate regions and
-    // pins the one the key actually serves. The profile is bound to the key
-    // server-side, but the data-plane endpoint is still regional, so the region
-    // must be discovered rather than assumed (an EU key 403s against us-east-1).
-    const payload = {
-      authMethod: 'api_key',
-      kiroApiKey: key,
-      nickname: $('apiKeyNickname').value.trim(),
-      enabled: true
-    };
-    try {
-      const res = await api('/accounts', { method: 'POST', body: JSON.stringify(payload) });
-      const d = await res.json();
-      if (d.success) {
-        closeModal(); loadAccounts(); loadStats();
-        toastPrimary(t('apikey.success'));
-        autoRefreshNewAccount(d.id);
-      } else {
-        toastError(t('common.failed') + ': ' + (d.error || ''));
-      }
-    } catch {
-      toastError(t('common.failed'));
-    }
   }
   // modalCustomApi renders the "Custom API" (pool-linking) add form. A Custom API
   // account is a transparent proxy to ANOTHER Kiro-Go pool: base URL + a key that
@@ -2556,6 +3291,42 @@
   }
 
   // Import handlers
+  async function importApiKey() {
+    const raw = ($('kiroApiKeyInput') && $('kiroApiKeyInput').value || '').trim();
+    if (!raw) return toastWarning(t('apikey.missing'));
+    let key = raw;
+    let regionFromKey = '';
+    if (raw.includes('|')) {
+      const parts = raw.split('|');
+      key = (parts[0] || '').trim();
+      regionFromKey = (parts[1] || '').trim();
+    }
+    if (!key) return toastWarning(t('apikey.missing'));
+    // H1: no 'us-east-1' fallback. An empty region here must reach the
+    // backend as "" so resolveApiKeyRegion runs its full multi-region probe
+    // instead of being pinned to a single (possibly wrong) region.
+    const region = regionFromKey || ($('kiroApiKeyRegion') && $('kiroApiKeyRegion').value.trim()) || '';
+    const nickname = ($('kiroApiKeyNickname') && $('kiroApiKeyNickname').value.trim()) || '';
+    const payload = {
+      kiroApiKey: key,
+      authMethod: 'api_key',
+      region,
+      nickname
+    };
+    try {
+      const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+      const d = await res.json();
+      if (d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('apikey.importSuccess') + ': ' + (d.account?.email || d.account?.id));
+        autoRefreshNewAccount(d.account?.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch (e) {
+      toastError(t('common.failed') + ': ' + (e.message || e));
+    }
+  }
   async function importLocalKiro() {
     const provider = $('localProvider').value;
     const tokenJson = $('localTokenJson').value.trim();
@@ -2594,30 +3365,10 @@
     let skipped = 0;
     try {
       const json = JSON.parse(raw);
-      if (json.accounts && Array.isArray(json.accounts)) {
-        items = json.accounts.map(a => {
-          const c = a.credentials || {};
-          return {
-            refreshToken: c.refreshToken || a.refreshToken,
-            accessToken: c.accessToken || a.accessToken,
-            clientId: c.clientId || a.clientId,
-            clientSecret: c.clientSecret || a.clientSecret,
-            kiroApiKey: c.kiroApiKey || a.kiroApiKey,
-            region: c.region || a.region,
-            authMethod: c.authMethod || a.authMethod,
-            provider: c.provider || a.provider || a.idp,
-            tokenEndpoint: c.tokenEndpoint || a.tokenEndpoint,
-            issuerUrl: c.issuerUrl || a.issuerUrl,
-            scopes: c.scopes || a.scopes,
-            id: a.id,
-            email: c.email || a.email,
-            profileArn: c.profileArn || a.profileArn,
-            userId: a.userId
-          };
-        });
-      } else {
-        items = Array.isArray(json) ? json : [json];
-      }
+      const source = json.accounts && Array.isArray(json.accounts)
+        ? json.accounts
+        : (Array.isArray(json) ? json : [json]);
+      items = source.map(normalizeCredentialRecord);
     } catch {
       const parsed = parseLineCredentials(raw);
       items = parsed.items;
@@ -2633,55 +3384,64 @@
     }
     let ok = 0, fail = 0, newIds = [];
     for (const item of items) {
-      // api_key accounts carry a kiroApiKey instead of a refreshToken; route them
-      // straight to the import endpoint's api_key branch.
-      const itemAuth = (item.authMethod || '').toLowerCase();
-      if (itemAuth === 'api_key' || item.kiroApiKey) {
-        if (!item.kiroApiKey) { fail++; continue; }
+      const rawMethod = String(item.authMethod || '').trim();
+      const rawProvider = String(item.provider || '').trim();
+      const methodKey = rawMethod.toLowerCase();
+      const providerKey = rawProvider.toLowerCase();
+      const kiroApiKey = String(item.kiroApiKey || '').trim();
+      const isApiKey = Boolean(kiroApiKey) || methodKey === 'api_key' || methodKey === 'apikey' ||
+        (!item.refreshToken && String(item.accessToken || '').trim().startsWith('ksk_'));
+      if (!isApiKey && !item.refreshToken) { fail++; continue; }
+      if (isApiKey) {
+        const payload = {
+          id: item.id || '',
+          email: item.email || '',
+          userId: item.userId || '',
+          nickname: item.nickname || '',
+          kiroApiKey: kiroApiKey || item.accessToken || '',
+          authMethod: 'api_key',
+          provider: rawProvider || 'APIKey',
+          region: item.region || 'us-east-1'
+        };
         try {
-          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify({
-            authMethod: 'api_key',
-            kiroApiKey: item.kiroApiKey,
-            region: item.region || 'us-east-1',
-            ...(item.id ? { id: item.id } : {}),
-            ...(item.email ? { email: item.email } : {}),
-            ...(item.provider ? { provider: item.provider } : {})
-          }) });
+          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
           const d = await res.json();
           if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
           else fail++;
         } catch { fail++; }
         continue;
       }
-      if (!item.refreshToken) { fail++; continue; }
-      const EXTERNAL_IDP = ['external_idp','azuread','azure','entra','entra-id','microsoft','m365','office365','external'];
-      let authMethod = (item.authMethod || '').toLowerCase();
-      if (EXTERNAL_IDP.includes(authMethod) || item.tokenEndpoint) {
-        authMethod = 'external_idp';
-      } else if (item.clientId && item.clientSecret) {
-        authMethod = 'idc';
-      } else if (!authMethod || authMethod === 'social') {
-        authMethod = 'social';
-      } else {
-        authMethod = authMethod === 'idc' ? 'idc' : 'social';
-      }
-      let provider = item.provider || '';
-      if (!provider && authMethod === 'external_idp') provider = 'AzureAD';
+      const externalAliases = [
+        'external_idp', 'external-idp', 'external', 'microsoft', 'm365', 'office365',
+        'azure', 'azuread', 'azure-ad', 'azure_ad', 'entra', 'entra-id'
+      ];
+      const isExternalIdp = externalAliases.includes(methodKey) ||
+        externalAliases.includes(providerKey) ||
+        Boolean(item.tokenEndpoint || item.issuerUrl);
+      let authMethod;
+      if (isExternalIdp) authMethod = 'external_idp';
+      else if (item.clientId && item.clientSecret) authMethod = 'idc';
+      else if (methodKey === 'idc') authMethod = 'idc';
+      else if (methodKey === 'social' || methodKey === 'google' || methodKey === 'github') authMethod = 'social';
+      else authMethod = methodKey ? 'social' : '';
+      let provider = isExternalIdp ? 'AzureAD' : rawProvider;
       if (!provider && authMethod === 'social') provider = 'Google';
       if (!provider && authMethod === 'idc') provider = 'BuilderId';
       const payload = {
+        id: item.id || '',
+        email: item.email || '',
+        userId: item.userId || '',
+        nickname: item.nickname || '',
+        profileArn: item.profileArn || '',
         refreshToken: item.refreshToken,
         accessToken: item.accessToken || '',
         clientId: item.clientId || '',
         clientSecret: item.clientSecret || '',
         authMethod, provider,
-        region: item.region || 'us-east-1',
+        region: item.region || (isExternalIdp ? '' : 'us-east-1'),
         tokenEndpoint: item.tokenEndpoint || '',
         issuerUrl: item.issuerUrl || '',
-        scopes: item.scopes || '',
-        ...(item.id ? { id: item.id } : {}),
-        ...(item.email ? { email: item.email } : {}),
-        ...(item.profileArn ? { profileArn: item.profileArn } : {})
+        scopes: item.scopes || ''
       };
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
@@ -2696,6 +3456,33 @@
     if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
     toastPrimary(msg, { duration: 5200 });
     newIds.forEach(autoRefreshNewAccount);
+  }
+  function normalizeCredentialRecord(record) {
+    const source = record && typeof record === 'object' ? record : {};
+    const credentials = source.credentials && typeof source.credentials === 'object'
+      ? source.credentials
+      : {};
+    const value = key => Object.prototype.hasOwnProperty.call(credentials, key)
+      ? credentials[key]
+      : source[key];
+    return {
+      id: value('id'),
+      email: value('email'),
+      userId: value('userId'),
+      nickname: value('nickname'),
+      profileArn: value('profileArn'),
+      accessToken: value('accessToken'),
+      refreshToken: value('refreshToken'),
+      kiroApiKey: value('kiroApiKey'),
+      clientId: value('clientId'),
+      clientSecret: value('clientSecret'),
+      authMethod: value('authMethod'),
+      provider: value('provider') || source.idp,
+      region: value('region'),
+      tokenEndpoint: value('tokenEndpoint'),
+      issuerUrl: value('issuerUrl'),
+      scopes: value('scopes')
+    };
   }
   function parseLineCredentials(text) {
     const items = [];
@@ -2802,10 +3589,28 @@
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.enterpriseSsoDesc')) + '</p>' +
       '<div id="kiroSsoStep1">' +
-      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.hostNote')) + '</p></div>' +
+      // Fastest path when the Kiro IDE is already signed in ON THIS HOST: read its
+      // local credential cache and import directly, no browser sign-in.
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.ideCacheNote')) + '</p>' +
+      '<button class="btn btn-sm btn-outline mt-2" id="kiroSsoIdeCacheBtn" type="button">' + escapeHtml(t('kirosso.importIdeCache')) + '</button>' +
+      '</div>' +
+      '<div class="message message-info mt-2"><p class="text-xs">' + escapeHtml(t('kirosso.hostNote')) + '</p></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="startKiroSsoBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
+      '</div>' +
+      // Alternative path: import a CLIProxyAPI_*.json already minted by the
+      // standalone kiro-login-helper.py (offline / headless hosts where the
+      // browser sign-in can't run on the proxy host itself).
+      '<p class="text-xs muted-text mt-4 mb-2">' + escapeHtml(t('kirosso.orImportJson')) + '</p>' +
+      '<div class="form-group">' +
+      '<label>' + escapeHtml(t('kirosso.helperJsonLabel')) + '</label>' +
+      '<p class="help-block text-xs">' + escapeHtml(t('kirosso.helperJsonHint')) + '</p>' +
+      '<input type="file" id="kiroSsoJsonFile" accept=".json" multiple class="mt-1">' +
+      '<textarea id="kiroSsoJsonText" class="font-mono mt-2" placeholder=\'{"auth_method":"external_idp","client_id":"...","refresh_token":"...","token_endpoint":"https://login.microsoftonline.com/.../oauth2/v2.0/token","issuer_url":"...","scopes":"... offline_access"}\'></textarea>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-primary" id="kiroSsoImportJsonBtn" type="button">' + escapeHtml(t('kirosso.importJson')) + '</button>' +
+      '</div>' +
       '</div>' +
       '</div>' +
       '<div id="kiroSsoStep2" class="hidden">' +
@@ -2832,6 +3637,52 @@
       '</div>' +
       '</div>';
     $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
+    $('kiroSsoIdeCacheBtn').addEventListener('click', importIdeCache);
+    $('kiroSsoJsonFile').addEventListener('change', e => loadHelperJsonFiles(e.target));
+    $('kiroSsoImportJsonBtn').addEventListener('click', importHelperJson);
+  }
+  // importIdeCache imports the credential the Kiro IDE already cached on the proxy
+  // host (~/.aws/sso/cache/kiro-auth-token.json) with no browser sign-in. The
+  // backend reads the file server-side, so this only works when the IDE and the
+  // proxy run on the same host (or the cache is mounted + KIRO_IDE_CACHE is set).
+  async function importIdeCache() {
+    const res = await api('/auth/import-ide-cache', { method: 'POST', body: JSON.stringify({}) });
+    const d = await res.json();
+    if (d.success) {
+      closeModal(); loadAccounts(); loadStats();
+      toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+      autoRefreshNewAccount(d.account?.id);
+    } else {
+      toastError(t('common.failed') + ': ' + (d.error || ''));
+    }
+  }
+  // loadHelperJsonFiles reads one or more selected CLIProxyAPI_*.json files into
+  // the textarea (newline-separated objects, which normalizeCliJson handles).
+  function loadHelperJsonFiles(input) {
+    const files = Array.from(input.files || []);
+    if (files.length === 0) return;
+    Promise.all(files.map(f => f.text())).then(texts => {
+      $('kiroSsoJsonText').value = texts.map(s => s.trim()).filter(Boolean).join('\n');
+    });
+  }
+  // importHelperJson posts the helper JSON (file-loaded or pasted) to the
+  // dedicated /auth/import-cli-json endpoint, which accepts the helper's native
+  // snake_case external_idp format directly.
+  async function importHelperJson() {
+    const raw = ($('kiroSsoJsonText').value || '').trim();
+    if (!raw) { toastWarning(t('kirosso.helperJsonEmpty')); return; }
+    const res = await api('/auth/import-cli-json', { method: 'POST', body: raw });
+    const d = await res.json();
+    if (d.success) {
+      const ids = (d.imported || []).map(a => a.id);
+      closeModal(); loadAccounts(); loadStats();
+      let msg = t('kirosso.importSuccess', (d.imported || []).length);
+      if ((d.errors || []).length > 0) msg += t('kirosso.importPartial', d.errors.length);
+      toastPrimary(msg, { duration: 5200 });
+      ids.forEach(autoRefreshNewAccount);
+    } else {
+      toastError(t('common.failed') + ': ' + (d.error || ''));
+    }
   }
   // Renders the discovered profiles as a radio list. The label leads with the
   // profile's region (parsed from its ARN); the full ARN is shown underneath so
@@ -2994,6 +3845,187 @@
       } else toastError(t('common.failed') + ': ' + (d.error || ''));
     }
   }
+  function cancelMicrosoftServerSession(sessionId, selectionId) {
+    if (!sessionId && !selectionId) return;
+    api('/auth/microsoft-sso/cancel', {
+      method: 'POST',
+      body: JSON.stringify({
+        sessionId: sessionId || '',
+        selectionId: selectionId || ''
+      })
+    }).catch(() => {});
+  }
+  function resetMicrosoftFlow(notifyServer) {
+    const sessionId = microsoftSession;
+    const selectionId = microsoftSelectionId;
+    microsoftGeneration++;
+    microsoftSession = '';
+    microsoftSelectionId = '';
+    microsoftStage = 'kiro';
+    microsoftAuthorizeUrl = '';
+    microsoftProfiles = [];
+    microsoftSelectedProfileArn = '';
+    microsoftBusy = false;
+    if (notifyServer) cancelMicrosoftServerSession(sessionId, selectionId);
+  }
+  function syncMicrosoftBusyUI() {
+    const loginAction = $('microsoftBtn');
+    if (loginAction) {
+      loginAction.disabled = microsoftBusy;
+      loginAction.textContent = microsoftBusy
+        ? t('microsoft.processing')
+        : (microsoftAuthorizeUrl ? t('microsoft.complete') : t('microsoft.start'));
+    }
+    const profileAction = $('microsoftSelectProfileBtn');
+    if (profileAction) {
+      profileAction.disabled = microsoftBusy;
+      profileAction.textContent = microsoftBusy ? t('microsoft.processing') : t('microsoft.selectProfile');
+    }
+    qsa('[data-microsoft-back]', $('modalBody')).forEach(button => {
+      button.disabled = microsoftBusy;
+    });
+  }
+  async function startMicrosoftLogin() {
+    if (microsoftBusy) return;
+    microsoftBusy = true;
+    syncMicrosoftBusyUI();
+    const generation = microsoftGeneration;
+    try {
+      const res = await api('/auth/microsoft-sso/start', {
+        method: 'POST',
+        body: JSON.stringify({})
+      });
+      const d = await res.json().catch(() => ({}));
+      if (generation !== microsoftGeneration) {
+        cancelMicrosoftServerSession(d.sessionId || '', d.selectionId || '');
+        return;
+      }
+      if (!res.ok || !d.sessionId || !d.authorizeUrl) {
+        toastError(t('common.failed') + ': ' + (d.error || res.statusText || ''));
+        return;
+      }
+      microsoftSession = d.sessionId;
+      microsoftAuthorizeUrl = d.authorizeUrl;
+      microsoftStage = 'kiro';
+      microsoftBusy = false;
+      renderMicrosoftModal();
+    } catch (e) {
+      if (generation === microsoftGeneration) {
+        toastError(t('common.failed') + ': ' + (e.message || ''));
+      }
+    } finally {
+      if (generation === microsoftGeneration && microsoftBusy) {
+        microsoftBusy = false;
+        syncMicrosoftBusyUI();
+      }
+    }
+  }
+  async function completeMicrosoftLogin() {
+    if (microsoftBusy) return;
+    const callback = ($('microsoftCallback')?.value || '').trim();
+    if (!callback) {
+      toastWarning(t('microsoft.callbackRequired'));
+      $('microsoftCallback')?.focus();
+      return;
+    }
+    microsoftBusy = true;
+    syncMicrosoftBusyUI();
+    const generation = microsoftGeneration;
+    const sessionId = microsoftSession;
+    try {
+      const res = await api('/auth/microsoft-sso/complete', {
+        method: 'POST',
+        body: JSON.stringify({
+          sessionId: microsoftSession,
+          callbackUrl: callback
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (generation !== microsoftGeneration) {
+        cancelMicrosoftServerSession(sessionId, d.selectionId || '');
+        return;
+      }
+      if (!res.ok || d.error) {
+        toastError(t('common.failed') + ': ' + (d.error || res.statusText || ''));
+        return;
+      }
+      if (d.requiresProfileSelection && d.selectionId && Array.isArray(d.profiles) && d.profiles.length) {
+        microsoftSelectionId = d.selectionId;
+        microsoftProfiles = d.profiles;
+        microsoftSelectedProfileArn = String(d.profiles[0]?.arn || '');
+        microsoftBusy = false;
+        renderMicrosoftModal();
+        return;
+      }
+      if (d.account) {
+        finishMicrosoftLogin(d.account, d.warning);
+        return;
+      }
+      if (d.stage === 'microsoft' && d.authorizeUrl) {
+        microsoftStage = 'microsoft';
+        microsoftAuthorizeUrl = d.authorizeUrl;
+        microsoftBusy = false;
+        renderMicrosoftModal();
+        return;
+      }
+      toastError(t('common.failed') + ': ' + (d.error || t('microsoft.invalidResponse')));
+    } catch (e) {
+      if (generation === microsoftGeneration) {
+        toastError(t('common.failed') + ': ' + (e.message || ''));
+      }
+    } finally {
+      if (generation === microsoftGeneration && microsoftBusy) {
+        microsoftBusy = false;
+        syncMicrosoftBusyUI();
+      }
+    }
+  }
+  async function selectMicrosoftProfile() {
+    if (microsoftBusy) return;
+    const selected = qsa('input[name="microsoftProfile"]:checked', $('modalBody'))[0];
+    const profileArn = (selected?.value || microsoftSelectedProfileArn || '').trim();
+    if (!profileArn) {
+      toastWarning(t('microsoft.profileRequired'));
+      return;
+    }
+    microsoftBusy = true;
+    syncMicrosoftBusyUI();
+    const generation = microsoftGeneration;
+    try {
+      const res = await api('/auth/microsoft-sso/select-profile', {
+        method: 'POST',
+        body: JSON.stringify({
+          selectionId: microsoftSelectionId,
+          profileArn
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (generation !== microsoftGeneration) return;
+      if (!res.ok || !d.account) {
+        toastError(t('common.failed') + ': ' + (d.error || res.statusText || ''));
+        return;
+      }
+      finishMicrosoftLogin(d.account, d.warning);
+    } catch (e) {
+      if (generation === microsoftGeneration) {
+        toastError(t('common.failed') + ': ' + (e.message || ''));
+      }
+    } finally {
+      if (generation === microsoftGeneration && microsoftBusy) {
+        microsoftBusy = false;
+        syncMicrosoftBusyUI();
+      }
+    }
+  }
+  function finishMicrosoftLogin(account, warning) {
+    resetMicrosoftFlow(false);
+    closeModal();
+    loadAccounts();
+    loadStats();
+    toastPrimary(t('microsoft.success') + ': ' + (account?.email || account?.id || ''));
+    if (warning) toastWarning(String(warning));
+    autoRefreshNewAccount(account?.id);
+  }
   async function autoRefreshNewAccount(id) {
     if (!id) return;
     try { await api('/accounts/' + id + '/refresh', { method: 'POST' }); } catch (e) { }
@@ -3071,10 +4103,7 @@
     if (exportSelectedIds.size === 0) { toastWarning(t('export.noSelection')); return; }
     const jsonPromise = getExportData().then(data => {
       if (!data) throw new Error('no-data');
-      const filtered = (data.accounts || []).map(a => {
-        const { clientId, clientSecret, accessToken, refreshToken } = a.credentials || {};
-        return { clientId, clientSecret, accessToken, refreshToken };
-      });
+      const filtered = (data.accounts || []).map(credentialImportPayloadFromExportAccount);
       return JSON.stringify(filtered, null, 2);
     });
     try {
@@ -3221,6 +4250,7 @@
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
     if (tab === 'logs') loadLogs();
+    syncAccountRuntimePolling(tab === 'accounts');
   }
 
   // Event wiring
@@ -3256,6 +4286,9 @@
     });
     window.addEventListener('resize', positionOpenCustomSelects);
     window.addEventListener('scroll', positionOpenCustomSelects, true);
+    document.addEventListener('visibilitychange', () => syncAccountRuntimePolling(true));
+    window.addEventListener('pagehide', () => stopAccountRuntimeTimers());
+    window.addEventListener('pageshow', () => syncAccountRuntimePolling(true));
 
     $('loginThemeToggle').addEventListener('click', toggleTheme);
     $('mainThemeToggle').addEventListener('click', toggleTheme);
@@ -3305,6 +4338,7 @@
     $('exportBtn').addEventListener('click', showExportModal);
     $('refreshAllModelsBtn').addEventListener('click', refreshAllModels);
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
+    $('accountRoutingStrategySelect').addEventListener('change', saveAccountRoutingStrategy);
 
     $('selectAllCheckbox').addEventListener('change', e => toggleSelectAll(e.target.checked));
     qsa('[data-batch]').forEach(b => b.addEventListener('click', () => {
@@ -3316,6 +4350,14 @@
 
     $('filterSearch').addEventListener('input', onFilterChange);
     $('filterStatusSelect').addEventListener('change', onFilterChange);
+
+    $('accountsList').addEventListener('keydown', e => {
+      if (e.key !== 'Enter' || !e.target.matches('[data-routing-priority-input]')) return;
+      e.preventDefault();
+      const controls = e.target.closest('.account-routing-controls');
+      const save = controls && controls.querySelector('button[data-action="savePriority"]');
+      if (save) save.click();
+    });
 
     $('accountsList').addEventListener('click', e => {
       const cb = e.target.closest('.account-checkbox');
@@ -3335,6 +4377,9 @@
       else if (action === 'toggle') toggleAccount(id, btn.dataset.enabled === 'true');
       else if (action === 'test') testAccount(id);
       else if (action === 'switchProfile') openSwitchProfileModal(id, btn);
+      else if (action === 'savePriority') saveAccountPriority(id, btn);
+      else if (action === 'moveRoutingUp') moveAccountWithinPriority(id, -1, btn);
+      else if (action === 'moveRoutingDown') moveAccountWithinPriority(id, 1, btn);
       else if (action === 'delete') deleteAccount(id);
     });
   }
@@ -3342,6 +4387,8 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    $('responseLanguagePolicy').addEventListener('change', updateResponseLanguageVisibility);
+    $('saveResponseLanguageBtn').addEventListener('click', saveResponseLanguageConfig);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);
@@ -3391,6 +4438,12 @@
     $('modalBody').addEventListener('click', e => {
       const m = e.target.closest('[data-method]');
       if (m) { showModal(m.dataset.method); return; }
+      const microsoftBack = e.target.closest('[data-microsoft-back]');
+      if (microsoftBack) {
+        resetMicrosoftFlow(true);
+        showModal('add');
+        return;
+      }
       const g = e.target.closest('[data-modal-goto]');
       if (g) { showModal(g.dataset.modalGoto); return; }
       if (e.target.dataset.closeAdd) closeModal();
@@ -3445,10 +4498,10 @@
     const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
     const parts = [];
-    if (d > 0) parts.push(d + (currentLang === 'zh' ? '天' : 'd'));
-    if (h > 0) parts.push(h + (currentLang === 'zh' ? '时' : 'h'));
-    if (m > 0) parts.push(m + (currentLang === 'zh' ? '分' : 'm'));
-    parts.push(s + (currentLang === 'zh' ? '秒' : 's'));
+    if (d > 0) parts.push(d + t('uptime.d'));
+    if (h > 0) parts.push(h + t('uptime.h'));
+    if (m > 0) parts.push(m + t('uptime.m'));
+    parts.push(s + t('uptime.s'));
     return parts.join(' ');
   }
 
@@ -3533,7 +4586,7 @@
       gemini: 'Gemini (Google)',
       meta: 'LLaMA (Meta)',
       proxy: 'Proxy Aliases',
-      other: currentLang === 'zh' ? '其他模型' : 'Other'
+      other: t('models.familyOther')
     };
     return labels[family] || family;
   }

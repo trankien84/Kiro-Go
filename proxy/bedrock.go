@@ -108,7 +108,7 @@ func resolveBedrockModelID(account *config.Account, requested string) (string, e
 	// discovery): exact or unique-alias match against what this account can
 	// actually invoke. Reads the cache only, never the network.
 	if account != nil {
-		if id := discoveredBedrockModelFor(account.ID, requested); id != "" {
+		if id := discoveredBedrockModelForAccount(account, requested); id != "" {
 			return id, nil
 		}
 	}
@@ -266,7 +266,11 @@ func extractAnthropicReplyText(body []byte) string {
 // the caller's to close. All returned errors occur before any client bytes, so
 // callers may fail over.
 func (h *Handler) doBedrockInvoke(p forwardParams, anthropicBody []byte, streaming bool) (*http.Response, error) {
-	modelID, err := resolveBedrockModelID(p.account, p.model)
+	modelID := strings.TrimSpace(p.providerModelID)
+	var err error
+	if modelID == "" {
+		modelID, err = resolveBedrockModelID(p.account, p.model)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -418,9 +422,15 @@ func (h *Handler) recordBedrockSuccess(p forwardParams, inputTokens, outputToken
 	}
 	credits := bedrockCreditsForTokens(inputTokens + outputTokens)
 	h.recordSuccessForApiKey(p.apiKeyID, inputTokens, outputTokens, credits)
-	h.pool.RecordSuccess(p.account.ID)
-	h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))
-	h.pool.UpdateStats(p.account.ID, inputTokens+outputTokens, credits)
+	if p.selection != nil {
+		h.pool.RecordSuccessForSelection(*p.selection)
+		h.pool.RecordLatencyForSelection(*p.selection, float64(time.Since(reqStart).Milliseconds()))
+		h.pool.UpdateStatsForSelection(*p.selection, inputTokens+outputTokens, credits)
+	} else {
+		h.pool.RecordSuccess(p.account.ID)
+		h.pool.RecordLatency(p.account.ID, float64(time.Since(reqStart).Milliseconds()))
+		h.pool.UpdateStats(p.account.ID, inputTokens+outputTokens, credits)
+	}
 	h.recordSuccessLog(endpoint, p.model, p.account.ID, p.apiKeyID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 }
 

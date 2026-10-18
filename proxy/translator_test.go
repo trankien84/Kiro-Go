@@ -284,6 +284,70 @@ func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
 	}
 }
 
+func TestResolveClaudeHandlerStopReason(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reason    string
+		toolCount int
+		want      string
+	}{
+		{name: "max tokens", reason: "MAX_TOKENS", want: "max_tokens"},
+		{name: "max output tokens alias", reason: "max_output_tokens", want: "max_tokens"},
+		{name: "length alias", reason: "length", want: "max_tokens"},
+		{name: "context limit", reason: "CONTEXT_WINDOW_EXCEEDED", want: "model_context_window_exceeded"},
+		{name: "context length alias", reason: "context_length_exceeded", want: "model_context_window_exceeded"},
+		{name: "model context limit", reason: "model_context_window_exceeded", want: "model_context_window_exceeded"},
+		{name: "content filter", reason: "CONTENT_FILTERED", want: "refusal"},
+		{name: "content filter alias", reason: "content_filter", want: "refusal"},
+		{name: "refusal", reason: "refusal", want: "refusal"},
+		{name: "guardrail alias", reason: "guardrail_intervened", want: "refusal"},
+		{name: "stop sequence", reason: "STOP_SEQUENCE", want: "stop_sequence"},
+		{name: "pause", reason: "PAUSE_TURN", want: "pause_turn"},
+		{name: "end turn", reason: "END_TURN", want: "end_turn"},
+		{name: "empty falls back to end turn", reason: "", want: "end_turn"},
+		{name: "unknown is preserved", reason: "COMPLETE", want: "COMPLETE"},
+		{name: "explicit max tokens wins over observed tool", reason: "MAX_TOKENS", toolCount: 1, want: "max_tokens"},
+		{name: "tool use wins over empty reason", reason: "", toolCount: 2, want: "tool_use"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveClaudeHandlerStopReason(tc.reason, tc.toolCount); got != tc.want {
+				t.Fatalf("resolveClaudeHandlerStopReason(%q, %d) = %q, want %q", tc.reason, tc.toolCount, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveOpenAIHandlerFinishReason(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reason    string
+		toolCount int
+		want      string
+	}{
+		{name: "max tokens", reason: "MAX_TOKENS", want: "length"},
+		{name: "max output tokens alias", reason: "max_output_tokens", want: "length"},
+		{name: "length alias", reason: "length", want: "length"},
+		{name: "context limit", reason: "CONTEXT_WINDOW_EXCEEDED", want: "length"},
+		{name: "model context limit", reason: "model_context_window_exceeded", want: "length"},
+		{name: "content filter", reason: "CONTENT_FILTERED", want: "content_filter"},
+		{name: "content filter alias", reason: "content_filter", want: "content_filter"},
+		{name: "refusal alias", reason: "refusal", want: "content_filter"},
+		{name: "guardrail alias", reason: "guardrail_intervened", want: "content_filter"},
+		{name: "end turn", reason: "END_TURN", want: "stop"},
+		{name: "empty falls back to stop", reason: "", want: "stop"},
+		{name: "pause is preserved", reason: "PAUSE_TURN", want: "PAUSE_TURN"},
+		{name: "unknown is preserved", reason: "COMPLETE", want: "COMPLETE"},
+		{name: "explicit max tokens wins over observed tool", reason: "MAX_TOKENS", toolCount: 1, want: "length"},
+		{name: "tool calls win over empty reason", reason: "", toolCount: 2, want: "tool_calls"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveOpenAIHandlerFinishReason(tc.reason, tc.toolCount); got != tc.want {
+				t.Fatalf("resolveOpenAIHandlerFinishReason(%q, %d) = %q, want %q", tc.reason, tc.toolCount, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",
@@ -309,6 +373,12 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	}
 	if !strings.Contains(content, "result-1") {
 		t.Fatalf("expected tool result text in continuation content, got %q", content)
+	}
+}
+
+func TestResolveOpenAIHandlerFinishReasonPreservesLength(t *testing.T) {
+	if got := resolveOpenAIHandlerFinishReason("MAX_TOKENS", 0); got != "length" {
+		t.Fatalf("finish_reason=%q, want length", got)
 	}
 }
 
@@ -429,11 +499,11 @@ func TestParseModelAndThinking(t *testing.T) {
 		{"claude 3 sonnet", "claude-3-sonnet", "claude-sonnet-4", false},
 		{"claude 3 haiku", "claude-3-haiku", "claude-haiku-4.5", false},
 
-		// Non-Anthropic fallbacks.
-		{"gpt-4-turbo", "gpt-4-turbo", "claude-sonnet-4.5", false},
-		{"gpt-4o", "gpt-4o", "claude-sonnet-4.5", false},
-		{"gpt-4", "gpt-4", "claude-sonnet-4.5", false},
-		{"gpt-3.5-turbo", "gpt-3.5-turbo", "claude-sonnet-4.5", false},
+		// Non-Anthropic IDs are opaque and must not be remapped to Claude.
+		{"gpt-4-turbo exact", "gpt-4-turbo", "gpt-4-turbo", false},
+		{"gpt-4o exact", "gpt-4o", "gpt-4o", false},
+		{"gpt-4 exact", "gpt-4", "gpt-4", false},
+		{"gpt-3.5-turbo exact", "gpt-3.5-turbo", "gpt-3.5-turbo", false},
 
 		// Thinking suffix is stripped before mapping.
 		{"thinking suffix on dash form", "claude-opus-4-8-thinking", "claude-opus-4.8", true},
@@ -516,8 +586,54 @@ func TestClaudeToolResultImageAttachedToCurrentMessage(t *testing.T) {
 	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
 		t.Fatalf("expected one tool result preserved")
 	}
-	if strings.TrimSpace(cur.UserInputMessageContext.ToolResults[0].Content[0].Text) == "" {
+	result := cur.UserInputMessageContext.ToolResults[0]
+	if result.ToolUseID != "tool_1" || result.Status != "success" {
+		t.Fatalf("expected tool result identity/status preserved, got %#v", result)
+	}
+	if strings.TrimSpace(result.Content[0].Text) == "" {
 		t.Fatalf("expected non-empty placeholder text for image-only tool result")
+	}
+	if strings.Contains(strings.ToLower(result.Content[0].Text), "attached") {
+		t.Fatalf("tool-result image marker must not promise the image survives payload truncation: %q", result.Content[0].Text)
+	}
+}
+
+func TestClaudeParallelToolResultImagesPreserveDeterministicOrderAndStatus(t *testing.T) {
+	const first = "aGVsbG8="
+	const second = "d29ybGQ="
+	req := &ClaudeRequest{
+		Model: "claude-opus-5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "capture both"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "tool_a", "name": "capture", "input": map[string]interface{}{}},
+				map[string]interface{}{"type": "tool_use", "id": "tool_b", "name": "capture", "input": map[string]interface{}{}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_a", "content": []interface{}{
+					map[string]interface{}{"type": "text", "text": "first"},
+					map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "base64", "media_type": "image/png", "data": first}},
+				}},
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_b", "is_error": true, "content": []interface{}{
+					map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "base64", "media_type": "image/png", "data": second}},
+				}},
+			}},
+		},
+	}
+	payload := ClaudeToKiro(req, false)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if len(cur.Images) != 2 || cur.Images[0].Source.Bytes != first || cur.Images[1].Source.Bytes != second {
+		t.Fatalf("image order was not deterministic: %#v", cur.Images)
+	}
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 2 {
+		t.Fatalf("tool results=%#v", cur.UserInputMessageContext)
+	}
+	results := cur.UserInputMessageContext.ToolResults
+	if results[0].ToolUseID != "tool_a" || results[0].Status != "success" || results[0].Content[0].Text != "first" {
+		t.Fatalf("first result=%#v", results[0])
+	}
+	if results[1].ToolUseID != "tool_b" || results[1].Status != "error" || results[1].Content[0].Text != toolResultImagePlaceholder {
+		t.Fatalf("second result=%#v", results[1])
 	}
 }
 
@@ -557,11 +673,14 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	// The tool result is an orphan (no preceding assistant tool call), so per
 	// the flatten rule it must be narrated into Content rather than kept
 	// structured — and its text must survive even though an image is attached.
-	if !strings.Contains(cur.Content, "here is the screenshot") {
-		t.Fatalf("expected orphan tool-result text narrated into content, got %q", cur.Content)
-	}
 	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) != 0 {
 		t.Fatalf("expected orphan tool result to be flattened into text, not kept structured")
+	}
+	if !strings.Contains(cur.Content, toolResultsContinuationPrefix) {
+		t.Fatalf("expected tool result continuation, got %q", cur.Content)
+	}
+	if !strings.Contains(cur.Content, "here is the screenshot") {
+		t.Fatalf("expected orphan tool-result text narrated into content, got %q", cur.Content)
 	}
 }
 
@@ -629,15 +748,23 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 	// The tool image is carried on the history entry that holds the (now
 	// narrated) tool result. Flatten strips the structured ToolResults from
 	// that entry, so count the image on the user entry itself, not via the
-	// structured context.
-	var toolHistImages int
+	// structured context — and confirm no structured tool results leaked
+	// into history at all.
+	var toolHistImages, structuredToolResults int
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil {
-			toolHistImages += len(h.UserInputMessage.Images)
+		if h.UserInputMessage == nil {
+			continue
+		}
+		toolHistImages += len(h.UserInputMessage.Images)
+		if context := h.UserInputMessage.UserInputMessageContext; context != nil {
+			structuredToolResults += len(context.ToolResults)
 		}
 	}
 	if toolHistImages != 1 {
-		t.Fatalf("expected tool image carried on the flushed tool-result history entry, got %d", toolHistImages)
+		t.Fatalf("expected tool image carried in history, got %d", toolHistImages)
+	}
+	if structuredToolResults != 0 {
+		t.Fatalf("history must not retain structured tool results, got %d", structuredToolResults)
 	}
 
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage

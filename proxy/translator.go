@@ -1,11 +1,16 @@
 package proxy
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"kiro-go/diagnostics"
+	"kiro-go/logger"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -28,24 +33,42 @@ var modelAliases = []modelMapping{
 	{"claude-3-opus", "claude-sonnet-4.5"},
 	{"claude-3-sonnet", "claude-sonnet-4"},
 	{"claude-3-haiku", "claude-haiku-4.5"},
-	{"gpt-4-turbo", "claude-sonnet-4.5"},
-	{"gpt-4o", "claude-sonnet-4.5"},
-	{"gpt-4", "claude-sonnet-4.5"},
-	{"gpt-3.5-turbo", "claude-sonnet-4.5"},
 }
 
 // claudeVersionPattern normalizes "claude-{family}-N-M" to "claude-{family}-N.M".
-// Minor is capped at 1-2 digits with a \b boundary so dated snapshots
-// (claude-sonnet-4-20250514) are not accidentally rewritten.
-var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
+// Only whole, unqualified legacy IDs qualify. Opaque provider IDs with extra
+// suffixes (including -private) and dated snapshots must not be rewritten.
+var claudeVersionPattern = regexp.MustCompile(`^claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})$`)
 
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
+const agentToolExecutionPrompt = `You are operating as the model backend for an autonomous coding agent.
+
+When the current request requires reading files, searching code, editing or creating files, running commands, tests, or validation, invoke the appropriate provided tool immediately.
+
+Reasoning, planning, or describing a tool action does not count as executing it.
+Do not merely announce, describe, promise, or plan the next action.
+Do not end the turn while required tool actions or verification remain.
+Continue using tools until the requested work is complete.
+Only then provide a concise final summary.
+
+A response that ends with future-action language such as "I will check", "I will verify", "next I will", or equivalent wording is invalid unless the corresponding real tool call is included in the same response.
+Never end a turn immediately after announcing pending work. Either invoke the tool now or provide a genuinely final answer.`
+
+// Remind the model to execute pending tool work.
+const agentToolTurnReminder = `[Agent execution requirement]
+If this request requires a tool, invoke the appropriate tool now.
+
+Thinking about, describing, or announcing the tool action is not sufficient.
+
+Continue until the requested action and verification are complete.
+Never end immediately after saying that you will check, verify, read, run, edit, test, or continue something. Invoke the corresponding tool in this response.`
+
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
-const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
+const toolResultImagePlaceholder = "[Tool result contains image content.]"
 
 // maxPayloadBytes is the upper bound for the serialized Kiro request body.
 // Kiro's upstream rejects oversized requests with HTTP 400
@@ -122,22 +145,36 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 
 	// Strip the configured thinking suffix (e.g. "-thinking") if present.
 	suffixLower := strings.ToLower(thinkingSuffix)
-	if strings.HasSuffix(lower, suffixLower) {
+	if thinkingSuffix != "" && strings.HasSuffix(lower, suffixLower) {
 		thinking = true
 		model = model[:len(model)-len(thinkingSuffix)]
 		lower = strings.ToLower(model)
 	}
 
-	// 1) Explicit aliases: dated snapshots, cross-family legacy IDs, non-Anthropic fallbacks.
+	// Opus 5.5 uses a fixed, hyphenated official API ID. Preserve it on the
+	// wire instead of applying the legacy N-M -> N.M Kiro normalization.
+	if lower == "claude-opus-5-5" {
+		return "claude-opus-5-5", thinking
+	}
+
+	// 1) Only exact legacy aliases are eligible for translation. A substring
+	// match can shadow a real opaque provider ID (e.g. prefixed gpt-4o).
+	// Live provider IDs are resolved before mapped aliases by the candidate registry.
 	for _, m := range modelAliases {
-		if strings.Contains(lower, m.key) {
+		if lower == m.key {
 			return m.value, thinking
 		}
 	}
 
-	// 2) Format normalization: claude-{family}-N-M → claude-{family}-N.M.
-	//    New versions (claude-opus-4-8, etc.) flow through here without code changes.
-	if claudeVersionPattern.MatchString(lower) {
+	// 2) Preserve official 5.5 identities (and their Bedrock qualified forms)
+	// byte-for-byte. Their contracts differ from major version 5 and the
+	// provider registry must see the exact requested ID.
+	if isClaudeSonnet55Model(model) || isClaudeOpus55Model(model) || isClaudeHaiku55Model(model) {
+		return model, thinking
+	}
+	// Legacy dashed Claude versions can still be translated for older Kiro
+	// adapters, but never modify slash-qualified or opaque provider IDs.
+	if model == lower && strings.HasPrefix(lower, "claude-") && claudeVersionPattern.MatchString(lower) {
 		return claudeVersionPattern.ReplaceAllString(lower, "claude-$1-$2.$3"), thinking
 	}
 
@@ -159,7 +196,21 @@ func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
 		return false
 	}
 	kind := strings.ToLower(strings.TrimSpace(thinkingCfg.Type))
-	return kind == "enabled" || kind == "adaptive"
+	return kind == "enabled" || kind == "adaptive" || kind == "between_tools"
+}
+
+func claudeToolChoiceIsNone(choice interface{}) bool {
+	switch value := choice.(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "none")
+
+	case map[string]interface{}:
+		kind, _ := value["type"].(string)
+		return strings.EqualFold(strings.TrimSpace(kind), "none")
+
+	default:
+		return false
+	}
 }
 
 func MapModel(model string) string {
@@ -178,19 +229,332 @@ type ClaudeRequest struct {
 	Stream      bool                  `json:"stream,omitempty"`
 	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
-	Tools       []ClaudeTool          `json:"tools,omitempty"`
-	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	// Anthropic Messages API native effort shape.
+	OutputConfig *ClaudeOutputConfig `json:"output_config,omitempty"`
+	// Compatibility for clients that send OpenAI-style top-level effort
+	// even though they call /v1/messages.
+	ReasoningEffort string       `json:"reasoning_effort,omitempty"`
+	Tools           []ClaudeTool `json:"tools,omitempty"`
+	ToolChoice      interface{}  `json:"tool_choice,omitempty"`
+
+	// Extra preserves current and future Messages request fields that Kiro-Go
+	// does not interpret directly, including mcp_servers, betas, metadata,
+	// stop_sequences, service_tier, container, and context-management options.
+	// Guard retries and continuations must not silently drop these fields.
+	Extra map[string]json.RawMessage `json:"-"`
+
+	// presentKnownFields records whether a known JSON field was present on the
+	// wire even when its decoded Go value is the zero value. This is required for
+	// lossless retries and continuations: temperature:0, stream:false,
+	// thinking:"", text:"", and explicit nulls must not disappear because of
+	// omitempty during a JSON clone.
+	presentKnownFields map[string]struct{}
+}
+
+var claudeRequestKnownFields = map[string]struct{}{
+	"model": {}, "messages": {}, "max_tokens": {}, "temperature": {},
+	"top_p": {}, "stream": {}, "system": {}, "thinking": {},
+	"output_config": {}, "reasoning_effort": {}, "tools": {},
+	"tool_choice": {},
+}
+
+func jsonRawIsNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+func rejectNullJSONFields(
+	raw map[string]json.RawMessage,
+	fields ...string,
+) error {
+	for _, key := range fields {
+		value, exists := raw[key]
+		if exists && jsonRawIsNull(value) {
+			return fmt.Errorf("%s must not be null", key)
+		}
+	}
+	return nil
+}
+
+func jsonKnownFieldPresence(
+	raw map[string]json.RawMessage,
+	known map[string]struct{},
+) map[string]struct{} {
+	if len(raw) == 0 {
+		return nil
+	}
+	present := make(map[string]struct{})
+	for key := range raw {
+		if _, ok := known[key]; ok {
+			present[key] = struct{}{}
+		}
+	}
+	if len(present) == 0 {
+		return nil
+	}
+	return present
+}
+
+func mergePresentKnownJSONField(
+	merged map[string]json.RawMessage,
+	present map[string]struct{},
+	key string,
+	value interface{},
+) error {
+	if _, wasPresent := present[key]; !wasPresent {
+		return nil
+	}
+	if _, alreadyEncoded := merged[key]; alreadyEncoded {
+		return nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	merged[key] = encoded
+	return nil
+}
+
+func (r ClaudeRequest) hasKnownJSONField(key string) bool {
+	_, ok := r.presentKnownFields[key]
+	return ok
+}
+
+func (r *ClaudeRequest) UnmarshalJSON(data []byte) error {
+	type alias ClaudeRequest
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := rejectNullJSONFields(
+		raw,
+		"model",
+		"messages",
+		"max_tokens",
+		"temperature",
+		"top_p",
+		"stream",
+		"reasoning_effort",
+	); err != nil {
+		return err
+	}
+	present := jsonKnownFieldPresence(raw, claudeRequestKnownFields)
+	for key := range claudeRequestKnownFields {
+		delete(raw, key)
+	}
+	if len(raw) == 0 {
+		raw = nil
+	}
+
+	*r = ClaudeRequest(decoded)
+	r.Extra = raw
+	r.presentKnownFields = present
+	return nil
+}
+
+func (r ClaudeRequest) MarshalJSON() ([]byte, error) {
+	type alias ClaudeRequest
+	base, err := json.Marshal(alias(r))
+	if err != nil {
+		return nil, err
+	}
+
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(base, &merged); err != nil {
+		return nil, err
+	}
+	for key, value := range r.Extra {
+		if _, exists := merged[key]; exists {
+			continue
+		}
+		merged[key] = append(json.RawMessage(nil), value...)
+	}
+
+	knownValues := map[string]interface{}{
+		"model": r.Model, "messages": r.Messages, "max_tokens": r.MaxTokens,
+		"temperature": r.Temperature, "top_p": r.TopP, "stream": r.Stream,
+		"system": r.System, "thinking": r.Thinking,
+		"output_config":    r.OutputConfig,
+		"reasoning_effort": r.ReasoningEffort,
+		"tools":            r.Tools, "tool_choice": r.ToolChoice,
+	}
+	for key, value := range knownValues {
+		if err := mergePresentKnownJSONField(
+			merged,
+			r.presentKnownFields,
+			key,
+			value,
+		); err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(merged)
+}
+
+type ClaudeOutputConfig struct {
+	Effort             string                     `json:"effort,omitempty"`
+	Extra              map[string]json.RawMessage `json:"-"`
+	presentKnownFields map[string]struct{}
+}
+
+func (c *ClaudeOutputConfig) UnmarshalJSON(data []byte) error {
+	type alias ClaudeOutputConfig
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := rejectNullJSONFields(raw, "effort"); err != nil {
+		return err
+	}
+	present := jsonKnownFieldPresence(raw, map[string]struct{}{"effort": {}})
+	delete(raw, "effort")
+	if len(raw) == 0 {
+		raw = nil
+	}
+	*c = ClaudeOutputConfig(decoded)
+	c.Extra = raw
+	c.presentKnownFields = present
+	return nil
+}
+
+func (c ClaudeOutputConfig) MarshalJSON() ([]byte, error) {
+	type alias ClaudeOutputConfig
+	base, err := json.Marshal(alias(c))
+	if err != nil {
+		return nil, err
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(base, &merged); err != nil {
+		return nil, err
+	}
+	for key, value := range c.Extra {
+		if _, exists := merged[key]; exists {
+			continue
+		}
+		merged[key] = append(json.RawMessage(nil), value...)
+	}
+	if err := mergePresentKnownJSONField(merged, c.presentKnownFields, "effort", c.Effort); err != nil {
+		return nil, err
+	}
+	return json.Marshal(merged)
 }
 
 type ClaudeThinkingConfig struct {
-	Type         string `json:"type,omitempty"`
-	BudgetTokens int    `json:"budget_tokens,omitempty"`
-	Display      string `json:"display,omitempty"`
+	Type               string                     `json:"type,omitempty"`
+	BudgetTokens       int                        `json:"budget_tokens,omitempty"`
+	Display            string                     `json:"display,omitempty"`
+	Extra              map[string]json.RawMessage `json:"-"`
+	presentKnownFields map[string]struct{}
+}
+
+func (c *ClaudeThinkingConfig) UnmarshalJSON(data []byte) error {
+	type alias ClaudeThinkingConfig
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := rejectNullJSONFields(raw, "type", "budget_tokens", "display"); err != nil {
+		return err
+	}
+	present := jsonKnownFieldPresence(raw, map[string]struct{}{
+		"type": {}, "budget_tokens": {}, "display": {},
+	})
+	for _, key := range []string{"type", "budget_tokens", "display"} {
+		delete(raw, key)
+	}
+	if len(raw) == 0 {
+		raw = nil
+	}
+	*c = ClaudeThinkingConfig(decoded)
+	c.Extra = raw
+	c.presentKnownFields = present
+	return nil
+}
+
+func (c ClaudeThinkingConfig) MarshalJSON() ([]byte, error) {
+	type alias ClaudeThinkingConfig
+	base, err := json.Marshal(alias(c))
+	if err != nil {
+		return nil, err
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(base, &merged); err != nil {
+		return nil, err
+	}
+	for key, value := range c.Extra {
+		if _, exists := merged[key]; exists {
+			continue
+		}
+		merged[key] = append(json.RawMessage(nil), value...)
+	}
+	for key, value := range map[string]interface{}{
+		"type": c.Type, "budget_tokens": c.BudgetTokens, "display": c.Display,
+	} {
+		if err := mergePresentKnownJSONField(merged, c.presentKnownFields, key, value); err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(merged)
 }
 
 type ClaudeMessage struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"` // string or []ContentBlock
+	Role    string                     `json:"role"`
+	Content interface{}                `json:"content"` // string or []ContentBlock
+	Extra   map[string]json.RawMessage `json:"-"`
+}
+
+func (m *ClaudeMessage) UnmarshalJSON(data []byte) error {
+	type alias ClaudeMessage
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := rejectNullJSONFields(raw, "role", "content"); err != nil {
+		return err
+	}
+	delete(raw, "role")
+	delete(raw, "content")
+	if len(raw) == 0 {
+		raw = nil
+	}
+	*m = ClaudeMessage(decoded)
+	m.Extra = raw
+	return nil
+}
+
+func (m ClaudeMessage) MarshalJSON() ([]byte, error) {
+	type alias ClaudeMessage
+	base, err := json.Marshal(alias(m))
+	if err != nil {
+		return nil, err
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(base, &merged); err != nil {
+		return nil, err
+	}
+	for key, value := range m.Extra {
+		if _, exists := merged[key]; exists {
+			continue
+		}
+		merged[key] = append(json.RawMessage(nil), value...)
+	}
+	return json.Marshal(merged)
 }
 
 type ClaudeContentBlock struct {
@@ -198,12 +562,110 @@ type ClaudeContentBlock struct {
 	Text      string       `json:"text,omitempty"`
 	Thinking  string       `json:"thinking,omitempty"`
 	Signature string       `json:"signature,omitempty"`
+	Data      string       `json:"data,omitempty"`
 	ID        string       `json:"id,omitempty"`
 	Name      string       `json:"name,omitempty"`
 	Input     interface{}  `json:"input,omitempty"`
 	ToolUseID string       `json:"tool_use_id,omitempty"`
 	Content   interface{}  `json:"content,omitempty"` // for tool_result
 	Source    *ImageSource `json:"source,omitempty"`
+
+	// Extra preserves provider-specific and future Claude content-block fields
+	// (for example MCP server_name/is_error metadata) across clone, retry,
+	// buffered replay, and native passthrough continuations.
+	Extra map[string]json.RawMessage `json:"-"`
+
+	// presentKnownFields has the same purpose as ClaudeRequest's presence map.
+	// It preserves valid zero-value content such as omitted-thinking blocks with
+	// an explicit thinking:"" field and empty text blocks used as protocol
+	// boundaries.
+	presentKnownFields map[string]struct{}
+}
+
+var claudeContentBlockKnownFields = map[string]struct{}{
+	"type": {}, "text": {}, "thinking": {}, "signature": {}, "data": {},
+	"id": {}, "name": {}, "input": {}, "tool_use_id": {}, "content": {},
+	"source": {},
+}
+
+func (b ClaudeContentBlock) hasKnownJSONField(key string) bool {
+	_, ok := b.presentKnownFields[key]
+	return ok
+}
+
+func (b *ClaudeContentBlock) UnmarshalJSON(data []byte) error {
+	type alias ClaudeContentBlock
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := rejectNullJSONFields(
+		raw,
+		"type",
+		"text",
+		"thinking",
+		"signature",
+		"data",
+		"id",
+		"name",
+		"tool_use_id",
+	); err != nil {
+		return err
+	}
+	present := jsonKnownFieldPresence(raw, claudeContentBlockKnownFields)
+	for key := range claudeContentBlockKnownFields {
+		delete(raw, key)
+	}
+	if len(raw) == 0 {
+		raw = nil
+	}
+
+	*b = ClaudeContentBlock(decoded)
+	b.Extra = raw
+	b.presentKnownFields = present
+	return nil
+}
+
+func (b ClaudeContentBlock) MarshalJSON() ([]byte, error) {
+	type alias ClaudeContentBlock
+	base, err := json.Marshal(alias(b))
+	if err != nil {
+		return nil, err
+	}
+
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(base, &merged); err != nil {
+		return nil, err
+	}
+	for key, value := range b.Extra {
+		if _, exists := merged[key]; exists {
+			continue
+		}
+		merged[key] = append(json.RawMessage(nil), value...)
+	}
+
+	knownValues := map[string]interface{}{
+		"type": b.Type, "text": b.Text, "thinking": b.Thinking,
+		"signature": b.Signature, "data": b.Data, "id": b.ID,
+		"name": b.Name, "input": b.Input, "tool_use_id": b.ToolUseID,
+		"content": b.Content, "source": b.Source,
+	}
+	for key, value := range knownValues {
+		if err := mergePresentKnownJSONField(
+			merged,
+			b.presentKnownFields,
+			key,
+			value,
+		); err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(merged)
 }
 
 type ImageSource struct {
@@ -213,9 +675,62 @@ type ImageSource struct {
 }
 
 type ClaudeTool struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema interface{} `json:"input_schema"`
+	Type        string      `json:"type,omitempty"`
+	Name        string      `json:"name,omitempty"`
+	Description string      `json:"description,omitempty"`
+	InputSchema interface{} `json:"input_schema,omitempty"`
+	// MaxUses is the native Anthropic web-search budget. Keep it typed so
+	// routing/execution can enforce the request's limit while Extra continues
+	// preserving newer server-tool fields we do not yet understand.
+	MaxUses int                        `json:"max_uses,omitempty"`
+	Extra   map[string]json.RawMessage `json:"-"`
+}
+
+var claudeToolKnownFields = map[string]struct{}{
+	"type": {}, "name": {}, "description": {}, "input_schema": {}, "max_uses": {},
+}
+
+func (t *ClaudeTool) UnmarshalJSON(data []byte) error {
+	type alias ClaudeTool
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for key := range claudeToolKnownFields {
+		delete(raw, key)
+	}
+	if len(raw) == 0 {
+		raw = nil
+	}
+
+	*t = ClaudeTool(decoded)
+	t.Extra = raw
+	return nil
+}
+
+func (t ClaudeTool) MarshalJSON() ([]byte, error) {
+	type alias ClaudeTool
+	base, err := json.Marshal(alias(t))
+	if err != nil {
+		return nil, err
+	}
+
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(base, &merged); err != nil {
+		return nil, err
+	}
+	for key, value := range t.Extra {
+		if _, exists := merged[key]; exists {
+			continue
+		}
+		merged[key] = append(json.RawMessage(nil), value...)
+	}
+	return json.Marshal(merged)
 }
 
 type ClaudeResponse struct {
@@ -227,6 +742,90 @@ type ClaudeResponse struct {
 	StopReason   string               `json:"stop_reason"`
 	StopSequence *string              `json:"stop_sequence"`
 	Usage        ClaudeUsage          `json:"usage"`
+
+	// Extra preserves current and future top-level Messages response fields,
+	// including container and stop_details. StreamDeltaExtra records fields that
+	// arrived inside message_delta so SSE replay can put them back in the correct
+	// event instead of moving them into message_start.
+	Extra                 map[string]json.RawMessage `json:"-"`
+	StreamDeltaExtra      map[string]json.RawMessage `json:"-"`
+	StreamStartUsageExtra map[string]json.RawMessage `json:"-"`
+	StreamDeltaUsageExtra map[string]json.RawMessage `json:"-"`
+
+	// presentKnownFields lets the completion guard distinguish a required
+	// zero-valued field from a field that was absent on the wire.
+	presentKnownFields map[string]struct{}
+}
+
+var claudeResponseKnownFields = map[string]struct{}{
+	"id": {}, "type": {}, "role": {}, "content": {}, "model": {},
+	"stop_reason": {}, "stop_sequence": {}, "usage": {},
+}
+
+func (r ClaudeResponse) hasKnownJSONField(key string) bool {
+	_, ok := r.presentKnownFields[key]
+	return ok
+}
+
+func (r *ClaudeResponse) UnmarshalJSON(data []byte) error {
+	type alias ClaudeResponse
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := rejectNullJSONFields(
+		raw,
+		"id",
+		"type",
+		"role",
+		"content",
+		"model",
+		"usage",
+	); err != nil {
+		return err
+	}
+	present := jsonKnownFieldPresence(raw, claudeResponseKnownFields)
+	for key := range claudeResponseKnownFields {
+		delete(raw, key)
+	}
+	if len(raw) == 0 {
+		raw = nil
+	}
+
+	*r = ClaudeResponse(decoded)
+	r.Extra = raw
+	r.StreamDeltaExtra = nil
+	r.StreamStartUsageExtra = nil
+	r.StreamDeltaUsageExtra = nil
+	r.presentKnownFields = present
+	return nil
+}
+
+func (r ClaudeResponse) MarshalJSON() ([]byte, error) {
+	type alias ClaudeResponse
+	base, err := json.Marshal(alias(r))
+	if err != nil {
+		return nil, err
+	}
+
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(base, &merged); err != nil {
+		return nil, err
+	}
+	for _, extras := range []map[string]json.RawMessage{r.Extra, r.StreamDeltaExtra} {
+		for key, value := range extras {
+			if _, exists := merged[key]; exists {
+				continue
+			}
+			merged[key] = append(json.RawMessage(nil), value...)
+		}
+	}
+	return json.Marshal(merged)
 }
 
 type ClaudeCacheCreationUsage struct {
@@ -240,6 +839,81 @@ type ClaudeUsage struct {
 	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens,omitempty"`
 	CacheReadInputTokens     int                       `json:"cache_read_input_tokens,omitempty"`
 	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
+
+	// Extra preserves current and future usage metadata exposed by the Messages
+	// API, including inference_geo, output_tokens_details, server_tool_use,
+	// service_tier, and fallback iterations. Guard buffering/replay must not
+	// silently erase billing, routing, or server-tool accounting fields.
+	Extra map[string]json.RawMessage `json:"-"`
+
+	// presentKnownFields allows strict wire validation to distinguish a required
+	// zero-valued token counter from an omitted counter.
+	presentKnownFields map[string]struct{}
+}
+
+var claudeUsageKnownFields = map[string]struct{}{
+	"input_tokens": {}, "output_tokens": {},
+	"cache_creation_input_tokens": {}, "cache_read_input_tokens": {},
+	"cache_creation": {},
+}
+
+func (u ClaudeUsage) hasKnownJSONField(key string) bool {
+	_, ok := u.presentKnownFields[key]
+	return ok
+}
+
+func (u *ClaudeUsage) UnmarshalJSON(data []byte) error {
+	type alias ClaudeUsage
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := rejectNullJSONFields(
+		raw,
+		"input_tokens",
+		"output_tokens",
+		"cache_creation_input_tokens",
+		"cache_read_input_tokens",
+	); err != nil {
+		return err
+	}
+	present := jsonKnownFieldPresence(raw, claudeUsageKnownFields)
+	for key := range claudeUsageKnownFields {
+		delete(raw, key)
+	}
+	if len(raw) == 0 {
+		raw = nil
+	}
+
+	*u = ClaudeUsage(decoded)
+	u.Extra = raw
+	u.presentKnownFields = present
+	return nil
+}
+
+func (u ClaudeUsage) MarshalJSON() ([]byte, error) {
+	type alias ClaudeUsage
+	base, err := json.Marshal(alias(u))
+	if err != nil {
+		return nil, err
+	}
+
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(base, &merged); err != nil {
+		return nil, err
+	}
+	for key, value := range u.Extra {
+		if _, exists := merged[key]; exists {
+			continue
+		}
+		merged[key] = append(json.RawMessage(nil), value...)
+	}
+	return json.Marshal(merged)
 }
 
 // ==================== Claude -> Kiro 转换 ====================
@@ -252,6 +926,28 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 提取系统提示
 	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	// Optional operator language steering is injected only into the Kiro-native
+	// projection. The original Claude request object remains untouched so other
+	// transports preserve client semantics byte-for-byte.
+	systemPrompt = appendKiroResponseLanguageSteering(systemPrompt)
+	toolSteeringEligible := hasClaudeClientTool(req.Tools) && !claudeToolChoiceIsNone(req.ToolChoice)
+	agentToolSteeringEnabled := config.GetAgentToolSteering()
+	toolSteeringInjected := toolSteeringEligible && agentToolSteeringEnabled
+
+	if diagnostics.Reasoning() {
+		logger.Infof(
+			"[ToolSteering] tools=%d toolChoice=%v eligible=%t enabled=%t injected=%t",
+			len(req.Tools), req.ToolChoice, toolSteeringEligible, agentToolSteeringEnabled, toolSteeringInjected)
+	}
+
+	// Reinforce tool execution for active agent turns.
+	if toolSteeringInjected {
+		if systemPrompt != "" {
+			systemPrompt += "\n\n"
+		}
+
+		systemPrompt += agentToolExecutionPrompt
+	}
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -261,8 +957,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	for i, msg := range req.Messages {
 		isLast := i == len(req.Messages)-1
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
 
-		if msg.Role == "user" {
+		if role == "user" {
 			content, images, toolResults := extractClaudeUserContent(msg.Content)
 			content = normalizeUserContent(content, len(images) > 0)
 
@@ -288,14 +985,33 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 					UserInputMessage: &userMsg,
 				})
 			}
-		} else if msg.Role == "assistant" {
+		} else if role == "assistant" {
 			content, toolUses := extractClaudeAssistantContent(msg.Content)
+			rawBlocks := cloneClaudeAssistantContentBlocks(msg.Content)
+			var nativeBlocks []ClaudeContentBlock
+			if claudeAssistantBlocksNeedLosslessSidecar(rawBlocks) {
+				// Retain the entire assistant turn, not only the unsupported blocks,
+				// because Claude requires the original block order and exact signed/
+				// server-tool state when the turn is echoed back. Routing is decided
+				// separately by the immutable transport requirements analyzer.
+				nativeBlocks = rawBlocks
+			}
 			history = append(history, KiroHistoryMessage{
 				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content:  content,
-					ToolUses: toolUses,
+					Content:             content,
+					ToolUses:            toolUses,
+					ClaudeContentBlocks: nativeBlocks,
 				},
 			})
+		} else if role == "system" {
+			// Kiro has no native mid-conversation system role. Preserve the
+			// instruction at its chronological position using the same synthetic
+			// conversation-priming boundary used for top-level system content.
+			// This is deliberately classified as Emulated, never Exact.
+			midSystemPrompt := applyPromptFilters(extractSystemPrompt(msg.Content))
+			if midSystemPrompt != "" {
+				history = append(history, kiroSystemPrimingHistory(midSystemPrompt, modelID, origin)...)
+			}
 		}
 	}
 
@@ -303,21 +1019,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// Keep system instructions in history instead of user content.
 	if systemPrompt != "" {
-		priming := []KiroHistoryMessage{
-			{
-				UserInputMessage: &KiroUserInputMessage{
-					Content: systemPrompt,
-					ModelID: modelID,
-					Origin:  origin,
-				},
-			},
-			{
-				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content: "I will follow these instructions.",
-				},
-			},
-		}
-		history = append(priming, history...)
+		history = append(kiroSystemPrimingHistory(systemPrompt, modelID, origin), history...)
 	}
 
 	// Decide whether the current tool results form a valid "active" tool turn:
@@ -359,7 +1061,20 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	// 转换工具
+	// Reinforce tool execution on fresh user turns.
+	//
+	// Do not add this to tool-result continuations because those already belong
+	// to an active tool loop.
+	if toolSteeringInjected && len(currentToolResults) == 0 {
+		if finalContent != "" {
+			finalContent += "\n\n"
+		}
+
+		finalContent += agentToolTurnReminder
+	}
+
+	// ClaudeToKiro is a pure translator. The caller only uses this payload when
+	// the independently analyzed transport requirements allow Kiro-native.
 	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
 
 	// 构建 payload
@@ -393,17 +1108,236 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		payload.ConversationState.History = history
 	}
 
-	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
+	temperaturePresent := req.hasKnownJSONField("temperature")
+	topPPresent := req.hasKnownJSONField("top_p")
+	if req.MaxTokens > 0 || temperaturePresent || topPPresent ||
+		req.Temperature != 0 || req.TopP != 0 {
 		payload.InferenceConfig = &InferenceConfig{
-			MaxTokens:   req.MaxTokens,
-			Temperature: req.Temperature,
-			TopP:        req.TopP,
+			MaxTokens:          req.MaxTokens,
+			Temperature:        req.Temperature,
+			TopP:               req.TopP,
+			TemperaturePresent: temperaturePresent,
+			TopPPresent:        topPPresent,
 		}
 	}
 
 	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
+}
+
+func kiroSystemPrimingHistory(prompt, modelID, origin string) []KiroHistoryMessage {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return nil
+	}
+	return []KiroHistoryMessage{
+		{
+			UserInputMessage: &KiroUserInputMessage{
+				Content: prompt,
+				ModelID: modelID,
+				Origin:  origin,
+			},
+		},
+		{
+			AssistantResponseMessage: &KiroAssistantResponseMessage{
+				Content: "I will follow these instructions.",
+			},
+		},
+	}
+}
+
+func cloneClaudeAssistantContentBlocks(content interface{}) []ClaudeContentBlock {
+	if content == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(content)
+	if err != nil {
+		return nil
+	}
+	var blocks []ClaudeContentBlock
+	if json.Unmarshal(encoded, &blocks) != nil {
+		return nil
+	}
+	return blocks
+}
+
+func claudeAssistantBlocksNeedLosslessSidecar(blocks []ClaudeContentBlock) bool {
+	for _, block := range blocks {
+		blockType := strings.ToLower(strings.TrimSpace(block.Type))
+		switch {
+		case blockType == "", blockType == "text", blockType == "tool_use":
+			continue
+		case blockType == "thinking" &&
+			isKiroThinkingSignature(strings.TrimSpace(block.Signature)):
+			// Synthetic Kiro signatures are local round-trip markers, not provider
+			// state. The native Kiro history projection intentionally omits them.
+			continue
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func claudeRequestHasMidConversationSystemMessages(req *ClaudeRequest) bool {
+	if req == nil {
+		return false
+	}
+	for _, message := range req.Messages {
+		if strings.EqualFold(strings.TrimSpace(message.Role), "system") {
+			return true
+		}
+	}
+	return false
+}
+
+func claudeMessageEndsWithServerToolResult(message ClaudeMessage) bool {
+	blocks := claudeContentBlocks(message.Content)
+	for index := len(blocks) - 1; index >= 0; index-- {
+		blockType, _ := blocks[index]["type"].(string)
+		blockType = strings.TrimSpace(blockType)
+		if blockType == "" {
+			continue
+		}
+		return completionGuardServerToolResultBlockType(blockType)
+	}
+	return false
+}
+
+func claudeSystemEffortOnly(message ClaudeMessage) bool {
+	if strings.ToLower(strings.TrimSpace(message.Role)) != "system" {
+		return false
+	}
+	raw := message.Extra["output_config"]
+	if len(raw) == 0 {
+		return false
+	}
+	var fields map[string]interface{}
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return false
+	}
+	effort, ok := fields["effort"].(string)
+	if !ok || strings.TrimSpace(effort) == "" {
+		return false
+	}
+	if text, ok := message.Content.(string); ok {
+		return strings.TrimSpace(text) == ""
+	}
+	return len(claudeContentBlocks(message.Content)) == 0
+}
+
+// Retained for existing internal callers with no beta-header context.
+func validateClaudeMidConversationSystemMessages(messages []ClaudeMessage) string {
+	return validateClaudeMidConversationSystemMessagesWithBetas(messages, newClaudeBetaSet())
+}
+
+func validateClaudeMidConversationSystemMessagesWithBetas(messages []ClaudeMessage, betas claudeBetaSet) string {
+	for index, message := range messages {
+		if !strings.EqualFold(strings.TrimSpace(message.Role), "system") {
+			continue
+		}
+		if raw, present := message.Extra["output_config"]; present {
+			if !betas.Contains("mid-conversation-output-config-2026-07-01") {
+				return "messages role=system output_config requires anthropic-beta mid-conversation-output-config-2026-07-01"
+			}
+			var fields map[string]interface{}
+			if json.Unmarshal(raw, &fields) != nil || fields == nil {
+				return fmt.Sprintf("messages[%d].output_config must be an object", index)
+			}
+			effort, ok := fields["effort"].(string)
+			if !ok || strings.TrimSpace(effort) == "" {
+				return fmt.Sprintf("messages[%d].output_config.effort must be non-empty", index)
+			}
+		}
+		if raw, present := message.Extra["clear_at"]; present {
+			if !betas.Contains("mid-conversation-system-clear-at-2026-08-21") {
+				return "messages clear_at requires anthropic-beta mid-conversation-system-clear-at-2026-08-21"
+			}
+			var value string
+			if json.Unmarshal(raw, &value) != nil || (value != "never" && value != "next_user_message") {
+				return fmt.Sprintf("messages[%d].clear_at is invalid", index)
+			}
+			if value == "next_user_message" {
+				if _, present := message.Extra["output_config"]; present {
+					return fmt.Sprintf("messages[%d].output_config is not permitted on turn-scoped messages", index)
+				}
+				for _, block := range claudeContentBlocks(message.Content) {
+					if block["type"] != "text" {
+						return fmt.Sprintf("messages[%d] turn-scoped system message supports text only", index)
+					}
+					if _, present := block["cache_control"]; present {
+						return fmt.Sprintf("messages[%d] turn-scoped text cannot carry cache_control", index)
+					}
+				}
+			}
+		}
+	}
+	for index := 0; index < len(messages); {
+		if !strings.EqualFold(strings.TrimSpace(messages[index].Role), "system") {
+			index++
+			continue
+		}
+		start := index
+		allEffortOnly, hasToolChange := true, false
+		for index < len(messages) && strings.EqualFold(strings.TrimSpace(messages[index].Role), "system") {
+			if !claudeSystemEffortOnly(messages[index]) {
+				allEffortOnly = false
+			}
+			for _, block := range claudeContentBlocks(messages[index].Content) {
+				if block["type"] == "tool_addition" || block["type"] == "tool_removal" {
+					hasToolChange = true
+				}
+			}
+			index++
+		}
+		if allEffortOnly {
+			continue
+		}
+		if start == 0 {
+			return "messages role=system cannot be the first message; use the top-level system field"
+		}
+		previous := messages[start-1]
+		previousRole := strings.ToLower(strings.TrimSpace(previous.Role))
+		pausedTurn := previousRole == "assistant" && claudeMessageEndsWithServerToolResult(previous)
+		if previousRole != "user" && !pausedTurn {
+			return "messages role=system must immediately follow a user turn or an assistant turn ending in a server tool result"
+		}
+		if pausedTurn && hasToolChange {
+			return "tool changes cannot immediately follow a paused assistant server-tool turn"
+		}
+		if index < len(messages) && !strings.EqualFold(strings.TrimSpace(messages[index].Role), "assistant") {
+			return "messages role=system must be the final message or be immediately followed by an assistant turn"
+		}
+	}
+	return ""
+}
+
+func claudeToolCanEmitClientToolUse(tool ClaudeTool) bool {
+	toolType := strings.ToLower(strings.TrimSpace(tool.Type))
+	if toolType == "" || toolType == "function" || toolType == "custom" {
+		return true
+	}
+
+	// Anthropic-defined client tools execute in the caller and therefore
+	// produce ordinary tool_use blocks. Keep the allow-list explicit so a new
+	// server-side tool family is not accidentally treated as client-executable.
+	for _, prefix := range []string{
+		"bash_",
+		"computer_",
+		"text_editor_",
+		"str_replace_based_edit_tool_",
+		"memory_",
+	} {
+		if strings.HasPrefix(toolType, prefix) {
+			return true
+		}
+	}
+	return toolType == "bash" ||
+		toolType == "computer" ||
+		toolType == "text_editor" ||
+		toolType == "str_replace_based_edit_tool" ||
+		toolType == "memory"
 }
 
 func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
@@ -688,6 +1622,14 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 		return s, nil, nil
 	}
 
+	if typedBlocks, ok := content.([]map[string]interface{}); ok {
+		blocks := make([]interface{}, len(typedBlocks))
+		for i := range typedBlocks {
+			blocks[i] = typedBlocks[i]
+		}
+		return extractClaudeUserContent(blocks)
+	}
+
 	if blocks, ok := content.([]interface{}); ok {
 		for _, b := range blocks {
 			block, ok := b.(map[string]interface{})
@@ -708,6 +1650,10 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 			case "tool_result":
 				toolUseID, _ := block["tool_use_id"].(string)
 				resultContent, resultImages := extractToolResultContent(block["content"])
+				status := "success"
+				if isError, _ := block["is_error"].(bool); isError {
+					status = "error"
+				}
 				if len(resultImages) > 0 {
 					images = append(images, resultImages...)
 					if strings.TrimSpace(resultContent) == "" {
@@ -717,7 +1663,7 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 				toolResults = append(toolResults, KiroToolResult{
 					ToolUseID: toolUseID,
 					Content:   []KiroResultContent{{Text: resultContent}},
-					Status:    "success",
+					Status:    status,
 				})
 			}
 		}
@@ -805,6 +1751,36 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 		return s, nil
 	}
 
+	if blocks, ok := content.([]ClaudeContentBlock); ok {
+		for _, block := range blocks {
+			switch block.Type {
+			case "text":
+				text += block.Text
+			case "thinking", "redacted_thinking":
+				continue
+			case "tool_use":
+				input, _ := block.Input.(map[string]interface{})
+				if input == nil {
+					input = make(map[string]interface{})
+				}
+				toolUses = append(toolUses, KiroToolUse{
+					ToolUseID: block.ID,
+					Name:      block.Name,
+					Input:     input,
+				})
+			}
+		}
+		return text, toolUses
+	}
+
+	if typedBlocks, ok := content.([]map[string]interface{}); ok {
+		blocks := make([]interface{}, len(typedBlocks))
+		for i := range typedBlocks {
+			blocks[i] = typedBlocks[i]
+		}
+		return extractClaudeAssistantContent(blocks)
+	}
+
 	if blocks, ok := content.([]interface{}); ok {
 		for _, b := range blocks {
 			block, ok := b.(map[string]interface{})
@@ -818,6 +1794,11 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 				if t, ok := block["text"].(string); ok {
 					text += t
 				}
+			case "thinking", "redacted_thinking":
+				// Claude clients echo these blocks during a tool-result turn.
+				// Kiro assistant history has no equivalent fields, so they are
+				// inspected separately for diagnostics and intentionally omitted.
+				continue
 			case "tool_use":
 				id, _ := block["id"].(string)
 				name, _ := block["name"].(string)
@@ -837,6 +1818,15 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 	return text, toolUses
 }
 
+func hasClaudeClientTool(tools []ClaudeTool) bool {
+	for _, tool := range tools {
+		if !isNativeWebSearchTool(tool) {
+			return true
+		}
+	}
+	return false
+}
+
 func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]string) {
 	if len(tools) == 0 {
 		return nil, nil
@@ -845,6 +1835,15 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	result := make([]KiroToolWrapper, 0, len(tools))
 	nameMap := make(map[string]string)
 	for _, tool := range tools {
+		// Anthropic native server tools are transport semantics, not ordinary
+		// client function tools. Phase-4 routing either executes pure native
+		// web_search through the selected Kiro MCP adapter or keeps it on a
+		// transparent Anthropic transport; mixed native/client tools are direct-only.
+		// Never serialize the native server tool into Kiro's client tool catalog.
+		if isNativeWebSearchTool(tool) {
+			continue
+		}
+
 		desc := tool.Description
 		if len(desc) > maxToolDescLen {
 			desc = desc[:maxToolDescLen] + "..."
@@ -902,6 +1901,7 @@ func cloneSchemaValue(v interface{}) interface{} {
 // cleanSchema 递归清理会导致 Kiro 400 的 schema 字段。
 func cleanSchema(m map[string]interface{}) {
 	delete(m, "additionalProperties")
+	delete(m, "encrypted")
 
 	// required 必须是非空数组，否则 Kiro 会报 Improperly formed request。
 	if req, exists := m["required"]; exists {
@@ -995,10 +1995,12 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 	blocks := make([]ClaudeContentBlock, 0)
 
 	if thinkingContent != "" || includeEmptyThinkingBlock {
-		blocks = append(blocks, ClaudeContentBlock{
+		block := ClaudeContentBlock{
 			Type:     "thinking",
 			Thinking: thinkingContent,
-		})
+		}
+		block.presentKnownFields = map[string]struct{}{"thinking": {}}
+		blocks = append(blocks, block)
 	}
 
 	if content != "" {
@@ -1046,6 +2048,54 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+	// Common compatibility shapes.
+	Thinking        *ClaudeThinkingConfig  `json:"thinking,omitempty"`
+	OutputConfig    *ClaudeOutputConfig    `json:"output_config,omitempty"`
+	Reasoning       *OpenAIReasoningConfig `json:"reasoning,omitempty"`
+	ReasoningEffort string                 `json:"reasoning_effort,omitempty"`
+
+	// Explicit zero is meaningful for OpenAI sampling controls. Keep wire
+	// presence separately from the public numeric fields so temperature:0 and
+	// top_p:0 are not collapsed into "omitted" before projection to Kiro.
+	temperaturePresent      bool
+	topPPresent             bool
+	disableLegacyTruncation bool
+}
+
+func (r *OpenAIRequest) UnmarshalJSON(data []byte) error {
+	type alias OpenAIRequest
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*r = OpenAIRequest(decoded)
+	if value, ok := raw["temperature"]; ok && !jsonRawIsNull(value) {
+		r.temperaturePresent = true
+	}
+	if value, ok := raw["top_p"]; ok && !jsonRawIsNull(value) {
+		r.topPPresent = true
+	}
+	return nil
+}
+
+func (r *OpenAIRequest) markTemperaturePresent() {
+	if r != nil {
+		r.temperaturePresent = true
+	}
+}
+
+func (r *OpenAIRequest) markTopPPresent() {
+	if r != nil {
+		r.topPPresent = true
+	}
+}
+
+type OpenAIReasoningConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1056,17 +2106,21 @@ type OpenAIMessage struct {
 }
 
 type ToolCall struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Function struct {
+	ID            string `json:"id"`
+	Type          string `json:"type"`
+	Namespace     string `json:"-"`
+	ResponsesKind string `json:"-"`
+	Function      struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
 }
 
 type OpenAITool struct {
-	Type     string `json:"type"`
-	Function struct {
+	Type               string `json:"type"`
+	ResponsesNamespace string `json:"-"`
+	ResponsesKind      string `json:"-"`
+	Function           struct {
 		Name        string      `json:"name"`
 		Description string      `json:"description"`
 		Parameters  interface{} `json:"parameters"`
@@ -1144,9 +2198,37 @@ type OpenAIUsage struct {
 
 // ==================== OpenAI -> Kiro 转换 ====================
 
+// OpenAIToKiroWithoutTruncation builds the exact payload that the translated
+// OpenAI path would dispatch, but deliberately leaves legacy Kiro history
+// truncation disabled. The caller can then measure the real payload and reject
+// or relay instead of silently changing OpenAI conversation semantics.
+func projectOpenAIToKiro(req *OpenAIRequest, thinking bool) (*KiroPayload, openAIProjection) {
+	var projection openAIProjection
+	if req == nil {
+		projection.add("", "nil_request", "OpenAI request is nil")
+		return nil, projection
+	}
+	strict := *req
+	strict.disableLegacyTruncation = true
+	return openAIToKiro(&strict, thinking, &projection), projection
+}
+
+func OpenAIToKiroWithoutTruncation(req *OpenAIRequest, thinking bool) *KiroPayload {
+	payload, _ := projectOpenAIToKiro(req, thinking)
+	return payload
+}
+
 func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
+	return openAIToKiro(req, thinking, nil)
+}
+
+func openAIToKiro(req *OpenAIRequest, thinking bool, projection *openAIProjection) *KiroPayload {
+	if req == nil {
+		return nil
+	}
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
+	toolNames := buildOpenAIToolNameCatalog(req.Tools)
 
 	// 提取系统提示
 	var systemPrompt string
@@ -1162,16 +2244,25 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	if systemPrompt != "" && projection != nil {
+		projection.emulate("messages", "system_priming_emulation", "Kiro represents privileged system instructions as a synthetic conversation priming pair")
+	}
+
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
 		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
 	}
+	// Keep response-language steering at the Kiro projection boundary. This
+	// covers Chat Completions directly and Responses via its OpenAI projection
+	// without mutating the client-visible request/instructions fields.
+	systemPrompt = appendKiroResponseLanguageSteering(systemPrompt)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
 	var currentContent string
 	var currentImages []KiroImage
 	var currentToolResults []KiroToolResult
+	historyToolNames := make(map[string]string)
 
 	for i, msg := range nonSystemMessages {
 		isLast := i == len(nonSystemMessages)-1
@@ -1179,7 +2270,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		switch msg.Role {
 		case "user":
 			content, images := extractOpenAIUserContent(msg.Content)
+			originalContent := content
 			content = normalizeUserContent(content, len(images) > 0)
+			if projection != nil && content != originalContent {
+				projection.emulate("messages", "user_content_normalization", "Kiro normalizes user content before dispatch")
+			}
 
 			if isLast {
 				currentContent = content
@@ -1201,13 +2296,18 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			var toolUses []KiroToolUse
 			for _, tc := range msg.ToolCalls {
 				var input map[string]interface{}
-				json.Unmarshal([]byte(tc.Function.Arguments), &input)
-				if input == nil {
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil || input == nil {
+					if projection != nil {
+						projection.add("messages", "invalid_tool_arguments", "Kiro cannot preserve blank, malformed, or non-object function arguments")
+					}
 					input = make(map[string]interface{})
+				}
+				if strings.TrimSpace(tc.ID) != "" && strings.TrimSpace(tc.Function.Name) != "" {
+					historyToolNames[tc.ID] = tc.Function.Name
 				}
 				toolUses = append(toolUses, KiroToolUse{
 					ToolUseID: tc.ID,
-					Name:      tc.Function.Name,
+					Name:      toolNames.kiroNameFor(tc.Namespace, tc.Function.Name),
 					Input:     input,
 				})
 			}
@@ -1287,9 +2387,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 
 	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
+		history = sanitizeKiroHistoryWithProjectionAndToolNames(history, currentToolResultIDs, projection, historyToolNames)
 	} else {
-		history = sanitizeKiroHistory(history, nil)
+		history = sanitizeKiroHistoryWithProjectionAndToolNames(history, nil, projection, historyToolNames)
 	}
 
 	// 构建最终内容
@@ -1297,10 +2397,19 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	if finalContent == "" {
 		if len(currentImages) > 0 {
 			finalContent = normalizeUserContent("", true)
+			if projection != nil {
+				projection.emulate("messages", "image_prompt_synthesis", "Kiro synthesizes text for an image-only current user message")
+			}
 		} else if len(currentToolResults) > 0 {
 			finalContent = buildToolResultsContinuation(currentToolResults)
+			if projection != nil && keepCurrentToolResults {
+				projection.emulate("messages", "active_tool_result_narration", "Kiro adds compatibility narration alongside structured active tool results")
+			}
 		} else {
 			finalContent = minimalFallbackUserContent
+			if projection != nil {
+				projection.emulate("messages", "fallback_user_content", "Kiro synthesizes fallback current-user content")
+			}
 		}
 	}
 
@@ -1310,16 +2419,22 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// silently drop the tool-result text. Fold it into finalContent. See
 	// ClaudeToKiro for the full rationale.
 	if !keepCurrentToolResults && len(currentToolResults) > 0 {
+		if projection != nil {
+			projection.add("messages", "orphan_tool_result", "Kiro cannot preserve an uncorrelated current tool result structurally")
+		}
 		if continuation := buildToolResultsContinuation(currentToolResults); continuation != finalContent {
 			finalContent = finalContent + "\n\n" + continuation
 		}
 	}
 
-	// 转换工具
-	kiroTools := convertOpenAITools(req.Tools)
+	// Convert declarations through the same canonical catalog used by
+	// assistant tool-call history and forced tool_choice.
+	kiroTools := convertOpenAIToolsWithCatalog(req.Tools, toolNames)
 
 	// 构建 payload
 	payload := &KiroPayload{}
+	payload.ToolNameMap = toolNames.KiroToOriginal
+	payload.ToolIdentityMap = toolNames.KiroToIdentity
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
@@ -1344,15 +2459,21 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		payload.ConversationState.History = history
 	}
 
-	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
+	temperaturePresent := req.temperaturePresent || req.Temperature != 0
+	topPPresent := req.topPPresent || req.TopP != 0
+	if req.MaxTokens > 0 || temperaturePresent || topPPresent {
 		payload.InferenceConfig = &InferenceConfig{
-			MaxTokens:   req.MaxTokens,
-			Temperature: req.Temperature,
-			TopP:        req.TopP,
+			MaxTokens:          req.MaxTokens,
+			Temperature:        req.Temperature,
+			TopP:               req.TopP,
+			TemperaturePresent: temperaturePresent,
+			TopPPresent:        topPPresent,
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
+	if !req.disableLegacyTruncation {
+		truncatePayloadToLimit(payload, systemPrompt != "")
+	}
 
 	return payload
 }
@@ -1561,6 +2682,19 @@ func joinHistoryText(existing, narrated string) string {
 // (outgoing) message. When the last history entry is an assistant message whose
 // tool uses are fully covered by that set, its structured toolUses are kept.
 func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
+	return sanitizeKiroHistoryWithProjection(history, currentToolResultIDs, nil)
+}
+
+func sanitizeKiroHistoryWithProjection(history []KiroHistoryMessage, currentToolResultIDs map[string]bool, projection *openAIProjection) []KiroHistoryMessage {
+	return sanitizeKiroHistoryWithProjectionAndToolNames(history, currentToolResultIDs, projection, nil)
+}
+
+func sanitizeKiroHistoryWithProjectionAndToolNames(
+	history []KiroHistoryMessage,
+	currentToolResultIDs map[string]bool,
+	projection *openAIProjection,
+	originalToolNamesByID map[string]string,
+) []KiroHistoryMessage {
 	if len(history) == 0 {
 		return history
 	}
@@ -1573,7 +2707,11 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		if a := history[i].AssistantResponseMessage; a != nil {
 			for _, tu := range a.ToolUses {
 				if tu.ToolUseID != "" && tu.Name != "" {
-					toolNames[tu.ToolUseID] = tu.Name
+					name := tu.Name
+					if original := strings.TrimSpace(originalToolNamesByID[tu.ToolUseID]); original != "" {
+						name = original
+					}
+					toolNames[tu.ToolUseID] = name
 				}
 			}
 		}
@@ -1606,7 +2744,11 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 			// replaying as assistant text, so we neither reinforce the pattern
 			// nor leave it for the model to imitate.
 			if msg.AssistantResponseMessage.Content != "" {
-				msg.AssistantResponseMessage.Content = stripPollutedToolCallText(msg.AssistantResponseMessage.Content)
+				original := msg.AssistantResponseMessage.Content
+				msg.AssistantResponseMessage.Content = stripPollutedToolCallText(original)
+				if projection != nil && msg.AssistantResponseMessage.Content != original {
+					projection.emulate("messages", "assistant_history_sanitization", "Kiro removes legacy tool-call narration from assistant history")
+				}
 			}
 		}
 
@@ -1621,6 +2763,9 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 			// imitates instead of issuing real structured tool calls. The tool's
 			// identity is preserved on the result side (user turn) via toolNames.
 			msg.AssistantResponseMessage.ToolUses = nil
+			if projection != nil {
+				projection.emulate("messages", "historical_tool_state_emulation", "Kiro flattens completed historical tool calls/results into conversational text")
+			}
 		}
 
 		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
@@ -1629,6 +2774,9 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 				narrated := narrateToolResults(ctx.ToolResults, toolNames)
 				msg.UserInputMessage.Content = joinHistoryText(msg.UserInputMessage.Content, narrated)
 				ctx.ToolResults = nil
+				if projection != nil {
+					projection.emulate("messages", "historical_tool_state_emulation", "Kiro flattens completed historical tool calls/results into conversational text")
+				}
 			}
 			// History messages must not carry structured tool specs either.
 			ctx.Tools = nil
@@ -1644,6 +2792,9 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		// replying ".". Mark such turns for removal instead.
 		if msg.UserInputMessage != nil && strings.TrimSpace(msg.UserInputMessage.Content) == "" && len(msg.UserInputMessage.Images) == 0 {
 			msg.UserInputMessage.Content = minimalFallbackUserContent
+			if projection != nil {
+				projection.emulate("messages", "history_user_fallback", "Kiro replaces an empty historical user turn with fallback content")
+			}
 		}
 	}
 
@@ -1656,10 +2807,15 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 	cleaned := history[:0:0]
 	for i := range history {
 		msg := history[i]
-		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) == 0 {
+		if msg.AssistantResponseMessage != nil &&
+			len(msg.AssistantResponseMessage.ToolUses) == 0 &&
+			len(msg.AssistantResponseMessage.ClaudeContentBlocks) == 0 {
 			c := strings.TrimSpace(msg.AssistantResponseMessage.Content)
 			if c == "" || c == minimalFallbackUserContent {
-				continue // drop hollow assistant turn
+				if projection != nil {
+					projection.emulate("messages", "assistant_history_turn_dropped", "Kiro drops a hollow assistant history turn")
+				}
+				continue // drop truly hollow assistant turn
 			}
 		}
 		// Collapse runs of consecutive identical user "Tool results" turns. A
@@ -1673,6 +2829,9 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 				strings.TrimSpace(last.UserInputMessage.Content) == strings.TrimSpace(msg.UserInputMessage.Content) &&
 				strings.TrimSpace(msg.UserInputMessage.Content) != "" &&
 				len(msg.UserInputMessage.Images) == 0 {
+				if projection != nil {
+					projection.emulate("messages", "duplicate_history_turn_collapsed", "Kiro collapses consecutive duplicate user history turns")
+				}
 				continue // skip duplicate consecutive user turn
 			}
 		}
@@ -1681,7 +2840,11 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 
 	// Dropping hollow assistant turns can leave history starting with an
 	// assistant message; re-trim so it begins with a user turn.
-	return trimLeadingAssistantHistory(cleaned)
+	trimmed := trimLeadingAssistantHistory(cleaned)
+	if projection != nil && len(trimmed) != len(cleaned) {
+		projection.emulate("messages", "leading_assistant_history_trimmed", "Kiro removes leading assistant history until the first user turn")
+	}
+	return trimmed
 }
 
 // truncatePayloadToLimit drops the oldest conversation history turns until the
@@ -1705,8 +2868,45 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 		return
 	}
 
-	tokenLimit := maxPayloadTokens(currentMessageModelID(payload))
+	modelID := currentMessageModelID(payload)
+	tokenLimit := maxPayloadTokens(modelID)
+
+	// Measure payload changes without altering truncation logic.
+	var beforeBytes int
+	var beforeTokens int
+	var beforeHistory int
+	var beforeCurrentChars int
+	var beforeToolCount int
+	var beforeToolResultCount int
+
+	if diagnostics.Payload() {
+		beforeBytes = payloadByteSize(payload)
+		beforeTokens = estimateKiroPayloadTokens(payload)
+		beforeHistory = len(payload.ConversationState.History)
+		beforeCurrentChars = len([]rune(payload.ConversationState.CurrentMessage.UserInputMessage.Content))
+
+		ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+
+		if ctx != nil {
+			beforeToolCount = len(ctx.Tools)
+			beforeToolResultCount = len(ctx.ToolResults)
+		}
+	}
+
 	if payloadFits(payload, tokenLimit) {
+		if diagnostics.Payload() {
+			logger.Infof(
+				"[Payload] model=%s bytes=%d tokens=%d/%d history=%d tools=%d toolResults=%d currentChars=%d truncated=false",
+				modelID,
+				beforeBytes,
+				beforeTokens,
+				tokenLimit,
+				beforeHistory,
+				beforeToolCount,
+				beforeToolResultCount,
+				beforeCurrentChars,
+			)
+		}
 		return
 	}
 
@@ -1840,6 +3040,43 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 
 	// Safety net: any path that broke the pairing must not reach the wire.
 	detachOrphanedToolResults(payload)
+
+	if diagnostics.Payload() {
+		afterBytes := payloadByteSize(payload)
+		afterTokens := estimateKiroPayloadTokens(payload)
+		afterHistory := len(payload.ConversationState.History)
+		afterCurrentChars := len([]rune(payload.ConversationState.CurrentMessage.UserInputMessage.Content))
+
+		afterToolCount := 0
+		afterToolResultCount := 0
+
+		afterCtx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+
+		if afterCtx != nil {
+			afterToolCount = len(afterCtx.Tools)
+			afterToolResultCount = len(
+				afterCtx.ToolResults,
+			)
+		}
+
+		logger.Infof(
+			"[Payload] model=%s bytes=%d->%d tokens=%d->%d/%d history=%d->%d tools=%d->%d toolResults=%d->%d currentChars=%d->%d truncated=true",
+			modelID,
+			beforeBytes,
+			afterBytes,
+			beforeTokens,
+			afterTokens,
+			tokenLimit,
+			beforeHistory,
+			afterHistory,
+			beforeToolCount,
+			afterToolCount,
+			beforeToolResultCount,
+			afterToolResultCount,
+			beforeCurrentChars,
+			afterCurrentChars,
+		)
+	}
 }
 
 // activeToolTurn returns the assistant turn whose structured toolUses are
@@ -2272,7 +3509,144 @@ func parseBase64Image(data, format string) *KiroImage {
 	}
 }
 
-func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
+type openAIToolNameCatalog struct {
+	OriginalToKiro map[string]string
+	KiroToOriginal map[string]string
+	IdentityToKiro map[string]string
+	KiroToIdentity map[string]responsesToolIdentity
+}
+
+func (c openAIToolNameCatalog) kiroName(original string) string {
+	return c.kiroNameFor("", original)
+}
+
+func (c openAIToolNameCatalog) kiroNameFor(namespace, original string) string {
+	key := (responsesToolIdentity{Namespace: namespace, Name: original}).key()
+	if safe, ok := c.IdentityToKiro[key]; ok && safe != "" {
+		return safe
+	}
+	if safe, ok := c.OriginalToKiro[original]; ok && safe != "" {
+		return safe
+	}
+	return shortenToolName(sanitizeToolName(original))
+}
+
+func kiroToolNameForOriginal(payload *KiroPayload, original string) string {
+	return kiroToolNameForIdentity(payload, "", original)
+}
+
+func kiroToolNameForIdentity(payload *KiroPayload, namespace, original string) string {
+	if payload != nil {
+		key := (responsesToolIdentity{Namespace: namespace, Name: original}).key()
+		for safe, identity := range payload.ToolIdentityMap {
+			if identity.key() == key {
+				return safe
+			}
+		}
+		for safe, clientName := range payload.ToolNameMap {
+			if namespace == "" && clientName == original {
+				return safe
+			}
+		}
+	}
+	return shortenToolName(sanitizeToolName(original))
+}
+
+func buildOpenAIToolNameCatalog(tools []OpenAITool) openAIToolNameCatalog {
+	catalog := openAIToolNameCatalog{
+		OriginalToKiro: make(map[string]string),
+		KiroToOriginal: make(map[string]string),
+		IdentityToKiro: make(map[string]string),
+		KiroToIdentity: make(map[string]responsesToolIdentity),
+	}
+	if len(tools) == 0 {
+		return catalog
+	}
+
+	baseByOriginal := make(map[string]string)
+	originalsByBase := make(map[string][]string)
+	identityByKey := make(map[string]responsesToolIdentity)
+	for _, tool := range tools {
+		if tool.Type != "function" {
+			continue
+		}
+		original := strings.TrimSpace(tool.Function.Name)
+		identity := responsesToolIdentity{
+			Namespace: strings.TrimSpace(tool.ResponsesNamespace),
+			Name:      original,
+			Kind:      strings.TrimSpace(tool.ResponsesKind),
+		}
+		if identity.Kind == "" {
+			identity.Kind = responsesToolKindFunction
+		}
+		key := identity.key()
+		if original == "" {
+			continue
+		}
+		if _, seen := identityByKey[key]; seen {
+			continue
+		}
+		identityByKey[key] = identity
+		wireIdentity := original
+		if identity.Namespace != "" {
+			wireIdentity = identity.Namespace + "__" + original
+		}
+		base := shortenToolName(sanitizeToolName(wireIdentity))
+		baseByOriginal[key] = base
+		originalsByBase[base] = append(originalsByBase[base], key)
+	}
+
+	orderedOriginals := make([]string, 0, len(baseByOriginal))
+	for key := range baseByOriginal {
+		orderedOriginals = append(orderedOriginals, key)
+	}
+	sort.Strings(orderedOriginals)
+
+	used := make(map[string]string)
+	for _, key := range orderedOriginals {
+		identity := identityByKey[key]
+		original := identity.display()
+		base := baseByOriginal[key]
+		safe := base
+		if len(originalsByBase[base]) > 1 {
+			safe = disambiguateKiroToolName(base, original, used)
+		} else if other, exists := used[safe]; exists && other != original {
+			safe = disambiguateKiroToolName(base, original, used)
+		}
+		used[safe] = original
+		catalog.IdentityToKiro[key] = safe
+		catalog.KiroToIdentity[safe] = identity
+		catalog.KiroToOriginal[safe] = identity.Name
+		if identity.Namespace == "" {
+			catalog.OriginalToKiro[identity.Name] = safe
+		}
+	}
+	return catalog
+}
+
+func disambiguateKiroToolName(base, original string, used map[string]string) string {
+	sum := sha256.Sum256([]byte(original))
+	for hashBytes := 4; hashBytes <= len(sum); hashBytes += 2 {
+		suffix := fmt.Sprintf("X%x", sum[:hashBytes])
+		prefixBytes := 64 - len(suffix)
+		if prefixBytes < 1 {
+			prefixBytes = 1
+		}
+		prefix := base
+		if len(prefix) > prefixBytes {
+			prefix = prefix[:prefixBytes]
+		}
+		candidate := prefix + suffix
+		if other, exists := used[candidate]; !exists || other == original {
+			return candidate
+		}
+	}
+	// SHA-256 exhaustion is practically unreachable, but never allow two
+	// distinct client tools to silently collapse onto one Kiro declaration.
+	return shortenToolName("tool" + fmt.Sprintf("%x", sum[:]))
+}
+
+func convertOpenAIToolsWithCatalog(tools []OpenAITool, catalog openAIToolNameCatalog) []KiroToolWrapper {
 	if len(tools) == 0 {
 		return nil
 	}
@@ -2286,7 +3660,7 @@ func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
 		if len(desc) > maxToolDescLen {
 			desc = desc[:maxToolDescLen] + "..."
 		}
-		name := shortenToolName(tool.Function.Name)
+		name := catalog.kiroNameFor(tool.ResponsesNamespace, tool.Function.Name)
 		if strings.TrimSpace(name) == "" {
 			// Kiro rejects tools with empty names; skip unusable specs.
 			continue
@@ -2300,6 +3674,10 @@ func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
 	return result
 }
 
+func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
+	return convertOpenAIToolsWithCatalog(tools, buildOpenAIToolNameCatalog(tools))
+}
+
 // ==================== Kiro -> OpenAI 转换 ====================
 
 func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *OpenAIResponse {
@@ -2310,7 +3688,11 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 	finishReason := "stop"
 
 	if len(toolUses) > 0 {
-		msg.Content = nil
+		if content != "" {
+			msg.Content = content
+		} else {
+			msg.Content = nil
+		}
 		msg.ToolCalls = make([]ToolCall, len(toolUses))
 		for i, tu := range toolUses {
 			args, _ := json.Marshal(tu.Input)
@@ -2346,29 +3728,29 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 
 // extractThinkingFromContent 从内容中提取 <thinking> 标签内的内容
 func extractThinkingFromContent(content string) (string, string) {
-	var reasoning string
-	result := content
+	var visible strings.Builder
+	var reasoning strings.Builder
+	cursor := 0
 
-	for {
-		start := strings.Index(result, "<thinking>")
-		if start == -1 {
+	for cursor < len(content) {
+		relativeStart := strings.Index(content[cursor:], "<thinking>")
+		if relativeStart < 0 {
+			visible.WriteString(content[cursor:])
 			break
 		}
-		end := strings.Index(result[start:], "</thinking>")
-		if end == -1 {
+		start := cursor + relativeStart
+		relativeEnd := strings.Index(content[start+10:], "</thinking>")
+		if relativeEnd < 0 {
+			visible.WriteString(content[cursor:])
 			break
 		}
-		end += start
-
-		// 提取 thinking 内容
-		thinkingContent := result[start+10 : end]
-		reasoning += thinkingContent
-
-		// 从结果中移除 thinking 标签
-		result = result[:start] + result[end+11:]
+		end := start + 10 + relativeEnd
+		visible.WriteString(content[cursor:start])
+		reasoning.WriteString(content[start+10 : end])
+		cursor = end + 11
 	}
 
-	return strings.TrimSpace(result), reasoning
+	return strings.TrimSpace(visible.String()), reasoning.String()
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
@@ -2379,8 +3761,26 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 		"role": "assistant",
 	}
 
-	if len(toolUses) > 0 {
+	// Visible/reasoning content and tool calls are independent OpenAI message
+	// fields. Preserve both when Kiro emits a mixed text+tool turn instead of
+	// discarding text merely because tool_use blocks are present.
+	if reasoningContent != "" {
+		switch thinkingFormat {
+		case "thinking":
+			message["content"] = "<thinking>" + reasoningContent + "</thinking>" + content
+		case "think":
+			message["content"] = "<think>" + reasoningContent + "</think>" + content
+		default: // "reasoning_content"
+			message["content"] = content
+			message["reasoning_content"] = reasoningContent
+		}
+	} else if content != "" || len(toolUses) == 0 {
+		message["content"] = content
+	} else {
 		message["content"] = nil
+	}
+
+	if len(toolUses) > 0 {
 		toolCalls := make([]map[string]interface{}, len(toolUses))
 		for i, tu := range toolUses {
 			args, _ := json.Marshal(tu.Input)
@@ -2395,21 +3795,6 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 		}
 		message["tool_calls"] = toolCalls
 		finishReason = "tool_calls"
-	} else {
-		// 根据配置格式化 thinking 输出
-		if reasoningContent != "" {
-			switch thinkingFormat {
-			case "thinking":
-				message["content"] = "<thinking>" + reasoningContent + "</thinking>" + content
-			case "think":
-				message["content"] = "<think>" + reasoningContent + "</think>" + content
-			default: // "reasoning_content"
-				message["content"] = content
-				message["reasoning_content"] = reasoningContent
-			}
-		} else {
-			message["content"] = content
-		}
 	}
 
 	return map[string]interface{}{

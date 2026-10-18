@@ -31,6 +31,52 @@ var reportingTokenWeights = tokenWeights{regularAscii: 4.5, digits: 2.0, symbols
 // costs the request.
 var wireTokenWeights = tokenWeights{regularAscii: 4.0, digits: 2.0, symbols: 1.5, nonASCII: 1.0}
 
+type approximateTokenCounter struct {
+	regularASCII int
+	digits       int
+	symbols      int
+	nonASCII     int
+	runes        int
+}
+
+func (c *approximateTokenCounter) Add(text string) {
+	if c == nil {
+		return
+	}
+	for _, r := range text {
+		c.runes++
+		switch {
+		case r >= 0x80:
+			c.nonASCII++
+		case r >= '0' && r <= '9':
+			c.digits++
+		case (r >= '!' && r <= '/') ||
+			(r >= ':' && r <= '@') ||
+			(r >= '[' && r <= '`') ||
+			(r >= '{' && r <= '~'):
+			c.symbols++
+		default:
+			c.regularASCII++
+		}
+	}
+}
+
+func (c approximateTokenCounter) Tokens() int {
+	if c.runes == 0 {
+		return 0
+	}
+	if c.runes < 5 {
+		return max(1, int(math.Ceil(float64(c.runes)/3.0)))
+	}
+	estimated := int(math.Ceil(
+		float64(c.regularASCII)/reportingTokenWeights.regularAscii +
+			float64(c.digits)/reportingTokenWeights.digits +
+			float64(c.symbols)/reportingTokenWeights.symbols +
+			float64(c.nonASCII)/reportingTokenWeights.nonASCII,
+	))
+	return max(1, estimated)
+}
+
 // estimateApproxTokens approximates the tokens in text for usage reporting.
 func estimateApproxTokens(text string) int {
 	return estimateApproxTokensWith(text, reportingTokenWeights)

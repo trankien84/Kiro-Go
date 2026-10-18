@@ -8,7 +8,24 @@ import (
 	"time"
 )
 
+func initPoolOverageTestConfig(t *testing.T, allowOverUsage bool) {
+	t.Helper()
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdateAllowOverUsage(allowOverUsage); err != nil {
+		t.Fatalf("UpdateAllowOverUsage(%v): %v", allowOverUsage, err)
+	}
+	t.Cleanup(func() {
+		if err := config.UpdateAllowOverUsage(false); err != nil {
+			t.Errorf("reset AllowOverUsage: %v", err)
+		}
+	})
+}
+
 func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
+	initPoolOverageTestConfig(t, false)
 	p := &AccountPool{}
 	normal := config.Account{ID: "normal"}
 	overLimit := config.Account{ID: "over", UsageCurrent: 10, UsageLimit: 10}
@@ -27,6 +44,7 @@ func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
 }
 
 func TestOverLimitAccountsCanBeSelectedWhenUpstreamOverageEnabled(t *testing.T) {
+	initPoolOverageTestConfig(t, false)
 	p := &AccountPool{}
 	overLimit := config.Account{
 		ID:            "over",
@@ -47,6 +65,7 @@ func TestOverLimitAccountsCanBeSelectedWhenUpstreamOverageEnabled(t *testing.T) 
 }
 
 func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T) {
+	initPoolOverageTestConfig(t, false)
 	p := &AccountPool{}
 	overLimit := config.Account{
 		ID:            "over",
@@ -278,10 +297,7 @@ func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestReloadKeepsOverQuotaAccountWhenAllowOverUsage(t *testing.T) {
-	cfgFile := filepath.Join(t.TempDir(), "config.json")
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
+	initPoolOverageTestConfig(t, true)
 	if err := config.AddAccount(config.Account{
 		ID:           "over",
 		Enabled:      true,
@@ -289,9 +305,6 @@ func TestReloadKeepsOverQuotaAccountWhenAllowOverUsage(t *testing.T) {
 		UsageLimit:   10,
 	}); err != nil {
 		t.Fatalf("AddAccount: %v", err)
-	}
-	if err := config.UpdateAllowOverUsage(true); err != nil {
-		t.Fatalf("UpdateAllowOverUsage: %v", err)
 	}
 
 	p := newTestPool()
@@ -302,15 +315,15 @@ func TestReloadKeepsOverQuotaAccountWhenAllowOverUsage(t *testing.T) {
 	}
 }
 
-// TestAutoRecoverReprobesDisabledAccount verifies that a disabled account with a
-// valid refresh token gets re-enabled when auto-recovery probes it.
-func TestAutoRecoverReprobesDisabledAccount(t *testing.T) {
+// TestAutoRecoverSkipsManualDisabledAccount verifies that operator/manual
+// DISABLED state is not owned by legacy auto-recovery even when OAuth refresh
+// material is present.
+func TestAutoRecoverSkipsManualDisabledAccount(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
-	// Add a disabled account.
-	config.AddAccount(config.Account{
+	if err := config.AddAccount(config.Account{
 		ID:           "acc-disabled",
 		Email:        "test@example.com",
 		RefreshToken: "rt-valid",
@@ -318,31 +331,30 @@ func TestAutoRecoverReprobesDisabledAccount(t *testing.T) {
 		Enabled:      false,
 		BanStatus:    "DISABLED",
 		Region:       "us-east-1",
-	})
+	}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
 
 	p := &AccountPool{
 		cooldowns:      make(map[string]time.Time),
 		errorCounts:    make(map[string]int),
 		modelLists:     make(map[string]map[string]bool),
-		reprobeBackoff: make(map[string]time.Duration),
-		reprobeNext:    make(map[string]time.Time),
+		reprobeBackoff: make(map[accountRecoveryKey]time.Duration),
+		reprobeNext:    make(map[accountRecoveryKey]time.Time),
 	}
 	p.Reload()
 
-	// Call reprobeDisabled directly (bypassing the goroutine).
 	p.reprobeDisabled()
 
-	// The account should now be enabled (RefreshToken for social hits the real
-	// endpoint; in this test it will fail, so the account stays disabled —
-	// verify it does NOT crash and the pool remains stable).
 	accs := config.GetAccounts()
 	if len(accs) != 1 {
 		t.Fatalf("expected 1 account, got %d", len(accs))
 	}
-	// The reprobe attempted but failed (no fake endpoint) — account stays disabled.
-	// The test verifies no crash + no data loss.
-	if accs[0].ID != "acc-disabled" {
-		t.Fatalf("account preserved: got %q", accs[0].ID)
+	if accs[0].ID != "acc-disabled" || accs[0].Enabled || accs[0].BanStatus != "DISABLED" {
+		t.Fatalf("manual-disabled account changed during legacy recovery scan: %+v", accs[0])
+	}
+	if len(p.reprobeBackoff) != 0 || len(p.reprobeNext) != 0 {
+		t.Fatalf("manual-disabled account allocated legacy recovery timing: backoff=%v next=%v", p.reprobeBackoff, p.reprobeNext)
 	}
 }
 

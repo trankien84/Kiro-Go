@@ -86,10 +86,19 @@ type openAITool struct {
 
 // openAIToAnthropicMessages converts a raw OpenAI Chat Completions body into an
 // Anthropic Messages body (without model/anthropic_version; doBedrockInvoke's
-// buildBedrockBody adds those). It handles system/developer messages, text and
-// image user content, assistant tool_calls, and tool-result turns. Errors are
-// returned pre-stream so the caller can fail over to another account.
-func openAIToAnthropicMessages(rawBody []byte) ([]byte, error) {
+// buildBedrockBody adds those). The shared projection gate first proves the
+// request is in the adapter's lossless subset; unsupported roles/content/tool
+// semantics are rejected pre-stream so the caller can try another transport.
+func openAIToAnthropicMessages(rawBody []byte, specificToolChoiceSupport ...bool) ([]byte, error) {
+	specificToolChoiceSupported := true
+	if len(specificToolChoiceSupport) > 0 {
+		specificToolChoiceSupported = specificToolChoiceSupport[0]
+	}
+	projection := analyzeOpenAIChatBedrockProjection(rawBody, specificToolChoiceSupported)
+	if !projection.Supported() {
+		return nil, fmt.Errorf("bedrock openai: semantic projection unsupported: %s", projection.Reason())
+	}
+
 	var req openAIChatRequest
 	if err := json.Unmarshal(rawBody, &req); err != nil {
 		return nil, fmt.Errorf("bedrock openai: invalid request body: %w", err)
@@ -214,16 +223,10 @@ func openAIToAnthropicMessages(rawBody []byte) ([]byte, error) {
 		out["max_tokens"] = bedrockOpenAIDefaultMaxTokens
 	}
 	if req.Temperature != nil {
-		// OpenAI temperature ranges 0..2; Anthropic/Bedrock accepts 0..1 and 400s
-		// otherwise. Clamp so a valid OpenAI request never turns into a pre-stream
-		// Bedrock error that would fail over and cool down healthy accounts.
-		t := *req.Temperature
-		if t < 0 {
-			t = 0
-		} else if t > 1 {
-			t = 1
-		}
-		out["temperature"] = t
+		// Projection validation above guarantees Bedrock's [0,1] domain. Never
+		// clamp a valid OpenAI value: changing it would silently change sampling
+		// semantics and would incorrectly make this transport look compatible.
+		out["temperature"] = *req.Temperature
 	}
 	if req.TopP != nil {
 		out["top_p"] = *req.TopP
@@ -288,10 +291,10 @@ func normalizeStopSequences(raw json.RawMessage) []string {
 	return nil
 }
 
-// openAIToolChoiceToAnthropic maps an OpenAI tool_choice to Anthropic's form:
-// "auto"->auto, "required"->any, {function:{name}}->{tool,name}. "none" and
-// unrecognized values return nil so the default (auto) applies, avoiding a 400 on
-// model versions that may not accept an explicit "none".
+// openAIToolChoiceToAnthropic maps the subset already proven lossless by the
+// projection boundary: "auto"->auto, "required"->any, and a forced function
+// choice -> {tool,name}. Unsupported values (including "none") return nil only
+// as a defensive fallback; production callers are rejected before conversion.
 func openAIToolChoiceToAnthropic(raw json.RawMessage) map[string]interface{} {
 	if len(raw) == 0 {
 		return nil
@@ -713,7 +716,7 @@ func (h *Handler) invokeBedrockOpenAIStream(w http.ResponseWriter, flusher http.
 	}
 	reqStart := time.Now()
 
-	anthropicBody, err := openAIToAnthropicMessages(p.body)
+	anthropicBody, err := openAIToAnthropicMessages(p.body, bedrockSpecificToolChoiceSupported(p.account, p.providerModelID))
 	if err != nil {
 		return err // pre-stream: safe to fail over
 	}
@@ -757,7 +760,7 @@ func (h *Handler) invokeBedrockOpenAINonStream(w http.ResponseWriter, p forwardP
 	}
 	reqStart := time.Now()
 
-	anthropicBody, err := openAIToAnthropicMessages(p.body)
+	anthropicBody, err := openAIToAnthropicMessages(p.body, bedrockSpecificToolChoiceSupported(p.account, p.providerModelID))
 	if err != nil {
 		return err
 	}

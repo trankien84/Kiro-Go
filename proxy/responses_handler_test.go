@@ -71,9 +71,10 @@ func TestResponsesStoreAndLoad(t *testing.T) {
 		Status:    "completed",
 		Model:     "claude-sonnet-4.5",
 		Output: []ResponseOutputItem{{
-			ID:   "msg_x",
-			Type: "message",
-			Role: "assistant",
+			ID:     "msg_x",
+			Type:   "message",
+			Role:   "assistant",
+			Status: "completed",
 			Content: []ResponseContentPart{{
 				Type: "output_text",
 				Text: "stored hello",
@@ -105,6 +106,75 @@ func TestResponsesStoreAndLoad(t *testing.T) {
 	}
 }
 
+func TestResponsesNonStreamPreservesUpstreamIncompleteStatus(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "partial answer",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "MAX_TOKENS",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"input":"hello"
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var response ResponsesObject
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
+	}
+	if response.Status != "incomplete" {
+		t.Fatalf("status=%q, want incomplete", response.Status)
+	}
+	if response.IncompleteDetails == nil || response.IncompleteDetails.Reason != "max_output_tokens" {
+		t.Fatalf("incomplete_details=%#v, want max_output_tokens", response.IncompleteDetails)
+	}
+}
+
+func TestMapResponsesCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+		status string
+		detail string
+	}{
+		{name: "max tokens", reason: "MAX_TOKENS", status: "incomplete", detail: "max_output_tokens"},
+		{name: "max output tokens alias", reason: "max_output_tokens", status: "incomplete", detail: "max_output_tokens"},
+		{name: "length alias", reason: "length", status: "incomplete", detail: "max_output_tokens"},
+		{name: "context limit", reason: "CONTEXT_WINDOW_EXCEEDED", status: "incomplete", detail: "max_output_tokens"},
+		{name: "model context limit alias", reason: "model_context_window_exceeded", status: "incomplete", detail: "max_output_tokens"},
+		{name: "content filter", reason: "CONTENT_FILTERED", status: "incomplete", detail: "content_filter"},
+		{name: "refusal alias", reason: "refusal", status: "incomplete", detail: "content_filter"},
+		{name: "guardrail alias", reason: "guardrail_intervened", status: "incomplete", detail: "content_filter"},
+		// END_TURN is the literal the Kiro IDE bundle compares against.
+		{name: "end turn", reason: "END_TURN", status: "completed"},
+		// Absent metadataEvent: reported as completed here on purpose. Detecting
+		// that as truncation is the stream integrity layer's job, not this map's.
+		{name: "empty reports completed", reason: "", status: "completed"},
+		{name: "normal completion", reason: "COMPLETE", status: "completed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, detail := mapResponsesCompletion(tc.reason)
+			if status != tc.status || detail != tc.detail {
+				t.Fatalf("mapResponsesCompletion(%q) = (%q, %q), want (%q, %q)", tc.reason, status, detail, tc.status, tc.detail)
+			}
+		})
+	}
+}
+
 func TestResponsesPreviousResponseIDExpands(t *testing.T) {
 	prev := &ResponsesObject{
 		ID:          "resp_prev",
@@ -127,9 +197,12 @@ func TestResponsesPreviousResponseIDExpands(t *testing.T) {
 		},
 	}
 
-	expanded := expandPreviousResponseHistory(prev)
-	if len(expanded) != 3 {
-		t.Fatalf("expected 3 messages from history, got %d (%+v)", len(expanded), expanded)
+	expanded, err := expandPreviousResponseHistory(prev)
+	if err != nil {
+		t.Fatalf("expand history: %v", err)
+	}
+	if len(expanded) != 2 {
+		t.Fatalf("expected user + one semantic assistant turn, got %d (%+v)", len(expanded), expanded)
 	}
 	if expanded[0].Role != "user" {
 		t.Fatalf("expected first message to be user, got %+v", expanded[0])
@@ -137,11 +210,14 @@ func TestResponsesPreviousResponseIDExpands(t *testing.T) {
 	if expanded[1].Role != "assistant" {
 		t.Fatalf("expected second message to be assistant, got %+v", expanded[1])
 	}
-	if expanded[2].Role != "assistant" || len(expanded[2].ToolCalls) != 1 {
-		t.Fatalf("expected third to be assistant with tool_calls, got %+v", expanded[2])
+	if expanded[1].Role != "assistant" || len(expanded[1].ToolCalls) != 1 {
+		t.Fatalf("expected assistant turn to preserve tool_calls, got %+v", expanded[1])
 	}
-	if expanded[2].ToolCalls[0].ID != "call_prev" {
-		t.Fatalf("expected tool call id call_prev, got %+v", expanded[2].ToolCalls[0])
+	if got, _ := expanded[1].Content.(string); got != "earlier assistant reply" {
+		t.Fatalf("expected assistant text to share the tool-call turn, got %+v", expanded[1])
+	}
+	if expanded[1].ToolCalls[0].ID != "call_prev" {
+		t.Fatalf("expected tool call id call_prev, got %+v", expanded[1].ToolCalls[0])
 	}
 }
 
@@ -157,26 +233,28 @@ func TestResponsesPreviousResponseIDExpandsFullChain(t *testing.T) {
 	a := &ResponsesObject{
 		ID:           "resp_a",
 		Object:       "response",
+		CreatedAt:    time.Now().Unix(),
 		Status:       "completed",
 		Model:        "claude-sonnet-4.5",
 		StoredInput:  json.RawMessage(`"turn A user"`),
 		StoredAt:     time.Now().Unix(),
 		Instructions: "be terse",
 		Output: []ResponseOutputItem{{
-			Type: "message", Role: "assistant",
+			ID: "msg_a", Type: "message", Role: "assistant", Status: "completed",
 			Content: []ResponseContentPart{{Type: "output_text", Text: "turn A assistant"}},
 		}},
 	}
 	b := &ResponsesObject{
 		ID:                 "resp_b",
 		Object:             "response",
+		CreatedAt:          time.Now().Unix(),
 		Status:             "completed",
 		Model:              "claude-sonnet-4.5",
 		StoredInput:        json.RawMessage(`"turn B user"`),
 		StoredAt:           time.Now().Unix(),
 		PreviousResponseID: a.ID,
 		Output: []ResponseOutputItem{{
-			Type: "message", Role: "assistant",
+			ID: "msg_b", Type: "message", Role: "assistant", Status: "completed",
 			Content: []ResponseContentPart{{Type: "output_text", Text: "turn B assistant"}},
 		}},
 	}
@@ -187,7 +265,10 @@ func TestResponsesPreviousResponseIDExpandsFullChain(t *testing.T) {
 		t.Fatalf("save b: %v", err)
 	}
 
-	expanded := expandPreviousResponseHistory(b)
+	expanded, err := expandPreviousResponseHistory(b)
+	if err != nil {
+		t.Fatalf("expand full chain: %v", err)
+	}
 
 	var transcript []string
 	for _, m := range expanded {
@@ -196,9 +277,83 @@ func TestResponsesPreviousResponseIDExpandsFullChain(t *testing.T) {
 		transcript = append(transcript, role+":"+text)
 	}
 	got := strings.Join(transcript, "|")
-	want := "system:be terse|user:turn A user|assistant:turn A assistant|user:turn B user|assistant:turn B assistant"
+	want := "user:turn A user|assistant:turn A assistant|user:turn B user|assistant:turn B assistant"
 	if got != want {
 		t.Fatalf("chain order mismatch:\n got=%s\nwant=%s", got, want)
+	}
+}
+
+func TestResponsesPreviousResponseIDRejectsBrokenAncestorChain(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	prev := &ResponsesObject{
+		ID:                 "resp_child_with_missing_parent",
+		PreviousResponseID: "resp_missing_parent",
+		StoredInput:        json.RawMessage(`"child input"`),
+	}
+	if _, err := expandPreviousResponseHistory(prev); err == nil {
+		t.Fatal("broken previous_response_id chain was silently truncated")
+	}
+}
+
+func TestResponsesPreviousInstructionsDoNotCarryForward(t *testing.T) {
+	prev := &ResponsesObject{
+		ID:           "resp_old_instruction",
+		Instructions: "OLD INSTRUCTION MUST NOT CARRY",
+		StoredInput:  json.RawMessage(`"earlier user"`),
+		Output: []ResponseOutputItem{{
+			Type: "message", Role: "assistant",
+			Content: []ResponseContentPart{{Type: "output_text", Text: "earlier assistant"}},
+		}},
+	}
+	expanded, err := expandPreviousResponseHistory(prev)
+	if err != nil {
+		t.Fatalf("expand history: %v", err)
+	}
+	for _, message := range expanded {
+		if text, _ := message.Content.(string); strings.Contains(text, "OLD INSTRUCTION") {
+			t.Fatalf("ancestor instructions leaked into continuation history: %#v", message)
+		}
+	}
+}
+
+func TestResponsesPreviousToolCallsReuseAncestorCanonicalToolNames(t *testing.T) {
+	tools := []OpenAITool{
+		mustTool(t, `{"type":"function","name":"foo-bar","parameters":{"type":"object"}}`),
+		mustTool(t, `{"type":"function","name":"foo_bar","parameters":{"type":"object"}}`),
+	}
+	catalog := buildOpenAIToolNameCatalog(tools)
+	want := catalog.kiroName("foo_bar")
+	if want == catalog.kiroName("foo-bar") {
+		t.Fatal("test setup did not produce a canonicalization collision")
+	}
+	rawTools, err := json.Marshal(tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := &ResponsesObject{
+		ID:          "resp_tool_history",
+		StoredInput: json.RawMessage(`"earlier user"`),
+		Tools:       rawTools,
+		Output: []ResponseOutputItem{{
+			Type:      "function_call",
+			CallID:    "call_ancestor",
+			Name:      "foo_bar",
+			Arguments: `{}`,
+		}},
+	}
+	expanded, err := expandPreviousResponseHistory(prev)
+	if err != nil {
+		t.Fatalf("expand history: %v", err)
+	}
+	if len(expanded) != 2 || len(expanded[1].ToolCalls) != 1 {
+		t.Fatalf("unexpected expanded history: %#v", expanded)
+	}
+	if got := expanded[1].ToolCalls[0].Function.Name; got != want {
+		t.Fatalf("ancestor tool call used different Kiro canonical name: got=%q want=%q", got, want)
 	}
 }
 
@@ -210,15 +365,20 @@ func TestResponsesContinuationKeepsNewInstructions(t *testing.T) {
 	h, cleanup := setupResponsesTestHandler(t)
 	defer cleanup()
 
+	prevID, err := generateResponseID()
+	if err != nil {
+		t.Fatalf("generate local response id: %v", err)
+	}
 	prev := &ResponsesObject{
-		ID:          "resp_for_continuation",
+		ID:          prevID,
 		Object:      "response",
+		CreatedAt:   time.Now().Unix(),
 		Status:      "completed",
 		Model:       "claude-sonnet-4.5",
 		StoredInput: json.RawMessage(`"first user message"`),
 		StoredAt:    time.Now().Unix(),
 		Output: []ResponseOutputItem{{
-			Type: "message", Role: "assistant",
+			ID: "msg_continuation", Type: "message", Role: "assistant", Status: "completed",
 			Content: []ResponseContentPart{{Type: "output_text", Text: "first reply"}},
 		}},
 	}
@@ -234,6 +394,9 @@ func TestResponsesContinuationKeepsNewInstructions(t *testing.T) {
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 			"content": "second reply",
 		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
+		}))
 	}))
 	defer server.Close()
 	defer swapKiroEndpointsForTest(t, server)()
@@ -241,7 +404,7 @@ func TestResponsesContinuationKeepsNewInstructions(t *testing.T) {
 	body := strings.NewReader(`{
 		"model":"claude-sonnet-4.5",
 		"input":"second user turn",
-		"previous_response_id":"resp_for_continuation",
+		"previous_response_id":"` + prev.ID + `",
 		"instructions":"speak only French",
 		"store":false
 	}`)
@@ -265,6 +428,7 @@ func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 	}
 	if err := config.AddAccount(config.Account{
 		ID:          "test-account",
+		AuthMethod:  "social",
 		Enabled:     true,
 		AccessToken: "token-test",
 		ProfileArn:  "arn:aws:codewhisperer:profile/test",
@@ -283,7 +447,20 @@ func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 		pool:        p,
 		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
 	}
-	cleanup := func() {}
+	now := time.Now()
+	h.accountModelSnapshots = testRuntimeSnapshots(map[string]accountModelSnapshot{
+		"test-account": {
+			Models:      []ModelInfo{{ModelId: "claude-sonnet-4.5"}},
+			RefreshedAt: now,
+			FreshUntil:  now.Add(time.Hour),
+			StaleUntil:  now.Add(time.Hour),
+		},
+	})
+	p.SetModelList("test-account", []string{"claude-sonnet-4.5"})
+	h.rebuildEnabledModelUnion()
+	cleanup := func() {
+		p.WaitForPendingStats()
+	}
 	return h, cleanup
 }
 
@@ -297,9 +474,34 @@ func swapKiroEndpointsForTest(t *testing.T, server *httptest.Server) func() {
 	}}
 	oldClient := kiroHttpStore.Load()
 	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+
+	// reasoningCapabilityForModel (handler.go) warms the model cache off the
+	// request goroutine on a cache miss (warmModelsCacheAsync), so ANY test
+	// using this helper that reaches a Claude/OpenAI/count_tokens entrypoint
+	// with an empty cachedModels can now kick a background
+	// refreshModelsCache -> ListAvailableModels call. That goes through
+	// kiroRestHttpStore's REAL client (buildKiroTransport,
+	// Proxy: http.ProxyFromEnvironment) — NOT the local server swapped above,
+	// since ListAvailableModels targets kiroRestAPIBase, a separate constant
+	// this helper does not touch. Firing http.ProxyFromEnvironment ANYWHERE
+	// in the process caches env vars in a process-wide sync.Once on first
+	// call, permanently poisoning any later test (e.g.
+	// TestBuildKiroTransportFallsBackToEnvironmentProxy) that relies on
+	// t.Setenv("HTTPS_PROXY", ...) actually taking effect. Stub it to fail
+	// fast without touching the network, and always restore an equally inert
+	// stub (never the real ProxyFromEnvironment-backed client) since a
+	// background warm goroutine may still be in flight after the test
+	// returns and must not be able to re-poison anything when it completes.
+	kiroRestHttpStore.Store(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errTest("network disabled in test")
+		}),
+	})
+
 	return func() {
 		kiroEndpoints = oldEndpoints
 		kiroHttpStore.Store(oldClient)
+		kiroRestHttpStore.Store(&http.Client{Transport: &http.Transport{}})
 	}
 }
 
@@ -311,6 +513,9 @@ func TestResponsesNonStreamRoundTrip(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 			"content": "responses non-stream OK",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
 		}))
 	}))
 	defer server.Close()
@@ -356,6 +561,39 @@ func TestResponsesNonStreamRoundTrip(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamPreservesUpstreamIncompleteStatus(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "partial answer",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "MAX_TOKENS",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"input":"hello",
+		"stream":true,
+		"store":false
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIResponses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"status":"incomplete"`) || !strings.Contains(rec.Body.String(), `"reason":"max_output_tokens"`) {
+		t.Fatalf("expected incomplete response.completed event, got %s", rec.Body.String())
+	}
+}
+
 func TestResponsesStreamSSE(t *testing.T) {
 	h, cleanup := setupResponsesTestHandler(t)
 	defer cleanup()
@@ -364,6 +602,9 @@ func TestResponsesStreamSSE(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 			"content": "stream chunk",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
 		}))
 	}))
 	defer server.Close()
@@ -382,12 +623,68 @@ func TestResponsesStreamSSE(t *testing.T) {
 	bodyBytes, _ := io.ReadAll(rec.Body)
 	bodyStr := string(bodyBytes)
 
-	for _, evt := range []string{"event: response.created", "event: response.output_text.delta", "event: response.completed"} {
-		if !strings.Contains(bodyStr, evt) {
-			t.Fatalf("missing event %q in stream body:\n%s", evt, bodyStr)
+	requiredEvents := []string{
+		"response.created",
+		"response.in_progress",
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+		"response.output_text.done",
+		"response.content_part.done",
+		"response.output_item.done",
+		"response.completed",
+	}
+	lastOffset := -1
+	for _, eventName := range requiredEvents {
+		offset := strings.Index(bodyStr, "event: "+eventName)
+		if offset < 0 {
+			t.Fatalf("missing event %q in stream body:\n%s", eventName, bodyStr)
 		}
+		if offset <= lastOffset {
+			t.Fatalf("event %q is out of Responses lifecycle order:\n%s", eventName, bodyStr)
+		}
+		lastOffset = offset
+	}
+	if strings.Contains(bodyStr, "[DONE]") {
+		t.Fatalf("Responses stream must terminate semantically, not with Chat Completions [DONE]:\n%s", bodyStr)
 	}
 	if !strings.Contains(bodyStr, "stream chunk") {
 		t.Fatalf("expected stream content delta, got:\n%s", bodyStr)
+	}
+
+	blocks := strings.Split(strings.TrimSpace(bodyStr), "\n\n")
+	var doneItemID, completedItemID string
+	for i, block := range blocks {
+		var eventName, dataLine string
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "event: ") {
+				eventName = strings.TrimPrefix(line, "event: ")
+			}
+			if strings.HasPrefix(line, "data: ") {
+				dataLine = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		var event map[string]interface{}
+		if err := json.Unmarshal([]byte(dataLine), &event); err != nil {
+			t.Fatalf("decode SSE block %d: %v\n%s", i, err, block)
+		}
+		if got := int(event["sequence_number"].(float64)); got != i+1 {
+			t.Fatalf("sequence_number=%d at block=%d, want=%d", got, i, i+1)
+		}
+		switch eventName {
+		case "response.output_item.done":
+			item, _ := event["item"].(map[string]interface{})
+			doneItemID, _ = item["id"].(string)
+		case "response.completed":
+			response, _ := event["response"].(map[string]interface{})
+			output, _ := response["output"].([]interface{})
+			if len(output) > 0 {
+				item, _ := output[0].(map[string]interface{})
+				completedItemID, _ = item["id"].(string)
+			}
+		}
+	}
+	if doneItemID == "" || completedItemID != doneItemID {
+		t.Fatalf("completed response output did not match streamed output item: done=%q completed=%q", doneItemID, completedItemID)
 	}
 }
