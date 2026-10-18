@@ -1,275 +1,266 @@
 # Kiro-Go
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](https://www.docker.com/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/) [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](https://www.docker.com/) [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Convert Kiro accounts to OpenAI / Anthropic compatible API service.
+**Kiro-Go** exposes OpenAI-compatible and Anthropic Messages APIs over a pool of Kiro and other configured upstream accounts. The implementation includes provider-aware routing, account lifecycle safeguards, transport/protocol validation and bounded recovery. **API compatibility is feature- and transport-dependent**: an endpoint name alone does not mean every upstream implements every tool or reasoning feature.
 
-[English](README.md) | [中文](README_CN.md) | [Tiếng Việt](README_VI.md)
-
-If this project helps you, a Star would mean a lot.
+**Languages:** [English](README.md) | [Tiếng Việt](README_VI.md) | [简体中文](README_CN.md)
 
 ## Features
 
-- Anthropic `/v1/messages`, OpenAI `/v1/chat/completions` & OpenAI `/v1/responses`
-- Multi-account pool with round-robin load balancing
-- Auto token refresh, SSE streaming, Web admin panel
-- Multiple auth: AWS Builder ID, IAM Identity Center (Enterprise SSO), Microsoft Enterprise SSO, SSO Token, local cache, credentials JSON, Kiro API Key
-- Usage tracking, account import/export, i18n (CN / EN / VI)
-- Support configuring outbound proxy (SOCKS5 / HTTP)
+- **API surfaces:** Anthropic `POST /v1/messages`, OpenAI `POST /v1/chat/completions`, `POST /v1/responses`, and `GET /v1/models`; streaming where the selected adapter supports it.
+- **Upstreams:** Kiro OAuth / Kiro API Key, Direct Anthropic, Amazon Bedrock (Invoke or Converse), and custom-compatible relays, subject to endpoint-specific compatibility checks.
+- **Multi-account routing:** `round-robin`, `priority`, and `fill-first` scheduling, eligibility checks, model discovery, cooldown/failover, and per-account health.
+- **State safety:** lifecycle-gated asynchronous updates, safe config publication, background token/account reconciliation, and graceful request draining on shutdown.
+- **Agent protocols:** tool calls and history, capability-aware thinking, selected Inline Tools / MCP semantics, structured output gates, and Completion Guard for Claude Messages.
+- **Operations:** Web admin panel, usage statistics, provider credential import, EN/VI/ZH interface, and HTTP/SOCKS5 outbound proxies.
 
-## Quick Start
+See [the architecture guide](docs/architecture/overview.md) for implementation details, invariants, supported transports and source/test references.
 
-### Docker Compose (Recommended)
+## Architecture at a glance
+
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"nodeSpacing": 80, "rankSpacing": 95, "wrappingWidth": 350, "minNodeWidth": 320, "curve": "linear"}}}%%
+flowchart TD
+    Client["OpenAI or Anthropic<br/>compatible client"] --> Front["Kiro-Go HTTP endpoint<br/>Authenticate and<br/>validate request"]
+    Front --> Plan["Analyze model and<br/>requested features<br/>plus protocol requirements"]
+    Plan --> Pool["Filter eligible accounts<br/>Resolve exact<br/>provider model"]
+    Pool --> Route{"Selected compatible<br/>upstream transport"}
+    Route -->|Kiro| Kiro["Kiro runtime"]
+    Route -->|Direct / relay| Direct["Direct Anthropic or<br/>custom-compatible relay"]
+    Route -->|Bedrock| Bedrock["Bedrock Invoke<br/>or Converse"]
+    Kiro --> Response["Process upstream response<br/>Check applicable<br/>integrity rules"]
+    Direct --> Response
+    Bedrock --> Response
+    Response --> ClientOut["Commit response<br/>to client"]
+```
+
+The request **must pass both account eligibility and protocol compatibility**. For example, a Kiro account advertising a model is not automatically capable of hosting an Anthropic server tool; a request that requires unsupported semantics must select a suitable transport or fail explicitly. The final response stage is protocol-specific: Claude Messages uses Completion Guard when enabled; OpenAI Responses uses independent state and stream handling. This diagram is conceptual, not a literal call stack. See [provider routing](docs/architecture/provider-routing.md), [agent protocols](docs/architecture/agent-protocol.md) and [Completion Guard](docs/architecture/completion-guard.md).
+
+## Quick start
+
+### Docker Compose (recommended for a local deployment)
+
+Replace `OWNER/REPO` in the clone commands with the repository owner/name shown under **Code → HTTPS** (whether you use this fork or an upstream repository). The local checkout folder is always named `Kiro-Go`.
 
 ```bash
-git clone https://github.com/zsecducna/Kiro-Go.git
+git clone --branch main https://github.com/OWNER/REPO.git Kiro-Go
 cd Kiro-Go
 mkdir -p data
-docker-compose up -d
+KIRO_PORT=127.0.0.1:8080 docker compose up -d --build
+curl -fsS http://localhost:8080/health
 ```
 
-### Docker Run
+Compose **builds from this checkout**, mounts `./data` at `/app/data`, exposes the API on host port `8080` by default (the example restricts it to loopback with `KIRO_PORT=127.0.0.1:8080`), and binds the Microsoft SSO browser callback to host loopback `127.0.0.1:3128`. To change the published API port, use `KIRO_PORT=127.0.0.1:9090 docker compose up -d --build` for local-only access; the service still listens on container port `8080`. These commands explicitly clone the **`main` branch**.
+
+> **Security:** The supplied Compose file does **not** forward a host `ADMIN_PASSWORD` environment variable. The Compose default without this loopback override exposes the API on all host interfaces. On the first local start, sign in with the fresh-config password `changeme` and change it immediately in the admin UI **before allowing network access**; alternatively use a private Compose override that explicitly sets `ADMIN_PASSWORD` in the container. Compose enables `KIRO_IMPORT_WATCH=1`. Anyone able to write to `./data/imports` can cause accounts to be imported without the admin password. Keep that directory as restricted as `./data/config.json`, or set `KIRO_IMPORT_WATCH=0`. For remote deployments, use HTTPS and restrict access to `/admin`. The Microsoft SSO callback assumes a browser on the **Docker host**, not a remote workstation.
+
+### Docker build and run (without Compose)
 
 ```bash
+docker build -t kiro-go:local .
 docker run -d \
   --name kiro-go \
-  -p 8080:8080 \
-  -e ADMIN_PASSWORD=your_secure_password \
-  -v /path/to/data:/app/data \
+  -p 127.0.0.1:8080:8080 \
+  -e ADMIN_PASSWORD='replace-with-a-strong-password' \
+  -v /absolute/path/to/data:/app/data \
   --restart unless-stopped \
-  ghcr.io/zsecducna/kiro-go:latest
+  kiro-go:local
 ```
 
-### Build from Source
+Replace `/absolute/path/to/data` with an actual writable host directory. This standalone command does **not** mount the IDE cache or publish the Enterprise SSO callback port; use Compose or provide those settings explicitly if needed. It also does not enable the import watcher unless requested.
+
+### Build from source
 
 ```bash
-git clone https://github.com/zsecducna/Kiro-Go.git
+git clone --branch main https://github.com/OWNER/REPO.git Kiro-Go
 cd Kiro-Go
 go build -o kiro-go .
 ./kiro-go
-
-# Run on a different port (flag > PORT env > config.json):
+# CLI flag > PORT environment > saved config:
 ./kiro-go -port 9090
 # or: PORT=9090 ./kiro-go
 ```
 
-### Deploy on Zeabur
+Requires Go 1.21+ according to `go.mod`. The server generates `data/config.json` if missing. The initial admin password in a fresh config is `changeme`; **change it before exposing the server**. `ADMIN_PASSWORD` overrides that value at runtime. Open `http://localhost:8080/admin` (or your configured port) to add accounts.
 
-The repo already includes a `Dockerfile`, so it builds and runs on Zeabur out of the box.
+### Hosting and Zeabur
 
-**Option 1: Dashboard (one-click)**
+The repository includes a multi-stage `Dockerfile`. On Zeabur, deploy **from this GitHub repository**, expose container port `8080`, configure `ADMIN_PASSWORD`, and mount persistent storage at `/app/data`. Provide an HTTPS domain for external access. Interactive Microsoft SSO's loopback callback requires a separately verified host/browser network arrangement; do not assume it works unchanged in a remote container.
 
-1. Fork this repo to your GitHub account.
-2. In Zeabur, create a new service and choose **Deploy from GitHub**, then select your fork.
-3. Zeabur auto-detects the `Dockerfile` and builds the image.
-4. In the **Networking** tab, expose port `8080` and bind a domain.
-5. In the **Variables** tab, set at least `ADMIN_PASSWORD` (admin panel password).
-6. Mount a Volume at `/app/data` if you want accounts / config to survive redeploys.
+## API usage
 
-**Option 2: CLI**
+After adding an eligible account in `/admin`, use one of the supported API routes:
 
-```bash
-npm i -g zeabur
-zeabur auth login
-zeabur deploy
-```
-
-> Run the commands from the project root. The CLI writes `.zeabur/context.json` to remember the target project / service — it contains personal IDs, so don't commit it.
-
-Once the service is up, open `https://<your-domain>/admin` to log in.
-
-Config is auto-created at `data/config.json`. Mount `/app/data` for persistence. The default admin password is `changeme` — override it via the `ADMIN_PASSWORD` env var or change it in the admin panel before going to production.
-
-## Usage
-
-Open `http://localhost:8080/admin`, log in, add accounts, then call the API:
+| Interface | Route | Important note |
+|---|---|---|
+| Anthropic Messages | `POST /v1/messages` | Claude-specific tools/reasoning features require compatible transport |
+| Anthropic token counting | `POST /v1/messages/count_tokens` | Estimation and compatibility are model-dependent |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | Translation versus passthrough depends on account and request |
+| OpenAI Responses | `POST /v1/responses` | Local state and external `previous_response_id` have different ownership |
+| Model listing | `GET /v1/models` | Advertised models depend on current provider evidence and availability |
+| Health check | `GET /health` | Useful for deployment checks; not proof an upstream account is usable |
 
 ```bash
-# Claude
+# Anthropic Messages
 curl http://localhost:8080/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "anthropic-version: 2023-06-01" \
+  -H 'Content-Type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'x-api-key: YOUR_CLIENT_API_KEY' \
   -d '{"model":"claude-sonnet-4.5","max_tokens":1024,"messages":[{"role":"user","content":"Hello!"}]}'
 
-# OpenAI
+# OpenAI Chat Completions
 curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer any" \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_CLIENT_API_KEY' \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-### Add a Kiro API Key account
+`YOUR_CLIENT_API_KEY` represents a client API key configured in the admin panel. By default, client-key enforcement is disabled (`RequireApiKey=false`), so the sample authentication headers may be omitted. **Enable client-key enforcement before making the API public.** When enforcement is enabled with no configured keys, requests are rejected rather than accepted. Model IDs above are examples, **not guaranteed availability**: choose an entry actually returned by `/v1/models` for your configured providers.
 
-In the admin panel, choose **API Key** when adding an account and paste `ksk_...` (or `ksk_...|region`).
+## Accounts, importing credentials and routing
 
-You can also import via the credentials API:
+Kiro-Go supports Kiro sign-in accounts (AWS Builder ID / IAM Identity Center / Microsoft Enterprise SSO), Kiro API keys, and separately configured upstream transports such as Bedrock, Direct Anthropic and custom-compatible relays. Do not confuse an external identity provider (`external_idp`) with Direct Anthropic or Bedrock API credentials. See [authentication and trust boundaries](docs/architecture/authentication.md).
+
+### Kiro API Key
+
+In the admin panel, add an **API Key** account and enter `ksk_...` (optionally `ksk_...|region`). You can also use the admin credentials API:
 
 ```bash
+# Set this to the *current* admin password for the following requests.
+export ADMIN_PASSWORD='your-current-admin-password'
 curl -X POST http://localhost:8080/admin/api/auth/credentials \
-  -H "Content-Type: application/json" \
-  -H "Cookie: <admin-session>" \
+  -H 'Content-Type: application/json' \
+  -H "X-Admin-Password: $ADMIN_PASSWORD" \
   -d '{"kiroApiKey":"ksk_your_key|us-east-1","authMethod":"api_key","nickname":"cli-key"}'
 ```
 
-API Key accounts call the Kiro CLI runtime (`https://runtime.{region}.kiro.dev/`) with `tokentype: API_KEY`. They skip OAuth refresh and do not use `profileArn`.
+This is an **upstream Kiro API key**, not the key used by API clients connecting to Kiro-Go. Kiro API-key accounts do not use OAuth token refresh or `profileArn`. For an authentication failure, region reprobe is bounded and a candidate region is persisted only after the **runtime** retry succeeds; see [authentication](docs/architecture/authentication.md).
 
-## Importing Microsoft 365 / Entra ID (Azure AD) credentials
+### Microsoft 365 / Entra ID and other credential imports
 
-Enterprise SSO (Microsoft 365 / Entra ID) accounts are neither AWS Builder ID nor
-IAM Identity Center accounts. Besides the interactive **Enterprise SSO** flow in the
-admin panel, credentials can also arrive as a `CLIProxyAPI_<user>.json` file minted by
-an external helper (`auth_method: external_idp`). There are four ways to get an
-account in:
+There are **five entry paths**; file import paths share an internal `h.importCredential` classifier and validation core:
 
-1. **Interactive Enterprise SSO** (admin panel → Add Account → Enterprise SSO). The
-   backend drives the hosted sign-in portal and polls until the account is created.
+1. **Interactive Enterprise SSO:** Admin panel → Add Account → Enterprise SSO, using the hosted sign-in flow.
+2. **Paste or upload JSON:** The admin panel accepts the external helper's `CLIProxyAPI_*.json`, including `snake_case` credential fields, subject to validation.
+3. **Batch/admin endpoint:** `POST /admin/api/auth/import-cli-json` accepts individual JSON, arrays, supported wrapper formats, or concatenated objects, with per-item results.
+4. **Drop-folder watcher:** When `KIRO_IMPORT_WATCH=1`, eligible `CLIProxyAPI_*.json` files in `data/imports/` are processed and moved to `processed/` or `failed/`. Enabled by default **only in the supplied Compose configuration**.
+5. **Import Kiro IDE cache:** The admin panel button or `POST /admin/api/auth/import-ide-cache` reads the server's `KIRO_IDE_CACHE` path (default `~/.aws/sso/cache/kiro-auth-token.json`). For Docker Compose, the host cache is mounted read-only and `KIRO_AWS_SSO_CACHE_DIR` controls the host-side directory.
 
-2. **Paste / upload the helper JSON in the admin panel.** The Enterprise SSO card's
-   file picker and paste box accept the helper's native `CLIProxyAPI_*.json`
-   verbatim — snake_case keys (`token_endpoint`, `issuer_url`, `scopes`,
-   `profile_arn`) are understood, alongside the existing camelCase API shape.
+```bash
+# Import CLIProxyAPI helper JSON through the authenticated admin API
+curl -X POST http://localhost:8080/admin/api/auth/import-cli-json \
+  -H "X-Admin-Password: $ADMIN_PASSWORD" \
+  -H 'Content-Type: application/json' \
+  --data-binary @CLIProxyAPI_user.json
 
-3. **API.** `POST /admin/api/auth/import-cli-json` accepts a single helper object, a
-   JSON array, a `{ "files": ["<json>", ...] }` / `{ "accounts": [...] }` wrapper, or
-   raw text with several objects. It returns per-item results.
+# Read the IDE cache from the server-configured location
+curl -X POST http://localhost:8080/admin/api/auth/import-ide-cache \
+  -H "X-Admin-Password: $ADMIN_PASSWORD"
+```
 
-   ```bash
-   curl -X POST http://localhost:8080/admin/api/auth/import-cli-json \
-     -H "X-Admin-Password: $ADMIN_PASSWORD" \
-     --data-binary @CLIProxyAPI_user.json
-   ```
+**Important:** The IDE-cache endpoint intentionally **ignores a client-supplied `path`**. Set `KIRO_IDE_CACHE` on the server instead; allowing arbitrary paths in a request would cross a filesystem trust boundary. An IDE-cache import requires readable refresh material and performs a refresh rather than trusting a stale cache expiry. Keep credentials, import folders, admin sessions and logs private. Microsoft Enterprise SSO is not interchangeable with generic external IdP refresh; provider classification and endpoint validation are enforced server-side.
 
-4. **Zero-touch drop folder (Docker).** With `KIRO_IMPORT_WATCH=1` (set by default in
-   `docker-compose.yml`), any `CLIProxyAPI_*.json` placed in `data/imports/` is imported
-   within ~15s, then moved to `data/imports/processed/` (or `failed/` with a `.error.txt`
-   sidecar). Imports go through the same persisted path the running server owns, so they
-   never race the in-memory config.
+### Multi-account scheduling
 
-5. **Import from the Kiro IDE cache (no browser, no helper).** If the Kiro IDE is already
-   signed in on the same host as the proxy, it keeps a live credential at
-   `~/.aws/sso/cache/kiro-auth-token.json`. The admin panel's Enterprise SSO card has an
-   **Import from Kiro IDE (this host)** button, or call the API directly:
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"nodeSpacing": 80, "rankSpacing": 95, "wrappingWidth": 350, "minNodeWidth": 320, "curve": "linear"}}}%%
+flowchart TD
+    Candidate["Accounts matching<br/>requested model<br/>and provider route"] --> Eligible["Apply credential, quota,<br/>cooldown, health and<br/>protocol eligibility gates"]
+    Eligible --> Strategy{"Account selection<br/>strategy"}
+    Strategy -->|round-robin| RR["Keep eligible set<br/>Use existing rotation<br/>and load signals"]
+    Strategy -->|priority| Priority["Keep best eligible<br/>priority tier<br/>Distribute within that tier"]
+    Strategy -->|fill-first| Fill["Choose first eligible<br/>account in best<br/>priority tier"]
+    RR --> Dispatch["Capture immutable<br/>account lease and<br/>resolved provider model"]
+    Priority --> Dispatch
+    Fill --> Dispatch
+```
 
-   ```bash
-   curl -X POST http://localhost:8080/admin/api/auth/import-ide-cache \
-     -H "X-Admin-Password: $ADMIN_PASSWORD"
-   # custom location: -d '{"path":"/path/to/kiro-auth-token.json"}'
-   ```
+The strategy **never bypasses eligibility**. `priority` chooses the lowest numeric priority tier among *eligible* accounts, then allows the existing selector to distribute within the tier. `fill-first` picks the first eligible account in that tier according to pool/config order. Empty or invalid saved strategy values fall back to `round-robin`; legacy unset account priority uses effective tier `100`. A request snapshots both account lifecycle and model routing evidence; asynchronous completion cannot mutate a newly recreated account that reuses the same ID. See [provider routing](docs/architecture/provider-routing.md) and [account lifecycle](docs/architecture/account-lifecycle.md).
 
-   The proxy reads the file **server-side**, so this works only when the IDE and the proxy
-   share a host — or, in Docker, when the host AWS SSO cache directory is mounted into the
-   container. The Compose file does this portably for Linux/macOS with
-   `${HOME}/.aws/sso/cache:/host-aws-sso-cache:ro`; override `KIRO_AWS_SSO_CACHE_DIR` if
-   your Kiro IDE uses a different location. The cache's stale `expiresAt` is ignored: the
-   import performs a mandatory refresh, so the persisted expiry always comes from a fresh
-   upstream response.
+## Agent protocol, Completion Guard and streaming safety
 
-Every path above funnels through the same internal core, so an account imported via
-JSON, the IDE cache, or the drop folder gets identical Microsoft-vs-generic
-classification (strict tenant-bound refresh vs. loose allow-list-only refresh) to one
-created through the interactive flow.
+Compatibility is **semantic**, not just JSON syntax. Features such as MCP history, server tools, deferred loading, thinking signatures and structured JSON output may require a transport that preserves those semantics. A compatible-looking model alias is not enough. OpenAI Responses has separate local/external state ownership; Direct Anthropic and Bedrock are **not** native `/v1/responses` adapters in this implementation. See [agent protocol matrix](docs/architecture/agent-protocol.md).
 
-> The account email is stored as a label only. The password is **never** persisted or
-> sent upstream — Microsoft 365 tenants enforce MFA / Conditional Access, so a headless
-> password (ROPC) grant is not a reliable auth path.
+```mermaid
+%%{init: {"htmlLabels": false, "flowchart": {"nodeSpacing": 80, "rankSpacing": 95, "wrappingWidth": 350, "minNodeWidth": 320, "curve": "linear"}}}%%
+flowchart TD
+    Reply["Claude Messages<br/>candidate response"] --> Mode{"Completion Guard<br/>mode"}
+    Mode -->|off| Pass["Ordinary handler transport path"]
+    Mode -->|observe| Observe["Observe upstream response<br/>No guard retry<br/>or rewrite"]
+    Mode -->|retry / strict| Check["Select buffered or safe<br/>deferred delivery<br/>Validate SSE and<br/>structured tool turn"]
+    Check --> Valid{"Response complete<br/>and protocol-valid?"}
+    Valid -->|Yes| Commit["Commit permitted<br/>output to client"]
+    Valid -->|No, replay safe| Retry["Bounded retry before<br/>semantic output commit"]
+    Valid -->|No, already committed| Continue["Recover from<br/>committed history<br/>Never replay visible output"]
+```
 
-## Thinking Mode
+The default guard mode is `strict`, but **semantic completion audit is off by default**. If enabled with `KIRO_AGENT_COMPLETION_AUDIT=enforce`, an audit result of `needs_action` requires an independent verifier to authorize autonomous continuation; uncertainty or missing approval keeps the original usable response. `buffered` retains a response until final checks; `deferred-stream` can emit safe ordinary content early but holds structured tool turns atomically. Stream retry must not duplicate already committed text, reasoning or tools. The `observe` mode does **not** enforce validation. See [Completion Guard](docs/architecture/completion-guard.md) and [streaming/recovery](docs/architecture/streaming-recovery.md).
 
-Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. Configure output format in the admin panel under Settings - Thinking Mode.
+### Thinking, reasoning and text chunks
 
-## Outbound Proxy
+A configurable suffix (default `-thinking`) is a Kiro-Go convention; Claude requests may instead supply a top-level `thinking` object, subject to the resolved model's capabilities. Provider-issued thinking signatures are preserved on compatible transparent transports; Kiro's local continuation provenance is **not** presented as an Anthropic signature. `KIRO_ASSISTANT_CHUNK_MODE` and `KIRO_REASONING_CHUNK_MODE` default to `delta` so repeated text is not wrongly discarded; `cumulative` and opt-in `legacy` serve different upstream contracts. See [agent protocols](docs/architecture/agent-protocol.md) and [stream decoding](docs/architecture/streaming-recovery.md).
 
-For users in restricted network regions, configure an outbound proxy in the admin panel under **Settings - Outbound Proxy Settings**. Supports SOCKS5 and HTTP proxies.
+## Configuration reference
 
-The setting takes effect immediately without restarting.
+The values below are from the current code and provided Compose file. An option may be **runtime environment-only**, **persisted in `data/config.json`**, or **set through the admin UI**; do not assume that changing the container environment updates an already running process.
 
-## Environment Variables
+| Variable | Meaning | Default / behavior |
+|---|---|---|
+| `CONFIG_PATH` | Config file location | `data/config.json` |
+| `ADMIN_PASSWORD` | Override admin password | Default fresh-config password: `changeme`; set explicitly |
+| `PORT`, `HOST` | Listen port and address | `8080`, `0.0.0.0`; CLI `-port` / `-host` overrides env |
+| `KIRO_PORT` | Host port published by Docker Compose | `8080`; container remains `8080` |
+| `KIRO_IMPORT_WATCH` | Enable credential drop-folder watcher | Off normally; `1` in supplied Compose |
+| `KIRO_IMPORT_DIR` | Watcher directory | `data/imports` |
+| `KIRO_IDE_CACHE` | Server-side Kiro IDE credential cache | `~/.aws/sso/cache/kiro-auth-token.json`; Compose sets mounted path |
+| `KIRO_AWS_SSO_CACHE_DIR` | Host directory mounted read-only by Compose | `${HOME}/.aws/sso/cache` |
+| `KIRO_SSO_CALLBACK_BIND` | Listener bind for Enterprise SSO callback | Normally loopback; `0.0.0.0` inside Compose network |
+| `KIRO_PROFILE_REGIONS` | Kiro profile/API-key region probe candidates | Built-in list; comma-separated override |
+| `KIRO_DIAGNOSTICS` | Aggregate diagnostics master option | Disabled |
+| `KIRO_DIAG_STREAM`, `KIRO_DIAG_PAYLOAD`, `KIRO_DIAG_REASONING` | Granular metrics/diagnostics | Disabled |
+| `KIRO_DIAG_CHUNKS` | Raw text/chunk logging; can expose secrets | Disabled; **not implied** by `KIRO_DIAGNOSTICS` |
+| `KIRO_ASSISTANT_CHUNK_MODE`, `KIRO_REASONING_CHUNK_MODE` | Chunk decoder (`delta` / `cumulative` / `legacy`) | `delta` |
+| `KIRO_SYNTHETIC_THINKING_SIGNATURE` | Local fallback policy (`auto` / `always` / `never`) | `auto` |
+| `KIRO_AGENT_COMPLETION_GUARD` | Claude guard (`off` / `observe` / `retry` / `strict`) | `strict` |
+| `KIRO_AGENT_COMPLETION_DELIVERY` | `auto` / `buffered` / `deferred-stream` | `auto` |
+| `KIRO_AGENT_COMPLETION_GUARD_MAX_RETRIES` | Bound guard recovery attempts | `2` (allowed `0`–`4`) |
+| `KIRO_AGENT_COMPLETION_GUARD_HEARTBEAT_MS` | Wait-state SSE heartbeat interval | `10000` (allowed `1000`–`60000`) |
+| `KIRO_AGENT_COMPLETION_GUARD_MAX_BUFFER_BYTES` | Guard retained-payload budget | `16777216` bytes; not a Go heap cap |
+| `KIRO_AGENT_COMPLETION_AUDIT` | Semantic audit (`off` / `observe` / `enforce`) | `off` |
+| `KIRO_NATIVE_TOOL_CHOICE` | Native forced tool selection (`never` / `auto` / `always`) | `auto` |
+| `KIRO_MAX_REQUEST_BODY_BYTES` | General request-body limit; transport may be stricter | `67108864` bytes (64 MiB); Messages/count_tokens max 32 MiB |
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `CONFIG_PATH` | Config file path | `data/config.json` |
-| `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
-| `PORT` | HTTP listen port (overrides config; `-port` flag wins over this) | `8080` |
-| `HOST` | HTTP bind host (overrides config; `-host` flag wins over this) | `0.0.0.0` |
-| `KIRO_IMPORT_WATCH` | Enable the `data/imports/` auto-ingest watcher (`1`/`true`) | off (on in Docker) |
-| `KIRO_IMPORT_DIR` | Directory the watcher scans for `CLIProxyAPI_*.json` | `data/imports` |
-| `KIRO_IDE_CACHE` | Path to the Kiro IDE credential cache for `import-ide-cache` | `~/.aws/sso/cache/kiro-auth-token.json` (Docker: `/host-aws-sso-cache/kiro-auth-token.json`) |
-| `KIRO_AWS_SSO_CACHE_DIR` | Host AWS SSO cache directory mounted by Docker Compose for IDE-cache import | `$HOME/.aws/sso/cache` |
-| `KIRO_PROFILE_REGIONS` | Comma-separated fallback regions for external_idp profile probing | `us-east-1,eu-central-1` |
-| `KIRO_DIAGNOSTICS` | Enables stream, payload, and reasoning diagnostics | `false` |
-| `KIRO_DIAG_STREAM` | Logs aggregate stream metrics | `false` |
-| `KIRO_DIAG_PAYLOAD` | Logs payload size and truncation metrics | `false` |
-| `KIRO_DIAG_REASONING` | Logs reasoning capabilities and forwarded fields | `false` |
-| `KIRO_DIAG_CHUNKS` | Logs raw and emitted stream chunks; may contain sensitive content | `false` |
-| `KIRO_ASSISTANT_CHUNK_MODE` | Assistant text decoder: `delta`, `cumulative`, or opt-in `legacy` compatibility | `delta` |
-| `KIRO_REASONING_CHUNK_MODE` | Reasoning text decoder: `delta`, `cumulative`, or opt-in `legacy` compatibility | `delta` |
-| `KIRO_SYNTHETIC_THINKING_SIGNATURE` | Synthetic compatibility signature fallback: `auto`, `always`, or `never` | `auto` |
-| `KIRO_AGENT_COMPLETION_GUARD` | Completion guard policy: `off`, `observe`, `retry`, or `strict` | `strict` |
-| `KIRO_AGENT_COMPLETION_DELIVERY` | Response delivery: `auto`, `buffered`, or `deferred-stream` | `auto` |
-| `KIRO_AGENT_COMPLETION_GUARD_MAX_RETRIES` | Maximum recovery retries for unusable or truncated responses | `2` |
-| `KIRO_AGENT_COMPLETION_GUARD_HEARTBEAT_MS` | SSE heartbeat interval while a non-stream guard waits on an internal request | `10000` |
-| `KIRO_AGENT_COMPLETION_GUARD_MAX_BUFFER_BYTES` | Shared retained-data accounting budget for each guard attempt, including pending/raw SSE frames and parsed semantic state | `16777216` |
-| `KIRO_MAX_REQUEST_BODY_BYTES` | General JSON front-door ceiling. Messages and token counting are additionally capped at 32 MiB, and the selected transport may impose a lower effective limit (for example Bedrock). | `67108864` |
-| `KIRO_NATIVE_TOOL_CHOICE` | Kiro-native forced tool choice: `never` never sends the field, `auto` uses prompt-only, `always` opts into the experimental field with prompt-only fallback on rejection | `auto` |
-| `KIRO_AGENT_COMPLETION_AUDIT` | Semantic completion audit: `off`, `observe`, or `enforce` | `off` |
+Routing strategy, priority, API key enforcement, thinking preferences and account settings are managed via the admin UI / persisted config. Consult [provider routing](docs/architecture/provider-routing.md), [Completion Guard](docs/architecture/completion-guard.md) and [authentication](docs/architecture/authentication.md) for exact eligibility and failure boundaries.
 
-Completion guard delivery behavior:
+## Security, limitations and troubleshooting
 
-- `auto`: use deferred-finalization streaming only when the model is known not to support mid-stream refusal, and buffered verification for `stream=false`. Claude 4+ requests, unrecognized Claude model aliases, and requests using server-side `fallbacks` are forced to buffered delivery so a terminal `refusal` can discard partial output before any bytes reach the client. Known pre-Claude-4 models may still use deferred delivery when no fallback is configured.
-- `deferred-stream`: for `stream=true`, forward ordinary text and thinking immediately until a structured tool turn begins, then retain the complete structured remainder until every block, tool ID, tool input, server-result pair, and terminal field has been validated. Mixed server/client, server-tool, and MCP turns are therefore committed or discarded as one unit; a malformed later client tool cannot leave an earlier server-tool block visible. Non-stream requests remain buffered.
-- `buffered`: keep the original strict behavior even when the client requested streaming; the complete response is verified first and then replayed as SSE.
-- Deferred streaming validates the complete SSE lifecycle (`message_start`, sequential content blocks, one or more cumulative `message_delta` events, and one `message_stop`). Malformed JSON, incomplete frames, invalid delta types, reused or parallel block indexes, invalid tool input, out-of-order terminal events, and content after an error are not forwarded as successful completion.
-- Client `tool_use` blocks remain atomic. Server-tool calls and results are paired by `id`/`tool_use_id`; a pending server tool is accepted only for a mixed client-tool turn ending in `tool_use`, or is continued safely from matching prior history.
-- Before any visible content is committed, deferred streaming may retry HTTP 408, HTTP 429, HTTP 5xx, retryable SSE errors, and malformed upstream streams. Deterministic 4xx errors are not retried. After visible content is committed, recovery continues the open stream instead of replaying the response from the beginning.
-- Deferred streaming drops the pre-message raw HTTP/SSE body as soon as `message_start` is validated. Pending frames, deferred `message_start`, the atomic structured-turn buffer, partial tool JSON, and parsed semantic/raw metadata share one configurable retained-memory budget. Ownership is transferred instead of copied where possible; parser-only maps/builders are released immediately after classification, and every terminal/retry/error path clears its remaining buffers and response references.
-- Recovery suppresses incomplete internal thinking, trims only meaningful token-boundary overlap, and builds ordinary recovery history solely from content already committed to the client. `pause_turn` and paused compaction replay the complete assistant state exactly as required, including mixed server/client turns, pending server tools, MCP blocks, signed thinking, the response `container`, provider-specific block metadata, and unknown top-level Messages request fields. Server-side fallback boundaries are preserved in place; pre-boundary thinking, redacted thinking, connector narration, client tool calls, and unpaired server-tool calls are removed according to the fallback continuation contract, while all blocks after the final fallback boundary remain ordered. Signed-thinking continuations and Anthropic-defined client tools such as Bash, Computer, Text Editor, and Memory may use transparent `custom_api` or Claude-native Bedrock transports. Server-tool, MCP, unknown structured continuations, and unmodeled protocol-bearing Messages fields are direct-Messages-only: native Kiro and Bedrock accounts are skipped unless a future per-account capability matrix explicitly proves support. This is required for MCP because the Anthropic MCP connector is unavailable through Amazon Bedrock, and it avoids silently routing other server tools to a platform that may not expose that tool family.
-- Usage from rejected hidden retries and audit attempts is logged internally and is not added to client-visible usage. When a continuation or recovery contributes blocks that are actually emitted, its input/cache usage and structured usage metadata are merged, while visible output is capped by a bounded token estimate. Fallback `usage.iterations`, server-tool usage, citations metadata, response `stop_details`, and current/future unknown usage fields survive buffering and SSE replay. Recorders transfer ownership with `takeResult`, release backing storage immediately, and every streaming attempt clears parser state and deferred buffers on all terminal paths. The limit is an accounting guard for retained payload data, not an exact Go heap ceiling: maps, strings, and runtime object overhead may consume additional memory.
-- Kiro assistant history has no wire representation for Claude `thinking`, server-tool, or MCP blocks. The translator therefore marks the payload for Claude-native routing, retains a non-serialized reference to the parsed request plus per-turn sidecars for diagnostics/tests, and transparent transports receive the original raw Messages request. Custom JSON preservation on request, response, usage, tool, and content-block types prevents guard clones or buffered SSE replay from dropping fields such as `mcp_servers`, `server_name`, `is_error`, `max_uses`, `container`, `stop_details`, fallback `iterations`, citations, server-tool usage, or future provider metadata. The current documented streaming matrix covers text, connector narration, citations, tool input, thinking/signature, compaction, fallback boundaries, terminal metadata, and errors; unknown future protocol events fail closed or remain opaque rather than being silently reinterpreted. Ordinary malformed-stream recovery still restarts from committed visible output rather than replaying incomplete signed thinking.
-- Guard mode `observe` is a transparent passthrough: it does not defer, validate, retry, or rewrite the response. Use diagnostics or upstream logs when byte-for-byte behavior is required.
+- **Before public exposure:** replace `changeme`, enable and configure API client authentication, terminate TLS with a trusted reverse proxy and restrict administrative routes. The development defaults are not a production security profile.
+- **Secret files:** `/app/data/config.json` contains live upstream credentials. Restrict volume/filesystem access, backups and logs; never commit the data directory or CLI credential exports.
+- **Import watcher:** when enabled, directory write access is effectively account-import privilege. Avoid sharing `data/imports` with less-trusted users or services.
+- **Protocol compatibility:** an account can be healthy but ineligible for a particular model, tool family, reasoning mode or Responses history. Inspect the requested feature and provider transport before interpreting a 400/503 as a credential failure.
+- **Streaming:** a truncated stream is not automatically a successful response; retries stop at the semantic output boundary. Use aggregate diagnostics first; `KIRO_DIAG_CHUNKS` may record sensitive content.
+- **Useful checks:** `GET /health`, `GET /v1/models`, account status in `/admin`, then [provider routing](docs/architecture/provider-routing.md) and [streaming recovery](docs/architecture/streaming-recovery.md). `/health` alone does not test an upstream provider.
 
-Completion audit behavior:
+## Architecture documentation
 
-- `off`: prose responses are classified from their protocol stop reason only.
-- `observe`: an internal audit request is made and logged, but it never triggers a continuation.
-- `enforce`: a `needs_action` audit is independently verified before autonomous continuation. Only `continue_autonomously` may trigger the existing internal continuation; `complete`, `waiting_for_user`, `uncertain`, verifier rejection, or audit/verifier failure all fail open to the original candidate. Audit evidence includes a bounded recent conversation slice and bounded tool evidence so short referential replies can be resolved without unbounded context growth.
+| Topic | Guide |
+|---|---|
+| End-to-end request and shutdown lifecycle | [Architecture overview](docs/architecture/overview.md) |
+| Model evidence, provider choice and scheduling | [Provider routing](docs/architecture/provider-routing.md) |
+| Account generations, reconciler and persistence | [Account lifecycle](docs/architecture/account-lifecycle.md) |
+| Claude response integrity and semantic audit | [Completion Guard](docs/architecture/completion-guard.md) |
+| Claude tools, MCP, reasoning and Responses ownership | [Agent protocols](docs/architecture/agent-protocol.md) |
+| SSE parsing, retry and decoder contracts | [Streaming and recovery](docs/architecture/streaming-recovery.md) |
+| OAuth, SSO, API keys and import trust boundaries | [Authentication](docs/architecture/authentication.md) |
 
-Diagnostic logging is disabled by default.
+## Contributing and upstream credits
 
-Accepted enabled values: `1`, `true`, `yes`, `on`, `enabled`.
-
-`KIRO_DIAGNOSTICS` does not enable `KIRO_DIAG_CHUNKS`.
-
-Chunk modes are explicit because chunk content alone cannot reliably distinguish a new delta from a replayed or cumulative snapshot:
-
-- `delta`: emit every chunk unchanged. This is the non-destructive default for `assistantResponseEvent`.
-- `cumulative`: emit only monotonic snapshot growth. If the stream violates that contract, the decoder logs a warning, switches to `delta`, and preserves the current chunk.
-- `legacy`: retain the previous prefix/suffix overlap heuristic as an opt-in compatibility mode. Assistant and reasoning text both default to `delta` so valid short chunks are not removed by heuristic overlap detection.
-
-Transparent Claude-native transports preserve provider-issued thinking signatures unchanged. Kiro-native responses use a proxy-owned provenance signature instead, because provider-signed thinking state is not serialized into Kiro assistant history. This keeps a tool-result continuation on Kiro instead of misclassifying it as foreign provider state or forwarding a proxy signature to Direct Anthropic/Bedrock.
-
-`KIRO_SYNTHETIC_THINKING_SIGNATURE` controls only the local compatibility fallback:
-
-- `auto`: synthesize only when visible thinking text exists.
-- `always`: also allow a fallback for empty or omitted thinking.
-- `never`: never synthesize a local signature.
-
-The setting does not disable Kiro provenance localization when Kiro itself emitted a provider signature; that localization is required for transport affinity. Both provenance and fallback signatures are generated by Kiro-Go and are not provider-issued Claude signatures.
-
-Structured JSON output (`output_config.format`) is never silently dropped on Kiro. Kiro-Go forwards it through `additionalModelRequestFields` only when a live model snapshot from a genuine Kiro credential advertises `output_config.format`; otherwise Kiro is removed as a candidate and a transparent/native transport must handle the request.
-
-## Contributing
-
-Friendly discussion is welcome. If you run into issues, try asking Claude Code, Codex, or similar tools for help first — most problems can be solved that way. PRs are even better.
-
-## Friend Links
-
-- [LINUX DO](https://linux.do)
+Issues and pull requests with reproducible cases and regression tests are welcome. Development includes contributions and integrations from multiple authors; see the [changelog and commit provenance](CHANGELOG.md) and Git history for attribution. Read the architecture documentation before changing routing, lifecycle or protocol handling.
 
 ## Disclaimer
 
-For educational and research purposes only. Not affiliated with Amazon, AWS, or Kiro. Users are responsible for complying with applicable terms of service and laws. Use at your own risk.
+For educational and research purposes only. Not affiliated with Amazon, AWS or Kiro. Users are responsible for complying with applicable laws and service terms. Use at your own risk.
 
 ## License
 
